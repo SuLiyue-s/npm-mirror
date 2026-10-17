@@ -3873,6 +3873,17 @@
       if (arow) arow.hidden = state.mig.scope !== 'added';
       paintSelbar();
     });
+    /* datetime-local 没填时间时的原生占位文字（年/月/日 --:--）也跟项目里的占位色保持一致，
+     * 空值时挂 .is-empty 让 style.css 把分段文字调成 --txt-faint */
+    function syncAddedEmpty(ev) {
+      var el = ev && ev.target;
+      if (el && el.type === 'datetime-local') el.classList.toggle('is-empty', !el.value);
+    }
+    ['exp-added-from', 'exp-added-to'].forEach(function (id) {
+      on(id, 'input', syncAddedEmpty);
+      on(id, 'change', syncAddedEmpty);
+      on(id, 'blur', syncAddedEmpty);
+    });
     on('exp-run', 'click', function () {
       var scope = state.mig.scope;
       var payload = { scope: scope };

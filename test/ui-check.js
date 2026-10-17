@@ -651,22 +651,27 @@ async function get(p, { json = false } = {}) {
     const bundleAdd = fs.readFileSync(path.join(__dirname, '..', 'src', 'bundle.js'), 'utf8');
     const cliAdd = fs.readFileSync(path.join(__dirname, '..', 'cli.js'), 'utf8');
 
-    check('导出面板新增「按添加时间」范围与起止时间输入框（datetime-local，默认隐藏）',
+    check('导出面板新增「按添加时间」范围与起止时间输入框（datetime-local，默认隐藏、空值占位样式）',
       /data-scope="added"[^>]*>按添加时间</.test(htmlAdd)
         && /id="exp-added-row" hidden/.test(htmlAdd)
-        && /id="exp-added-from"[^>]*type="datetime-local"/.test(htmlAdd)
-        && /id="exp-added-to"[^>]*type="datetime-local"/.test(htmlAdd));
+        && /id="exp-added-from" class="is-empty" type="datetime-local"/.test(htmlAdd)
+        && /id="exp-added-to" class="is-empty" type="datetime-local"/.test(htmlAdd));
 
     check('切换范围时显示/隐藏「按添加时间」行，导出前校验起止时间并换成 ISO 时间戳提交',
       /var arow = \$\('#exp-added-row'\);\s*\n\s*if \(arow\) arow\.hidden = state\.mig\.scope !== 'added';/.test(jsAdd)
+        && /classList\.toggle\('is-empty', !el\.value\)/.test(jsAdd)
         && /请至少填写起始或结束时间/.test(jsAdd)
         && /起始时间不能晚于结束时间/.test(jsAdd)
         && /payload\.addedFrom = fms !== null \? new Date\(fms\)\.toISOString\(\) : null/.test(jsAdd)
         && /payload\.addedTo = tms !== null \? new Date\(tms\)\.toISOString\(\) : null/.test(jsAdd));
 
-    check('日期时间输入框复用深色输入样式（含日历图标反相，暗色主题下看得见）',
+    check('日期时间输入框样式对齐项目输入框（12px 等宽字体、34px 高、分段/占位/日历图标、暗色原生面板）',
       /input\[type=datetime-local\],select,textarea\{/.test(cssAdd)
-        && /input\[type=datetime-local\]::-webkit-calendar-picker-indicator\{filter:invert\(\.7\)/.test(cssAdd));
+        && /input\[type=datetime-local\]\{\s*\n\s*height:34px;padding:0 7px 0 9px;\s*\n\s*font-family:var\(--mono\);font-size:12px;letter-spacing:0;\s*\n\s*color-scheme:dark;cursor:text;/.test(cssAdd)
+        && /input\[type=datetime-local\]::-webkit-datetime-edit\{font:inherit;padding:0;line-height:32px;color:var\(--txt-hi\)\}/.test(cssAdd)
+        && /input\[type=datetime-local\]\.is-empty::-webkit-datetime-edit\{color:var\(--txt-faint\)\}/.test(cssAdd)
+        && /input\[type=datetime-local\]::-webkit-datetime-edit-text\{padding:0 1px;color:var\(--txt-dim\);font:inherit\}/.test(cssAdd)
+        && /input\[type=datetime-local\]::-webkit-calendar-picker-indicator\{filter:invert\(\.62\)/.test(cssAdd));
 
     check('后端支持 scope=added：按 meta.createdAt 闭区间筛选、manifest 记录 addedTimeRange，参数非法返回 400',
       /else if \(scope === 'added'\) \{/.test(bundleAdd)

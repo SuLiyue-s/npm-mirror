@@ -387,9 +387,36 @@ input[type=text],input[type=search],input[type=number],input[type=password],inpu
   color:var(--txt-hi);font-size:12.5px;font-family:var(--body);
   transition:border-color .15s,box-shadow .15s,background .15s;
 }
-/* 深色主题下日期时间选择器的小日历图标默认是黑的，反相一下才看得见（只影响原生控件） */
-input[type=datetime-local]::-webkit-calendar-picker-indicator{filter:invert(.7);cursor:pointer;opacity:.8}
-input[type=datetime-local]::-webkit-calendar-picker-indicator:hover{opacity:1}
+/* 日期时间输入框（datetime-local）：原生分段控件套上项目字体/配色，高度与其它输入框对齐；
+   color-scheme:dark 让点开的原生日期面板也是深色，不再是刺眼的白底 */
+input[type=datetime-local]{
+  height:34px;padding:0 7px 0 9px;
+  font-family:var(--mono);font-size:12px;letter-spacing:0;
+  color-scheme:dark;cursor:text;
+}
+input[type=datetime-local]::-webkit-datetime-edit{font:inherit;padding:0;line-height:32px;color:var(--txt-hi)}
+/* 还没填时间时，原生占位（年/月/日 --:--）用项目占位色，不抢眼（.is-empty 由 app.js 同步） */
+input[type=datetime-local].is-empty::-webkit-datetime-edit{color:var(--txt-faint)}
+input[type=datetime-local]::-webkit-datetime-edit-fields-wrapper{padding:0}
+input[type=datetime-local]::-webkit-datetime-edit-text{padding:0 1px;color:var(--txt-dim);font:inherit}
+input[type=datetime-local]::-webkit-datetime-edit-month-field,
+input[type=datetime-local]::-webkit-datetime-edit-day-field,
+input[type=datetime-local]::-webkit-datetime-edit-year-field,
+input[type=datetime-local]::-webkit-datetime-edit-hour-field,
+input[type=datetime-local]::-webkit-datetime-edit-minute-field,
+input[type=datetime-local]::-webkit-datetime-edit-second-field,
+input[type=datetime-local]::-webkit-datetime-edit-ampm-field{padding:0;font:inherit;border-radius:2px}
+input[type=datetime-local]::-webkit-datetime-edit-month-field:focus,
+input[type=datetime-local]::-webkit-datetime-edit-day-field:focus,
+input[type=datetime-local]::-webkit-datetime-edit-year-field:focus,
+input[type=datetime-local]::-webkit-datetime-edit-hour-field:focus,
+input[type=datetime-local]::-webkit-datetime-edit-minute-field:focus,
+input[type=datetime-local]::-webkit-datetime-edit-second-field:focus,
+input[type=datetime-local]::-webkit-datetime-edit-ampm-field:focus{background:var(--cy-glow);color:var(--cy);outline:0}
+/* 深色主题下日期时间选择器的小日历图标默认是黑的，反相后是浅灰，和项目里的小图标一致 */
+input[type=datetime-local]::-webkit-calendar-picker-indicator{filter:invert(.62);cursor:pointer;opacity:.65;margin-left:4px}
+input[type=datetime-local]::-webkit-calendar-picker-indicator:hover{filter:invert(.85);opacity:1}
+#exp-added-from,#exp-added-to{max-width:250px}
 input.mono,textarea.mono{font-family:var(--mono);font-size:12px}
 input:focus,select:focus,textarea:focus{outline:0;border-color:rgba(46,230,196,.6);box-shadow:0 0 0 2px var(--cy-glow);background:#0a1117}
 input::placeholder,textarea::placeholder{color:var(--txt-faint)}
