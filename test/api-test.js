@@ -978,7 +978,7 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
   }
 
   // ---------------------------------------------------------------- 全部包补 tarball
-  section('五之八、全部包补 tarball（包管理页「全部包补 dist-tag 版本 / 全部包补最新版本」，不用勾选）');
+  section('五之八、全部包补 tarball（包管理页「全部包补 dist-tag 版本 / 全部包补最新版本 / 全部包补全部版本」，不用勾选）');
   {
     const { Store } = require('../src/store');
     const cfgMod = require('../src/config');
@@ -997,10 +997,43 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
 
     const planLatest = pullMod.planTargets(roStore, names, 'latest');
     const planTags = pullMod.planTargets(roStore, names, 'tags');
+    const planAll = pullMod.planTargets(roStore, names, 'all');
     const sum = (plan) => plan.reduce((a, p) => a + p.target.length, 0);
     check('planTargets(全部包, latest / tags) 每个包一行，latest 的目标数不超过 tags',
       planLatest.length === totalPkgs && planTags.length === totalPkgs && sum(planLatest) <= sum(planTags),
       `有目标的包：latest=${planLatest.filter(p => p.target.length).length} / tags=${planTags.filter(p => p.target.length).length}`);
+    // 「全部包补全部版本」= 每个包把所有缺失版本都规划进去：目标总数应等于各包「缺 tarball 的版本数」之和，且不小于 tags 模式
+    const missTotal = names.reduce((a, n) => a + roStore.missingTarballs(n).length, 0);
+    check('planTargets(全部包, all) 规划每一个缺失版本（目标数 = 各包缺失 tarball 之和，且不少于 tags 模式）',
+      planAll.length === totalPkgs && sum(planAll) === missTotal && sum(planAll) >= sum(planTags),
+      `all=${sum(planAll)} tags=${sum(planTags)} missing=${missTotal}`);
+
+    // 走真接口：scope=all 的 all 任务（全部包补全部版本）—— 建任务后立刻取消，只验证模式/标题/可取消，不把镜像真的补全
+    const pullAll = await api('/__admin/api/packages/pull', {
+      method: 'POST', body: { all: true, mode: 'all', concurrency: 1 }, timeoutMs: 60000,
+    });
+    const pjAll = (pullAll.json && pullAll.json.data) || {};
+    check('POST /packages/pull {all:true, mode:"all"} 能建「补全部版本」任务（响应带 scope=all / mode=all / 目标数=全部缺失版本）',
+      pullAll.status === 200 && pjAll.scope === 'all' && pjAll.mode === 'all'
+        && Number(pjAll.total) > 0 && Number(pjAll.total) <= sum(planAll) && Number(pjAll.total) >= sum(planTags),
+      `status=${pullAll.status} scope=${pjAll.scope} mode=${pjAll.mode} total=${pjAll.total} planAll=${sum(planAll)} planTags=${sum(planTags)}`);
+    if (pjAll.taskId) {
+      const tb = await api('/__admin/api/tasks/' + pjAll.taskId);
+      const tj = (tb.json && tb.json.data) || {};
+      check(`「补全部版本」任务标题写明「全部包补 全部版本」（${tj.title || ''}）`,
+        /全部包补/.test(String(tj.title || '')) && /全部版本/.test(String(tj.title || '')), tj.title);
+      await api('/__admin/api/tasks/' + pjAll.taskId + '/cancel', { method: 'POST' });
+      let finAll = null;
+      for (let i = 0; i < 240; i++) {
+        await new Promise((r) => setTimeout(r, 250));
+        const g = await api('/__admin/api/tasks/' + pjAll.taskId);
+        const t = (g.json && g.json.data) || {};
+        if (t.status !== 'running') { finAll = t; break; }
+      }
+      check('「补全部版本」任务能取消并正常收尾（取消不报错，也不会顺手把镜像补全）',
+        !!finAll && finAll.status !== 'running' && finAll.status !== 'error',
+        `status=${finAll && finAll.status} message=${finAll && finAll.message}`);
+    }
 
     // 走真接口：scope=all 的 latest 任务（随后立刻取消，只验证作用域/规划/可取消，不把镜像真的补全）
     const pull = await api('/__admin/api/packages/pull', {

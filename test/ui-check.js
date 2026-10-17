@@ -155,18 +155,28 @@ async function get(p, { json = false } = {}) {
     }
   }
 
-  console.log('\x1b[1m五、批量入口：「全部包补 dist-tag 版本 / 全部包补最新版本」\x1b[0m');
+  console.log('\x1b[1m五、批量入口：「全部包补 dist-tag 版本 / 全部包补最新版本 / 全部包补全部版本」\x1b[0m');
   {
-    const bothBtns = ['pkg-fill-tags-all', 'pkg-fill-latest-all'].every((id) => new RegExp(`id="${id}"`).test(home.text));
-    check('包管理工具栏有「全部包补 dist-tag 版本」「全部包补最新版本」两个按钮', bothBtns,
-      bothBtns ? '' : 'index.html 里缺少 #pkg-fill-tags-all / #pkg-fill-latest-all 之一');
-    const labels = /全部包补 dist-tag 版本/.test(home.text) && /全部包补最新版本/.test(home.text);
-    check('两个按钮文案齐全（不用勾选任何包就能跑）', labels);
+    const allBtns = ['pkg-fill-tags-all', 'pkg-fill-latest-all', 'pkg-fill-all-all'];
+    const bothBtns = allBtns.every((id) => new RegExp(`id="${id}"`).test(home.text));
+    check('包管理工具栏有「全部包补 dist-tag 版本」「全部包补最新版本」「全部包补全部版本」三个按钮', bothBtns,
+      bothBtns ? '' : 'index.html 里缺少 #pkg-fill-tags-all / #pkg-fill-latest-all / #pkg-fill-all-all 之一');
+    const labels = /全部包补 dist-tag 版本/.test(home.text) && /全部包补最新版本/.test(home.text) && /全部包补全部版本/.test(home.text);
+    check('三个按钮文案齐全（不用勾选任何包就能跑）', labels);
 
-    const handlers = ['pkg-fill-tags-all', 'pkg-fill-latest-all'].every((id) => js.text.includes(`'${id}'`));
+    const handlers = allBtns.every((id) => js.text.includes(`'${id}'`));
     const helper = /function fillAllTarballs\s*\(/.test(js.text);
-    check('app.js 绑定了这两个按钮并复用 runFill 的「全部包」模式（fillAllTarballs）', handlers && helper,
+    check('app.js 绑定了这三个按钮并复用 runFill 的「全部包」模式（fillAllTarballs）', handlers && helper,
       `handlers=${handlers} fillAllTarballs=${helper}`);
+
+    // 「补全部版本」是下载量最大的入口：走 mode='all'，确认框要写清范围，并给出「还差多少个版本」的估计
+    const allMode = /fillAllTarballs\('all'\)/.test(js.text) && /全部包 · 补全部版本/.test(js.text)
+      && /所有缺失版本/.test(js.text) && /个版本的 tarball 没缓存/.test(js.text) && /ALL VERSIONS/.test(js.text);
+    check('「全部包补全部版本」走 mode=all，确认框写明补「所有缺失版本」并给出未缓存版本数估计',
+      allMode);
+    const allBack = /body\.mode === 'all' \? 'all'/.test(apiSrc) && /全部版本/.test(apiSrc) && /planTargets/.test(apiSrc);
+    check('后端 /packages/pull 的 scope=all 支持 mode=all（服务端规划全部缺失版本），标题会写「全部包补 全部版本」',
+      allBack);
 
     const sendsAll = /\{\s*mode:\s*mode,\s*all:\s*true/.test(js.text) || /all:\s*true,\s*concurrency/.test(js.text);
     const backAll = /body\.all === true \|\| body\.scope === 'all'/.test(apiSrc);

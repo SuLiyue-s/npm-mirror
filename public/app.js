@@ -1269,25 +1269,44 @@
   }
 
   /* 全部包补 tarball（不用勾选任何包）：交给服务端按镜像里所有包规划（body.all = true）。
-   * mode='tags' → 每个包补 dist-tags 指向的缺失版本；mode='latest' → 每个包只补它自己的最新版本。 */
+   * mode='tags' → 每个包补 dist-tags 指向的缺失版本；mode='latest' → 每个包只补它自己的最新版本；
+   * mode='all' → 每个包把「所有缺失版本」都补齐（最全，也最耗流量和磁盘）。 */
   function fillAllTarballs(mode) {
+    mode = mode === 'all' ? 'all' : (mode === 'latest' ? 'latest' : 'tags');
     var isLatest = mode === 'latest';
+    var isAll = mode === 'all';
     var conc = fillConc();
-    function ask(total) {
+    function ask(total, missingN) {
+      var msg, detail;
+      if (isAll) {
+        msg = '将对镜像里全部 ' + (total ? fmtNum(total) + ' 个包' : '包') + '补齐各自「所有缺失版本」的 tarball，已经缓存的会跳过。'
+          + (missingN > 0 ? '按当前统计，大约还有 ' + fmtNum(missingN) + ' 个版本的 tarball 没缓存。' : '');
+        detail = '这是最全的补法：每个包有多少版本就补多少，可能涉及上万个 tarball、下载几十 GB、耗时很久。'
+          + '弹窗里可以随时点「取消下载」，也可以点「后台运行」先去忙别的。只想补常用的最新版，请改用「全部包补最新版本」。';
+      } else if (isLatest) {
+        msg = '将对镜像里全部 ' + (total ? fmtNum(total) + ' 个包' : '包') + '只补它们各自的最新版本（latest），已经缓存的会跳过。';
+        detail = '每个包最多补 1 个 tarball —— 离线只想装最新版时这样最省时间和磁盘。';
+      } else {
+        msg = '将对镜像里全部 ' + (total ? fmtNum(total) + ' 个包' : '包') + '补 dist-tags 指向的版本，已经缓存的会跳过。';
+        detail = '每个包按它自己的 dist-tags 补缺失版本；包多的时候下载量会比较大，弹窗里可以随时点「取消下载」。';
+      }
       return confirmBox({
-        title: isLatest ? '全部包 · 只补最新版本' : '全部包 · 补 dist-tag 版本',
-        sub: 'ALL PACKAGES', confirmText: '开始补下载',
-        message: '将对镜像里全部 ' + (total ? fmtNum(total) + ' 个包' : '包') +
-          (isLatest ? '只补它们各自的最新版本（latest）' : '补 dist-tags 指向的版本') + '，已经缓存的会跳过。',
-        detail: (isLatest
-          ? '每个包最多补 1 个 tarball —— 离线只想装最新版时这样最省时间和磁盘。'
-          : '每个包按它自己的 dist-tags 补缺失版本；包多的时候下载量会比较大，弹窗里可以随时点「取消下载」。')
-          + (conc ? ' 本次并发数：' + conc + '。' : '')
+        title: isAll ? '全部包 · 补全部版本' : (isLatest ? '全部包 · 只补最新版本' : '全部包 · 补 dist-tag 版本'),
+        sub: isAll ? 'ALL VERSIONS' : 'ALL PACKAGES',
+        confirmText: isAll ? '确认补全部版本' : '开始补下载',
+        message: msg,
+        detail: detail + (conc ? ' 本次并发数：' + conc + '。' : '')
       });
     }
-    // 用镜像全量包数（不受搜索/筛选影响）写进确认框；取不到就不显示数字
-    api('/packages?size=1').then(function (d) { return ask(Number(d.total || 0)); },
-      function () { return ask(0); }).then(function (ok) {
+    /* 用镜像全量包数（不受搜索/筛选影响）写进确认框；「补全部版本」再多取一次版本/缓存数，给出「还要补多少个版本」的估计 */
+    var totalP = api('/packages?size=1').then(function (d) { return Number(d.total || 0); }, function () { return 0; });
+    var missP = isAll
+      ? api('/overview').then(function (d) {
+        var s = (d && d.stats) || {};
+        return Math.max(0, Number(s.versions || 0) - Number(s.tarballs || 0));
+      }, function () { return 0; })
+      : Promise.resolve(0);
+    Promise.all([totalP, missP]).then(function (r) { return ask(r[0], r[1]); }).then(function (ok) {
       if (ok) runFill([], mode, null, { all: true });
     });
   }
@@ -3448,6 +3467,7 @@
     on('pkg-fill-tarball', 'click', fillTarballs);
     on('pkg-fill-tags-all', 'click', function () { fillAllTarballs('tags'); });
     on('pkg-fill-latest-all', 'click', function () { fillAllTarballs('latest'); });
+    on('pkg-fill-all-all', 'click', function () { fillAllTarballs('all'); });
     on('pkg-fill-conc', 'change', function () {
       var e = $('#pkg-fill-conc');
       var v = Number(e && e.value);

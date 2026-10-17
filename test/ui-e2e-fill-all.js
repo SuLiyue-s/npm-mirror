@@ -140,12 +140,13 @@ async function main() {
   check('包管理页渲染出行（带 data-name 的勾选框）', rowsReady > 0, `rows=${rowsReady}`);
 
   const btns = await evaluate(ws, `(function(){
-    var a = document.getElementById('pkg-fill-tags-all'), b = document.getElementById('pkg-fill-latest-all');
+    var a = document.getElementById('pkg-fill-tags-all'), b = document.getElementById('pkg-fill-latest-all'), c = document.getElementById('pkg-fill-all-all');
     return { tags: a ? (a.textContent||'').trim() : null, latest: b ? (b.textContent||'').trim() : null,
-             ids: !!a && !!b };
+             all: c ? (c.textContent||'').trim() : null, ids: !!a && !!b && !!c };
   })()`);
   check('工具栏有「全部包补 dist-tag 版本」按钮', btns.ids && /全部包补 dist-tag 版本/.test(btns.tags || ''), String(btns.tags));
   check('工具栏有「全部包补最新版本」按钮', btns.ids && /全部包补最新版本/.test(btns.latest || ''), String(btns.latest));
+  check('工具栏有「全部包补全部版本」按钮', btns.ids && /全部包补全部版本/.test(btns.all || ''), String(btns.all));
 
   try {
     // ---- 全部包补最新版本
@@ -247,6 +248,34 @@ async function main() {
     await sleep(400);
     const gone = await evaluate(ws, `!document.querySelector('#modal-root .modal')`);
     check('取消后确认框关闭（不会真的开跑）', !!gone);
+
+    // ---- 第三个入口：全部包补全部版本（只验证确认框就取消，绝不真的开跑：全部版本下载量最大）
+    await evaluate(ws, `document.getElementById('pkg-fill-all-all').click(); 1`);
+    let confirm3 = null;
+    for (let i = 0; i < 40; i++) {
+      await sleep(200);
+      confirm3 = await evaluate(ws, SNAP);
+      if (confirm3 && confirm3.open) break;
+    }
+    check('点「全部包补全部版本」弹出确认框（标题写明补全部版本）',
+      !!(confirm3 && confirm3.open) && /全部版本/.test(confirm3.title || ''),
+      JSON.stringify({ title: confirm3 && confirm3.title, note: (confirm3 && confirm3.note || '').slice(0, 120) }));
+    // SNAP.note 只取第一个 .muted（这里是 detail），确认框的正文（message）要单独取整个 modal-body 看
+    const body3 = await evaluate(ws, `(function(){
+      var b = document.querySelector('#modal-root .modal .modal-body');
+      return b ? (b.textContent || '').replace(/\\s+/g, ' ').trim() : '';
+    })()`);
+    check('确认框正文写明补「所有缺失版本」，并给出未缓存版本数估计',
+      /所有缺失版本/.test(body3 || '') && /个版本的 tarball 没缓存/.test(body3 || ''),
+      String(body3 || '').slice(0, 160));
+    await evaluate(ws, `(function(){
+      var bs = document.querySelectorAll('#modal-root .modal .modal-foot button');
+      for (var i = 0; i < bs.length; i++) if ((bs[i].textContent||'').trim() === '取消') { bs[i].click(); return true; }
+      return false;
+    })()`);
+    await sleep(400);
+    const gone3 = await evaluate(ws, `!document.querySelector('#modal-root .modal')`);
+    check('取消后确认框关闭（不会真的去补全部版本）', !!gone3);
   } finally {
     try { ws.close(); } catch { /* ignore */ }
     chrome.kill();
