@@ -667,14 +667,19 @@ async function get(p, { json = false } = {}) {
         && /payload\.addedFrom = fms !== null \? new Date\(fms\)\.toISOString\(\) : null/.test(jsAdd)
         && /payload\.addedTo = tms !== null \? new Date\(tms\)\.toISOString\(\) : null/.test(jsAdd));
 
-    check('日期时间输入框与自绘弹层样式对齐项目（只读等宽输入框 + 项目风格月历/时分/底部按钮，深色渐变青色角标）',
+    check('日期时间输入框与自绘弹层样式对齐项目（只读等宽输入框 + 项目风格月历/自绘时分下拉/底部按钮，深色渐变青色角标）',
       /input\.dt-input\{[\s\S]*?height:34px;padding:0 30px 0 9px;[\s\S]*?font-family:var\(--mono\);font-size:12px;/.test(cssAdd)
         && /input\.dt-input\.is-empty\{color:var\(--txt-faint\)\}/.test(cssAdd)
         && /\.dt-pop\{position:fixed;z-index:8600;width:288px/.test(cssAdd)
         && /\.dt-day\.is-sel\{background:rgba\(46,230,196,\.16\);border-color:var\(--cy\)/.test(cssAdd)
-        && /\.dt-time select\{width:62px;height:26px/.test(cssAdd)
+        && /\.dt-sel\{[\s\S]*?width:62px;height:26px;/.test(cssAdd)
+        && /\.dt-menu\{[\s\S]*?position:absolute;z-index:8700/.test(cssAdd)
+        && /\.dt-opt\.is-sel\{background:rgba\(46,230,196,\.16\)/.test(cssAdd)
+        && !/dt-time select\{/.test(cssAdd)
         && /\.dt-foot\{display:flex;align-items:center;gap:7px/.test(cssAdd)
         && /class: 'modal dt-pop'/.test(jsAdd)
+        && /class: 'dt-sel'/.test(jsAdd)
+        && /function buildMenu\(kind, label, count\)/.test(jsAdd)
         && /decorateFx\(pop\)/.test(jsAdd));
 
     check('后端支持 scope=added：按 meta.createdAt 闭区间筛选、manifest 记录 addedTimeRange，参数非法返回 400',

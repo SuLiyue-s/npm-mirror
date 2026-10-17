@@ -357,7 +357,8 @@
   function dateTimePicker(input) {
     if (!input) return null;
     if (input.__dtPicker) return input.__dtPicker;
-    var pop = null, draft = null, cursor = null, grid = null, titleEl = null, hourSel = null, minSel = null;
+    var pop = null, draft = null, cursor = null, grid = null, titleEl = null;
+    var hourBtn = null, minBtn = null, hourMenu = null, minMenu = null, menuKind = '';
     var opened = false;
 
     /* 把内部值同步回输入框：显示人类可读文本，空值挂 .is-empty 用项目占位色 */
@@ -375,12 +376,10 @@
       if (pop) return;
       titleEl = el('div', { class: 'dt-title' });
       grid = el('div', { class: 'dt-grid' });
-      hourSel = el('select', { 'aria-label': '小时' });
-      minSel = el('select', { 'aria-label': '分钟' });
-      for (var h = 0; h < 24; h++) hourSel.appendChild(el('option', { value: pad2(h), text: pad2(h) }));
-      for (var mi = 0; mi < 60; mi++) minSel.appendChild(el('option', { value: pad2(mi), text: pad2(mi) }));
-      hourSel.addEventListener('change', function () { if (draft) draft.hh = +hourSel.value; });
-      minSel.addEventListener('change', function () { if (draft) draft.mm = +minSel.value; });
+      hourBtn = timeBtn('hh', '小时');
+      minBtn = timeBtn('mm', '分钟');
+      hourMenu = buildMenu('hh', '选择小时', 24);
+      minMenu = buildMenu('mm', '选择分钟', 60);
       pop = el('div', { class: 'modal dt-pop', role: 'dialog', 'aria-label': '选择日期时间' }, [
         el('div', { class: 'modal-head' }, [
           el('div', {}, [
@@ -398,7 +397,7 @@
         grid,
         el('div', { class: 'dt-time' }, [
           el('span', { text: '时间' }),
-          hourSel, el('span', { text: ':' }), minSel,
+          hourBtn, el('span', { class: 'dt-colon', text: ':' }), minBtn,
           el('span', { class: 'sp' })
         ]),
         el('div', { class: 'dt-foot' }, [
@@ -407,7 +406,8 @@
           el('div', { class: 'spacer' }),
           el('button', { class: 'btn btn-xs btn-ghost', type: 'button', text: '取消', onclick: function () { closePop(); } }),
           el('button', { class: 'btn btn-xs btn-primary', type: 'button', text: '确定', onclick: apply })
-        ])
+        ]),
+        hourMenu, minMenu
       ]);
       decorateFx(pop);
       pop.setAttribute('data-for', input.id || '');
@@ -425,6 +425,86 @@
         }
       });
     }
+
+    /* 时/分选择：原生 <select> 展开后的选项列表是系统绘制的（黑底 + 白色选中块），
+     * 和项目风格差得远，所以这里用自绘下拉菜单，样式与弹层/按钮一致。 */
+    function timeBtn(kind, label) {
+      return el('button', {
+        class: 'dt-sel', type: 'button', 'aria-label': label, 'aria-haspopup': 'listbox', text: '00',
+        onclick: function () { openMenu(kind); }
+      });
+    }
+
+    function buildMenu(kind, label, count) {
+      var menu = el('div', { class: 'dt-menu', role: 'listbox', 'aria-label': label });
+      menu.hidden = true;
+      for (var i = 0; i < count; i++) {
+        menu.appendChild(el('button', {
+          class: 'dt-opt', type: 'button', role: 'option', text: pad2(i), 'data-v': pad2(i),
+          onclick: (function (val) {
+            return function () {
+              if (draft) { draft[kind] = val; syncTime(); renderTimeSel(); }
+              closeMenu();
+            };
+          })(i)
+        }));
+      }
+      return menu;
+    }
+
+    function menuEl(kind) { return kind === 'hh' ? hourMenu : minMenu; }
+    function menuBtn(kind) { return kind === 'hh' ? hourBtn : minBtn; }
+
+    function syncTime() {
+      if (!draft) return;
+      hourBtn.textContent = pad2(draft.hh);
+      minBtn.textContent = pad2(draft.mm);
+    }
+
+    function renderTimeSel() {
+      if (!draft) return;
+      [hourMenu, minMenu].forEach(function (menu) {
+        var v = menu === hourMenu ? draft.hh : draft.mm;
+        $$('.dt-opt', menu).forEach(function (o) {
+          o.classList.toggle('is-sel', +o.getAttribute('data-v') === v);
+        });
+      });
+    }
+
+    function openMenu(kind) {
+      if (!pop) return;
+      if (menuKind === kind) { closeMenu(); return; }
+      closeMenu();
+      var menu = menuEl(kind), btn = menuBtn(kind);
+      renderTimeSel();
+      menu.hidden = false;
+      placeMenu(menu, btn);
+      menuKind = kind;
+      btn.setAttribute('aria-expanded', 'true');
+      var sel = $('.dt-opt.is-sel', menu);
+      if (sel) menu.scrollTop = Math.max(0, sel.offsetTop - menu.clientHeight / 2 + sel.offsetHeight / 2);
+    }
+
+    function closeMenu() {
+      if (!menuKind) return;
+      menuEl(menuKind).hidden = true;
+      menuBtn(menuKind).setAttribute('aria-expanded', 'false');
+      menuKind = '';
+    }
+
+    function placeMenu(menu, btn) {
+      var pr = pop.getBoundingClientRect();
+      var br = btn.getBoundingClientRect();
+      var w = menu.offsetWidth || 62, h = menu.offsetHeight || 170;
+      var left = br.left - pr.left;
+      if (left + w > pr.width) left = Math.max(0, pr.width - w);
+      var top = br.bottom - pr.top + 4;
+      if (br.bottom + 4 + h > window.innerHeight - 8) top = br.top - pr.top - h - 4;
+      menu.style.left = left + 'px';
+      menu.style.top = top + 'px';
+    }
+
+    function isMenuBtn(t) { return t === hourBtn || t === minBtn; }
 
     function renderGrid() {
       clear(grid);
@@ -455,8 +535,9 @@
     function pick(v) {
       draft = v || dtNow();
       cursor = { y: draft.y, m: draft.m };
-      hourSel.value = pad2(draft.hh);
-      minSel.value = pad2(draft.mm);
+      syncTime();
+      renderTimeSel();
+      closeMenu();
       renderGrid();
     }
 
@@ -487,10 +568,19 @@
 
     function onDocDown(ev) {
       if (!pop || pop.hidden) return;
-      if (pop.contains(ev.target) || ev.target === input) return;
+      var inside = pop.contains(ev.target) || ev.target === input;
+      if (inside) {
+        if (menuKind && !menuEl(menuKind).contains(ev.target) && !isMenuBtn(ev.target)) closeMenu();
+        return;
+      }
       closePop();
     }
     function onKey(ev) { if (ev.key === 'Escape') { ev.stopPropagation(); closePop(); } }
+    /* 滚动会让固定定位的弹层和输入框错位，直接关掉；但时/分菜单自己滚不算 */
+    function onScroll(ev) {
+      if (menuKind && menuEl(menuKind).contains(ev.target)) return;
+      closePop();
+    }
 
     function openPop() {
       if (opened) return;
@@ -504,19 +594,19 @@
       document.addEventListener('mousedown', onDocDown, true);
       document.addEventListener('keydown', onKey, true);
       window.addEventListener('resize', closePop);
-      /* 视图内滚动会把输入框带走，弹层跟着关掉最稳（日历本身不需要滚动） */
-      document.addEventListener('scroll', closePop, true);
+      document.addEventListener('scroll', onScroll, true);
     }
 
     function closePop() {
       if (!opened || !pop) return;
       opened = false;
+      closeMenu();
       pop.hidden = true;
       input.setAttribute('aria-expanded', 'false');
       document.removeEventListener('mousedown', onDocDown, true);
       document.removeEventListener('keydown', onKey, true);
       window.removeEventListener('resize', closePop);
-      document.removeEventListener('scroll', closePop, true);
+      document.removeEventListener('scroll', onScroll, true);
     }
 
     input.__dtIso = input.getAttribute('data-iso') || '';
