@@ -32,7 +32,7 @@ function defaults() {
       trustLocalhost: true,        // 本机回环地址免令牌，方便自己用
       username: 'admin',
     },
-    storage: { dir: 'data/storage', maxUploadMB: 500 },
+    storage: { dir: 'data/storage', maxUploadMB: 500, maxBundleUploadMB: 4096 },
     log: { level: 'info', maxDays: 7 },
     ui: { title: '私人 npm 镜像源' },
   };
@@ -124,6 +124,9 @@ function sanitize(input) {
     storage: {
       dir: safeStorageDir(dir),
       maxUploadMB: clampInt(st.maxUploadMB, 1, 4096, 500),
+      // 离线包（整机备份）单独一个上限：几个 GB 的 bundle 是常态，不能跟单包上传共用一个 500MB 门槛；
+      // 上传时是流式落盘，不占内存，所以可以给到 64GB。
+      maxBundleUploadMB: clampInt(st.maxBundleUploadMB, 1, 65536, 4096),
     },
     log: {
       level: LOG_LEVELS.includes(level) ? level : 'info',

@@ -95,7 +95,10 @@ async function makeTarball(dir, pkg) {
 function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 15000 } = {}) {
   const httpMod = require('node:http');
   return new Promise((resolve) => {
-    const req = httpMod.request({ host: BASE_HOST, port: BASE_PORT, path: pathname, method, headers }, (res) => {
+    // agent: false = 每次开新连接。node:http 的全局 agent 默认 keep-alive，
+    // 而本文件有用例故意「声明了很大的 Content-Length 却不发完」（验证服务端提前 413 并断连），
+    // 那条连接会被服务端 close，若下一个请求恰好复用到它就会一直等不到响应（假超时）。
+    const req = httpMod.request({ host: BASE_HOST, port: BASE_PORT, path: pathname, method, headers, agent: false }, (res) => {
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
       res.on('end', () => resolve({ status: res.statusCode, text: Buffer.concat(chunks).toString('utf8'), headers: res.headers }));
@@ -173,6 +176,16 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
   {
     const r = await api('/__admin/api/session', { auth: false });
     check('GET /session 免鉴权且返回监听信息', r.status === 200 && r.json && r.json.data && !!r.json.data.registryUrl, `status=${r.status}`);
+  }
+  {
+    // 前端要靠这两个上限做体积预检：超限直接提示「放进 data\bundles 再导入」，而不是让浏览器干等后报网络错误
+    const s = await api('/__admin/api/session');
+    const sl = ((s.json || {}).data || {}).limits;
+    const c = await api('/__admin/api/config');
+    const st = ((((c.json || {}).data || {}).config) || {}).storage || {};
+    check('GET /session 返回上传上限（uploadMB / bundleUploadMB）',
+      s.status === 200 && sl && Number(sl.uploadMB) === Number(st.maxUploadMB) && Number(sl.bundleUploadMB) === Number(st.maxBundleUploadMB),
+      `limits=${JSON.stringify(sl)} config=${JSON.stringify(st)}`);
   }
   {
     const r = await api('/__admin/api/overview');
@@ -1074,8 +1087,80 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
     check('DELETE /bundles 删除离线包文件', r.status === 200, `status=${r.status}`);
   }
 
+  // -------------------------------------------- 网页上传整机备份（原始体流式导入）
+  section('六之二、网页上传离线包（原始体上传 + 体积上限）');
+  {
+    // 前端靠这两个上限做体积预检：超限时直接提示「放进 data\bundles 再导入」，
+    // 而不是让服务端读到上限后 413 + 断连，浏览器只报 net::ERR_CONNECTION_RESET（界面显示「上传失败（网络错误）」）
+    const cRes = await api('/__admin/api/config');
+    const st = ((((cRes.json || {}).data || {}).config) || {}).storage || {};
+    const r = await api('/__admin/api/bundles');
+    const lim = ((r.json || {}).data || {}).limits;
+    check('GET /bundles 返回上传上限（uploadMB / bundleUploadMB）',
+      r.status === 200 && lim
+        && Number(lim.uploadMB) === Number(st.maxUploadMB)
+        && Number(lim.bundleUploadMB) === Number(st.maxBundleUploadMB),
+      `limits=${JSON.stringify(lim)} config=${JSON.stringify(st)}`);
+  }
+  let rawUploadBundle = null;
+  {
+    // 用「原始体」上传：这正是网页里拖入文件走的路径，服务端应流式落盘（几个 GB 也不进内存）
+    const ex = await api('/__admin/api/bundles/export', { method: 'POST', body: { scope: 'private' }, timeoutMs: 180000 });
+    rawUploadBundle = ((ex.json || {}).data || {}).file;
+    const src = path.join(__dirname, '..', 'data', 'bundles', rawUploadBundle);
+    const buf = fs.readFileSync(src);
+    const up = await rawReq(`/__admin/api/bundles/import?overwrite=1&token=${encodeURIComponent(TOKEN)}`, {
+      method: 'POST', body: buf, timeoutMs: 180000,
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'X-Filename': encodeURIComponent(rawUploadBundle),
+        'X-Mirror-Token': TOKEN,
+      },
+    });
+    let uj = null; try { uj = JSON.parse(up.text); } catch { /* 非 JSON */ }
+    check('POST /bundles/import 原始体上传（网页拖入）→ 流式导入成功',
+      up.status === 200 && uj && uj.ok && uj.data && uj.data.tarballs >= 1,
+      `status=${up.status} bytes=${buf.length} ${String(up.text).slice(0, 120)}`);
+    // 临时文件必须清干净（导入失败时也不能在 data\tmp 里留半截）
+    const tmpDir = path.join(__dirname, '..', 'data', 'tmp');
+    const left = fs.existsSync(tmpDir) ? fs.readdirSync(tmpDir) : [];
+    check('原始体上传后临时文件已清理（data\\tmp 无残留）', left.length === 0, `left=${left.join(',')}`);
+    const delRaw = await api(`/__admin/api/bundles?file=${encodeURIComponent(rawUploadBundle)}`, { method: 'DELETE' });
+    check('原始体上传用例收尾：删除测试 bundle', delRaw.status === 200, `status=${delRaw.status}`);
+  }
+  {
+    // content-length 已声明超限：不必真收几个 GB，服务端应在读完前就 413，并给出本地文件通路
+    const cRes = await api('/__admin/api/config');
+    const maxMB = Number((((((cRes.json || {}).data || {}).config) || {}).storage || {}).maxBundleUploadMB) || 4096;
+    const decl = (maxMB + 16) * 1024 * 1024;
+    const r = await rawReq(`/__admin/api/bundles/import?overwrite=1&token=${encodeURIComponent(TOKEN)}`, {
+      method: 'POST', timeoutMs: 30000,
+      headers: { 'Content-Type': 'application/octet-stream', 'X-Filename': 'too-big.tgz', 'Content-Length': String(decl) },
+    });
+    let j = null; try { j = JSON.parse(r.text); } catch { /* 非 JSON */ }
+    check('上传声明体积超过上限 → 413 ETOOLARGE，并提示 data\\bundles 本地通路',
+      r.status === 413 && j && j.code === 'ETOOLARGE' && /data[\\/]bundles/.test(String(j.error || '')),
+      `status=${r.status} decl=${decl} ${String(r.text).slice(0, 160)}`);
+  }
+  {
+    // 空请求体：不能当成一个 0 字节 bundle 去导入
+    const r = await rawReq(`/__admin/api/bundles/import?overwrite=1&token=${encodeURIComponent(TOKEN)}`, {
+      method: 'POST', timeoutMs: 30000,
+      headers: { 'Content-Type': 'application/octet-stream', 'X-Filename': 'empty.tgz', 'Content-Length': '0' },
+    });
+    let j = null; try { j = JSON.parse(r.text); } catch { /* 非 JSON */ }
+    check('上传空请求体 → 400 请求体为空', r.status === 400 && /请求体为空/.test(String((j && j.error) || '')), `status=${r.status} ${String(r.text).slice(0, 120)}`);
+  }
+  {
+    // 非法上限必须被拒（保存前校验，避免写出起不来的配置）
+    const r1 = await api('/__admin/api/config', { method: 'PUT', body: { storage: { maxBundleUploadMB: 70000 } } });
+    check('PUT /config storage.maxBundleUploadMB 超范围 → 400', r1.status === 400 && /maxBundleUploadMB/.test(r1.text), `status=${r1.status} ${r1.text.slice(0, 120)}`);
+    const r2 = await api('/__admin/api/config', { method: 'PUT', body: { storage: { maxBundleUploadMB: 0 } } });
+    check('PUT /config storage.maxBundleUploadMB 非正数 → 400', r2.status === 400 && /maxBundleUploadMB/.test(r2.text), `status=${r2.status} ${r2.text.slice(0, 120)}`);
+  }
+
   // ------------------------------------------------ 导出选中包时连带导出依赖
-  section('六之二、导出选中的包时连带导出它的依赖（withDeps）');
+  section('六之三、导出选中的包时连带导出它的依赖（withDeps）');
   {
     const bundleMod = require('../src/bundle');
     // 1) 依赖范围解析：npm: 别名换成真实包名；file:/git/http 依赖不属于注册表，跳过

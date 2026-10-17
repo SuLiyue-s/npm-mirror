@@ -22,7 +22,7 @@
     timers: {},
     authPrompted: false,
     pkg: { q: '', source: 'all', sort: '-updated', page: 1, size: 20, total: 0, items: [], selected: {}, loading: false },
-    mig: { bundles: [], scope: 'all', scan: null, scanSel: {}, scanFilter: '', scanPage: 1 },
+    mig: { bundles: [], limits: null, scope: 'all', scan: null, scanSel: {}, scanFilter: '', scanPage: 1 },
     cfg: { raw: null, baseline: null, path: '', revealed: false },
     logs: { lines: [], level: '' }
   };
@@ -2002,6 +2002,16 @@
           return;
         }
         var f = arr[i];
+        // 体积预检：超限时服务端收到上限就回 413 并断连，浏览器只看得到「网络错误」，提前说清楚
+        var limMB = uploadLimitMB();
+        if (limMB && f.size > limMB * 1024 * 1024) {
+          bad++;
+          list.appendChild(el('div', { class: 'filerow err' }, [
+            el('span', { class: 'fn', text: f.name }),
+            el('span', { class: 'fr', text: '✕ ' + fmtBytes(f.size) + ' 超过单包上传上限 ' + fmtNum(limMB) + ' MB（可在「配置」页调大 storage.maxUploadMB）' })
+          ]));
+          i++; next(); return;
+        }
         var row = el('div', { class: 'filerow busy' }, [
           el('span', { class: 'fn', text: f.name }),
           el('span', { class: 'fr', text: '上传中…' })
@@ -2066,8 +2076,32 @@
   function loadBundles() {
     return api('/bundles', { timeout: 60000 }).then(function (d) {
       state.mig.bundles = d.items || [];
+      if (d.limits) state.mig.limits = d.limits;
       paintBundles();
+      paintImpLimitHint();
     }, function (e) { handleErr(e); }).catch(function () {});
+  }
+
+  /* 把服务端真实的离线包上传上限写进导入面板的提示（拿不到就保留 HTML 里的默认文案） */
+  function paintImpLimitHint() {
+    var node = $('#imp-limit-hint');
+    var mb = bundleUploadLimitMB();
+    if (!node || !mb) return;
+    node.innerHTML = '网页上传上限 ' + fmtNum(mb) + ' MB（流式落盘，不占内存，可在「配置」页调大）。超过上限的大包请直接放进程序目录下的 <code>data\\bundles</code>，刷新本页后从上方「服务器上已有」里点「导入」，或运行「一键导入离线包.cmd」，都不受上传上限限制。';
+  }
+
+  /* 网页上传离线包的体积上限（MB）；拿不到（还没登录/旧服务端）时返回 0 = 不做预检 */
+  function bundleUploadLimitMB() {
+    var l = (state.mig && state.mig.limits) || (state.session && state.session.limits);
+    var v = l && Number(l.bundleUploadMB);
+    return v > 0 ? v : 0;
+  }
+
+  /* 单包上传的体积上限（MB）；拿不到时返回 0 = 不做预检 */
+  function uploadLimitMB() {
+    var l = (state.session && state.session.limits) || (state.mig && state.mig.limits);
+    var v = l && Number(l.uploadMB);
+    return v > 0 ? v : 0;
   }
 
   function paintBundles() {
@@ -2153,6 +2187,18 @@
   }
 
   function importBundleUpload(file) {
+    /* 先按服务端声明的上限做体积预检：
+     * 超限时服务端会在收满上限那一刻回 413 并关连接，浏览器只会看到 net::ERR_CONNECTION_RESET，
+     * 界面就变成一句没头没尾的「上传失败（网络错误）」。提前拦下并给出可行通路，比让用户干等好。 */
+    var limitMB = bundleUploadLimitMB();
+    if (limitMB && file.size > limitMB * 1024 * 1024) {
+      var bigMsg = '文件 ' + fmtBytes(file.size) + ' 超过网页上传上限 ' + fmtNum(limitMB) + ' MB，未上传。'
+        + '请把 .tgz 直接放进 data\\bundles 目录后点「刷新列表」，用表格里的「导入」按钮导入；'
+        + '或运行「一键导入离线包.cmd」把文件拖进去（这两条路都不受上传上限限制）。';
+      setText('imp-status', bigMsg);
+      toast(bigMsg, 'err', 15000);
+      return;
+    }
     var ow = $('#imp-overwrite') ? $('#imp-overwrite').checked : true;
     var ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
     var to = setTimeout(function () { if (ctrl) ctrl.abort(); }, 600000);
@@ -2163,7 +2209,7 @@
     if (ctrl) init.signal = ctrl.signal;
     setBusy(true);
     setSideHint('IMPORTING…');
-    setText('imp-status', '正在上传并导入 ' + file.name + ' …');
+    setText('imp-status', '正在上传并导入 ' + file.name + '（' + fmtBytes(file.size) + '）…');
     fetch(API + '/bundles/import' + (ow ? '?overwrite=1' : ''), init).then(function (res) {
       return res.text().then(function (txt) {
         var j = null; try { j = txt ? JSON.parse(txt) : null; } catch (e) { j = null; }
@@ -2180,8 +2226,11 @@
         }
       });
     }, function (e) {
-      var msg = e && e.name === 'AbortError' ? '上传超时' : '上传失败（网络错误）';
-      setText('imp-status', msg); toast(msg, 'err');
+      var msg;
+      if (e && e.name === 'AbortError') msg = '上传超时（10 分钟内没传完）：大离线包建议直接放进 data\\bundles 目录后用「导入」按钮';
+      else if (limitMB) msg = '上传中断（网络错误）：文件超过网页上传上限 ' + fmtNum(limitMB) + ' MB、服务被停止或连接断开都会这样；大包请放进 data\\bundles 目录后用「导入」按钮';
+      else msg = '上传中断（网络错误）：请确认镜像源服务还在运行；大离线包建议放进 data\\bundles 目录后用「导入」按钮';
+      setText('imp-status', msg); toast(msg, 'err', 12000);
     }).then(function () { clearTimeout(to); setBusy(false); setSideHint('READY'); });
   }
 
@@ -2587,7 +2636,8 @@
     {
       title: '存储', en: 'STORAGE', fields: [
         { k: 'storage.dir', label: '存储目录', type: 'text' },
-        { k: 'storage.maxUploadMB', label: '单次上传上限（MB）', type: 'number' }
+        { k: 'storage.maxUploadMB', label: '单包上传上限（MB）', type: 'number', hint: '网页上传单个 .tgz 安装包的上限，1-4096。' },
+        { k: 'storage.maxBundleUploadMB', label: '离线包上传上限（MB）', type: 'number', hint: '网页上传整机备份（离线包）的上限，1-65536；服务端流式落盘，不占内存。更大的包建议直接放进 data/bundles 目录后再用「导入」按钮。' }
       ]
     },
     {

@@ -12,7 +12,7 @@ const authLib = require('./auth');
 const tokenMatches = authLib.tokenMatches;
 
 const {
-  ok, fail, readJson, readBody, sendJson, streamFile, bodyToTempFile,
+  ok, fail, readJson, readBody, readBodyToFile, sendJson, streamFile, bodyToTempFile, tempFilePath,
   baseFor, lanUrls, registryUrl,
 } = require('./http-util');
 const { parseLevelLine, validName } = require('./registry');
@@ -88,6 +88,8 @@ async function handleAdmin(ctx) {
       viaLocalhost: !!r.viaLocalhost,
       trustLocalhost: cfg.security.trustLocalhost !== false,
       authRequired: { read: cfg.security.requireRead === true, publish: cfg.security.requirePublish !== false },
+      // 上传体积上限：界面据此在上传前做预检，避免「拖进去几个 GB、等到服务端拒收才看到网络错误」
+      limits: { uploadMB: cfg.storage.maxUploadMB, bundleUploadMB: cfg.storage.maxBundleUploadMB },
       version: ctx.state.version,
       mode: cfg.mode,
       title: cfg.ui.title || '私人 npm 镜像源',
@@ -759,7 +761,11 @@ async function handleAdmin(ctx) {
       }
       Object.assign(it, info);
     }
-    return ok(res, { items, totalBytes: items.reduce((a, b) => a + (b.sizeBytes || 0), 0) });
+    return ok(res, {
+      items,
+      totalBytes: items.reduce((a, b) => a + (b.sizeBytes || 0), 0),
+      limits: { uploadMB: cfg.storage.maxUploadMB, bundleUploadMB: cfg.storage.maxBundleUploadMB },
+    });
   }
 
   if (rel === '/bundles/export' && method === 'POST') {
@@ -800,13 +806,39 @@ async function handleAdmin(ctx) {
       file = path.join(rootPath('data', 'bundles'), name);
       if (!fs.existsSync(file)) return fail(res, 404, `离线包不存在：${name}`, 'ENOENT');
     } else {
-      const maxBytes = Math.max(1, Number(cfg.storage.maxUploadMB || 500)) * 1024 * 1024;
-      const buf = await readBody(req, maxBytes);
-      if (!buf.length) return fail(res, 400, '请求体为空', 'EBADREQ');
-      let filename = '';
-      try { filename = decodeURIComponent(String(req.headers['x-filename'] || '')); } catch { filename = 'bundle.tgz'; }
-      temp = bodyToTempFile(buf, rootPath('data', 'tmp'), path.basename(filename || 'bundle.tgz'));
-      file = temp;
+      // 原始体上传（网页里拖入/选择 bundle）：流式落盘，几个 GB 的整机备份也不会把内存撑爆。
+      // 上限单独用 storage.maxBundleUploadMB（默认 4GB），与单包上传的 maxUploadMB 区分开。
+      const maxMB = Math.max(1, Number(cfg.storage.maxBundleUploadMB || 4096));
+      const maxBytes = maxMB * 1024 * 1024;
+      const tooLargeHint = '；更大的离线包请把 .tgz 拷到 data/bundles 目录后刷新列表，'
+        + '点表格里的「导入」按钮（或运行 一键导入离线包.cmd），这条路不受网页上传上限限制';
+      const declared = Number(req.headers['content-length'] || 0);
+      if (declared && declared > maxBytes) {
+        // 声明体积已经超限：不必再接收几个 GB 才拒绝
+        if (log) log.warn(`拒绝上传离线包：声明体积 ${formatBytes(declared)} 超过上限 ${maxMB} MB`);
+        return fail(res, 413, `请求体过大（上限 ${maxMB} MB）${tooLargeHint}`, 'ETOOLARGE');
+      }
+      let filename = 'bundle.tgz';
+      try {
+        const raw = path.basename(decodeURIComponent(String(req.headers['x-filename'] || '')));
+        if (raw) filename = raw;
+      } catch { /* 文件名解码失败就用默认名 */ }
+      temp = tempFilePath(rootPath('data', 'tmp'), filename);
+      try {
+        const { size } = await readBodyToFile(req, temp, { maxBytes, idleMs: 60000, totalMs: 1500000 });
+        if (!size) {
+          try { fs.unlinkSync(temp); } catch { /* 忽略 */ }
+          temp = null;
+          return fail(res, 400, '请求体为空', 'EBADREQ');
+        }
+        file = temp;
+      } catch (e) {
+        try { fs.unlinkSync(temp); } catch { /* 忽略 */ }
+        temp = null;
+        const hint = e.code === 'ETOOLARGE' ? tooLargeHint : '';
+        if (log) log.warn(`上传离线包失败：${e.message}（${e.code || 'EUNKNOWN'}）`);
+        return fail(res, e.status || 400, `${e.message}${hint}`, e.code || 'EBADREQ');
+      }
     }
     try {
       const r = await ctx.bundle.importBundle({ store, file, overwrite, logger: log });
@@ -895,6 +927,10 @@ async function handleAdmin(ctx) {
       if (st.maxUploadMB !== undefined) {
         const m = Number(st.maxUploadMB);
         if (!Number.isInteger(m) || m < 1 || m > 4096) return bad('storage.maxUploadMB 必须是 1-4096 的整数');
+      }
+      if (st.maxBundleUploadMB !== undefined) {
+        const m = Number(st.maxBundleUploadMB);
+        if (!Number.isInteger(m) || m < 1 || m > 65536) return bad('storage.maxBundleUploadMB 必须是 1-65536 的整数');
       }
       if (st.dir !== undefined) {
         if (typeof st.dir !== 'string') return bad('storage.dir 必须是字符串');

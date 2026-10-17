@@ -241,6 +241,36 @@ async function get(p, { json = false } = {}) {
       /currentDone: t\.currentDone/.test(fs.readFileSync(path.join(__dirname, '..', 'src', 'tasks.js'), 'utf8')));
   }
 
+  console.log('\x1b[1m七、导入备份：网页上传上限预检 + 本地文件通路\x1b[0m');
+  {
+    const httpSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'http-util.js'), 'utf8');
+    const srvSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'server.js'), 'utf8');
+    // ① 页面：上限提示 + 六步指引里的本地文件通路
+    check('导入备份面板有上传上限提示（#imp-limit-hint）', /id="imp-limit-hint"/.test(home.text) && /离线包上传上限/.test(home.text));
+    check('迁移指引写明「超过上传上限的大包放进 data\\bundles 再点导入」',
+      /data\\bundles/.test(home.text) && /一键导入离线包\.cmd/.test(home.text));
+    check('配置页有「离线包上传上限」字段（storage.maxBundleUploadMB）',
+      /label: '离线包上传上限（MB）'/.test(js.text) && /'storage\.maxBundleUploadMB'/.test(js.text));
+    // ② 前端预检：超限不发请求，直接给可行通路；网络错误文案不再是一句没头没尾的「上传失败（网络错误）」
+    check('前端有上限 helper（bundleUploadLimitMB / uploadLimitMB）并渲染真实上限',
+      /function bundleUploadLimitMB\s*\(/.test(js.text) && /function uploadLimitMB\s*\(/.test(js.text) && /function paintImpLimitHint\s*\(/.test(js.text));
+    check('拖入文件超上限时前端直接拦截（超过网页上传上限 + 放进 data\\bundles 指引）',
+      /超过网页上传上限/.test(js.text) && /不受上传上限限制/.test(js.text) && /file\.size > limitMB \* 1024 \* 1024/.test(js.text));
+    check('上传网络错误文案写明原因与替代通路（上传中断（网络错误））',
+      /上传中断（网络错误）/.test(js.text) && !/'上传失败（网络错误）'/.test(js.text));
+    check('单包上传也有体积预检（超过单包上传上限）', /超过单包上传上限/.test(js.text) && /storage\.maxUploadMB/.test(js.text));
+    // ③ 后端：离线包上传流式落盘、独立上限、体积/时长、可见日志
+    check('原始体上传改为流式落盘（readBodyToFile，不再整包读内存）',
+      /function readBodyToFile\s*\(/.test(httpSrc) && /createWriteStream/.test(httpSrc)
+        && /readBodyToFile\(req, temp/.test(apiSrc));
+    check('离线包上传用独立上限 storage.maxBundleUploadMB（与单包 maxUploadMB 分开）',
+      /maxBundleUploadMB \|\| 4096/.test(apiSrc) && /maxBundleUploadMB:\s*clampInt/.test(fs.readFileSync(path.join(__dirname, '..', 'src', 'config.js'), 'utf8')));
+    check('声明体积就超限时立刻 413（不必收完几个 GB）', /content-length/.test(apiSrc) && /拒绝上传离线包/.test(apiSrc));
+    check('服务端 requestTimeout 放宽到大离线包够用（≥ 10 分钟）',
+      Number((srvSrc.match(/server\.requestTimeout\s*=\s*(\d+)/) || [])[1]) >= 600000);
+    check('413/408 记 warn 日志（原来只在 debug，日志里完全看不到上传失败）', /code === 413 \|\| code === 408\) log\.warn/.test(srvSrc));
+  }
+
   console.log(`\n\x1b[1m结果：${pass}/${pass + fail} 通过\x1b[0m\n`);
   finish(fail === 0 ? 0 : 1);
 })().catch((e) => { console.error('自检异常：', e); finish(1); });

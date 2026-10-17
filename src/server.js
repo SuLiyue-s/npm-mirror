@@ -177,6 +177,7 @@ function createServer({ cliOpts = {} } = {}) {
         Hu.fail(res, code, e.message || '服务器内部错误', e.code || 'EINTERNAL');
       } else { try { res.destroy(); } catch { /* 忽略 */ } }
       if (code >= 500) log.error(`请求处理异常 ${req.method} ${pathname}: ${e.stack || e.message}`);
+      else if (code === 413 || code === 408) log.warn(`请求被拒绝 ${req.method} ${pathname}: ${e.code || ''} ${e.message}`);
       else log.debug(`请求被拒绝 ${req.method} ${pathname}: ${e.code || ''} ${e.message}`);
       return undefined;
     } finally {
@@ -188,9 +189,10 @@ function createServer({ cliOpts = {} } = {}) {
   }
 
   const server = http.createServer(handle);
-  // 上传大包需要时间，但不能完全放开：5 分钟收不完整个请求就断开，避免慢速上传长期占用连接。
-  // （readBody 另有 30s 空闲超时兜底；keepAlive 见下）
-  server.requestTimeout = 300000;
+  // 收完整个请求的上限：导入整机备份时浏览器要 POST 几个 GB，本机回环虽然快（GB/s），
+  // 但从局域网机器上传可能要好几分钟，原来 5 分钟会把大离线包直接切断。放到 30 分钟，
+  // 慢速攻击由 headersTimeout（66s）和各个 readBody/readBodyToFile 的空闲超时（30~60s）兜底。
+  server.requestTimeout = 1800000;
   // keepAlive 要比客户端（npm / 浏览器 / 本机脚本）的复用心跳长，否则空闲几秒后客户端
   // 复用一个「正被服务端关闭」的连接，下一次请求（尤其是 POST）会直接 ECONNRESET。
   // headersTimeout 必须大于 keepAliveTimeout（Node 的要求）。

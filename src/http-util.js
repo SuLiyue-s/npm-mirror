@@ -109,12 +109,108 @@ async function readJson(req, maxBytes, opts) {
   catch (e) { const err = new Error('请求体不是合法 JSON'); err.status = 400; err.code = 'EBADJSON'; throw err; }
 }
 
+/** 生成一个临时文件路径（只建目录，不创建文件；调用方负责删除文件） */
+function tempFilePath(dir, name) {
+  fs.mkdirSync(dir, { recursive: true });
+  return path.join(dir, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${name}`);
+}
+
 /** 把请求体保存为临时文件，返回路径（调用方负责删除） */
 function bodyToTempFile(buf, dir, name) {
-  fs.mkdirSync(dir, { recursive: true });
-  const file = path.join(dir, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${name}`);
+  const file = tempFilePath(dir, name);
   fs.writeFileSync(file, buf);
   return file;
+}
+
+/**
+ * 把请求体「流式」写入文件，全程不把整个请求体攒进内存（离线包动辄几个 GB，
+ * readBody 的 Buffer 方案会直接 OOM）。语义与 readBody 对齐：
+ * 超过 maxBytes → 413 ETOOLARGE；空闲/总时长超时 → 408 ETIMEDOUT。
+ * 出错时删除写了一半的文件，并且只 pause 不 destroy socket，让调用方还能把错误响应发回去。
+ * 返回 { size }（已写入的字节数）。
+ */
+function readBodyToFile(req, file, opts = {}) {
+  const maxBytes = Math.max(1, Number(opts.maxBytes || 8 * 1024 * 1024));
+  const idleMs = Number(opts.idleMs || 60000);
+  const totalMs = Number(opts.totalMs || 1800000);
+  return new Promise((resolve, reject) => {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const ws = fs.createWriteStream(file);
+    let size = 0;
+    let done = false;
+    let idleTimer = null;
+    let totalTimer = null;
+    const unlinkQuiet = () => { try { fs.unlinkSync(file); } catch { /* 忽略 */ } };
+    const cleanup = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      if (totalTimer) clearTimeout(totalTimer);
+      req.removeListener('data', onData);
+      req.removeListener('end', onEnd);
+      req.removeListener('error', onError);
+      req.removeListener('close', onClose);
+      ws.removeListener('drain', onDrain);
+      ws.removeListener('finish', onFinish);
+      ws.removeListener('error', onWsError);
+    };
+    const settle = (err) => {
+      if (done) return;
+      done = true;
+      cleanup();
+      if (!err) { resolve({ size }); return; }
+      try { req.pause(); } catch { /* 忽略 */ }
+      // Windows 上文件句柄没关就删会 EBUSY：先 destroy，等 close 再删；已经关了就直接删
+      try { ws.destroy(); } catch { /* 忽略 */ }
+      if (ws.closed) unlinkQuiet();
+      else ws.once('close', unlinkQuiet);
+      reject(err);
+    };
+    const fail = (status, code, message) => {
+      const e = new Error(message);
+      e.status = status; e.code = code;
+      settle(e);
+    };
+    const onData = (c) => {
+      if (done) return;
+      size += c.length;
+      if (size > maxBytes) {
+        fail(413, 'ETOOLARGE', `请求体过大（上限 ${Math.max(1, Math.round(maxBytes / 1048576))} MB）`);
+        return;
+      }
+      // 写盘有背压：写不进去就先暂停读 socket，drain 后再继续，避免内存里堆数据
+      if (!ws.write(c)) req.pause();
+      if (idleTimer) { clearTimeout(idleTimer); idleTimer = setTimeout(() => onTimeout('idle'), idleMs); }
+    };
+    const onDrain = () => { if (!done) req.resume(); };
+    const onTimeout = (kind) => {
+      const secs = Math.round((kind === 'idle' ? idleMs : totalMs) / 1000);
+      fail(408, 'ETIMEDOUT', kind === 'idle' ? `请求体接收超时（${secs} 秒没有新数据）` : `请求体读取总时长超时（${secs} 秒）`);
+    };
+    const onEnd = () => {
+      if (done) return;
+      if (idleTimer) clearTimeout(idleTimer);
+      if (totalTimer) clearTimeout(totalTimer);
+      ws.end();      // 等 'finish' 确认全部落盘再算完成
+    };
+    const onFinish = () => settle(null);
+    const onError = (e) => settle(e);
+    // 客户端中途断开：req.complete 为 false 时说明请求体没传完，删掉半截文件
+    const onClose = () => {
+      if (!done && !req.complete) settle(Object.assign(new Error('客户端中断了上传'), { code: 'ECONNRESET' }));
+    };
+    const onWsError = (e) => settle(e);
+    req.on('data', onData);
+    req.on('end', onEnd);
+    req.on('error', onError);
+    req.on('close', onClose);
+    ws.on('drain', onDrain);
+    ws.on('finish', onFinish);
+    ws.on('error', onWsError);
+    idleTimer = setTimeout(() => onTimeout('idle'), idleMs);
+    totalTimer = setTimeout(() => onTimeout('total'), totalMs);
+    // 0 字节请求（Content-Length: 0，例如误点上传空文件）：这类 IncomingMessage 可能在挂监听
+    // 之前就已经结束，'end' 不会再补发，不主动收尾就会一直挂到超时。这里补一次。
+    if (req.readableEnded) onEnd();
+  });
 }
 
 function streamFile(res, file, opts = {}) {
@@ -249,6 +345,6 @@ function originAllowed(req) {
 }
 
 module.exports = {
-  MIME, sendJson, ok, fail, sendText, readBody, readJson, bodyToTempFile,
+  MIME, sendJson, ok, fail, sendText, readBody, readJson, readBodyToFile, bodyToTempFile, tempFilePath,
   streamFile, baseFor, clientIp, lanAddresses, lanUrls, registryUrl, hostName, hostAllowed, originAllowed,
 };

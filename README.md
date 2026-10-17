@@ -111,7 +111,8 @@ node cli.js import npm-mirror-all.tgz
 | `security.token` | 随机生成 | 访问令牌（**不要提交到仓库**） |
 | `security.requirePublish` / `requireRead` | `true` / `false` | 发布 / 读取是否需要令牌 |
 | `security.trustLocalhost` | `true` | 本机回环地址免令牌 |
-| `storage.dir` / `storage.maxUploadMB` | `data/storage` / `500` | 包存储目录 / 上传上限（MB） |
+| `storage.dir` / `storage.maxUploadMB` | `data/storage` / `500` | 包存储目录 / 单包上传上限（MB，1-4096） |
+| `storage.maxBundleUploadMB` | `4096` | 网页上传整机备份（离线包）的上限（MB，1-65536）。上传走流式落盘，不占内存；更大的包可放进 `data/bundles` 后用界面「导入」 |
 | `log.level` / `log.maxDays` | `info` / `7` | 日志级别 / 保留天数 |
 | `ui.title` | `私人 npm 镜像源` | 管理界面标题 |
 

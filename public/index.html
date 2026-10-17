@@ -226,7 +226,7 @@
           <li><b>在有网的机器上</b>打开「包管理」，把需要的公共包「添加」进来（tarball 会被缓存到本机）。</li>
           <li>回到本页，在「导出备份」中选择范围（建议 <code>全部</code> 或 <code>仅公共缓存</code>），点击<b>导出 bundle</b>。</li>
           <li>在下方「bundle 历史」里点<b>下载</b>，把生成的 <code>.tar</code>/<code>.tgz</code> bundle 拷到 U 盘。</li>
-          <li>把 U 盘插到<b>无网络的电脑</b>，启动本镜像源服务，打开本页，在「导入备份」里<b>拖入 bundle 文件</b>（或选择服务器上已有的 bundle）。</li>
+          <li>把 U 盘插到<b>无网络的电脑</b>，启动本镜像源服务，打开本页，在「导入备份」里<b>拖入 bundle 文件</b>（或选择服务器上已有的 bundle）。整机备份往往有几个 GB：<b>超过网页上传上限的包请直接放进 <code>data\bundles</code> 目录</b>，刷新本页后在「服务器上已有」里点「导入」，这条路不受上传上限限制。</li>
           <li>若该电脑装过 npm 全局包，可再用「从本机 npm 缓存导入」把 <code>_cacache</code> 里的包直接搬进镜像源，无需联网。</li>
           <li>导入完成后在「配置」页生成客户端 <code>.npmrc</code>，让其它项目指向本镜像源即可离线安装。</li>
         </ol>
@@ -276,6 +276,7 @@
             <i>或 <span class="link" id="imp-pick">点击选择文件</span>（.tar / .tgz / .tar.gz）</i>
             <input type="file" id="imp-input" hidden />
           </div>
+          <div class="muted" id="imp-limit-hint">网页上传上限见「配置」页的「离线包上传上限」（默认 4096 MB，流式落盘不占内存）。超过上限的大包请直接放进程序目录下的 <code>data\bundles</code>，刷新本页后从上方「服务器上已有」里点「导入」，或运行「一键导入离线包.cmd」，都不受上传上限限制。</div>
           <label class="checkline"><input type="checkbox" id="imp-overwrite" checked /> 覆盖已存在的同名包/版本</label>
           <div class="panel-actions"><span class="muted" id="imp-status"></span></div>
         </div>
