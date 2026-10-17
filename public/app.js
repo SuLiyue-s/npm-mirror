@@ -330,6 +330,205 @@
     return node;
   }
 
+  /* ================= 日期时间选择器（自绘弹层） =================
+   * 原生 <input type="datetime-local"> 点开的小日历弹窗由浏览器内部绘制，
+   * CSS 只能改输入框本体、改不了那个弹窗，和项目深色控制台风格差得远。
+   * 这里改成「只读输入框 + 自绘弹层」：点输入框弹出项目风格的月历，
+   * 时/分用深色下拉选择，底部提供 清除 / 现在 / 取消 / 确定。
+   * 输入框显示人类可读的 "YYYY-MM-DD HH:mm"，ISO 值存在 input.__dtIso 上。 */
+  var DT_WEEK = ['一', '二', '三', '四', '五', '六', '日'];
+
+  function dtParse(s) {
+    var m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(String(s || ''));
+    if (!m) return null;
+    return { y: +m[1], m: +m[2], d: +m[3], hh: +m[4], mm: +m[5] };
+  }
+  function dtIso(v) { return v ? v.y + '-' + pad2(v.m) + '-' + pad2(v.d) + 'T' + pad2(v.hh) + ':' + pad2(v.mm) : ''; }
+  function dtHuman(v) { return v ? v.y + '-' + pad2(v.m) + '-' + pad2(v.d) + ' ' + pad2(v.hh) + ':' + pad2(v.mm) : ''; }
+  function dtNow() {
+    var n = new Date();
+    return { y: n.getFullYear(), m: n.getMonth() + 1, d: n.getDate(), hh: n.getHours(), mm: n.getMinutes() };
+  }
+  function dtToday() { var n = dtNow(); return { y: n.y, m: n.m, d: n.d }; }
+  function dtSameDay(a, b) { return !!a && !!b && a.y === b.y && a.m === b.m && a.d === b.d; }
+  /* 读输入框里的 ISO 值（'' 表示未填），供导出逻辑使用 */
+  function dtIsoOf(input) { return (input && input.__dtIso) || ''; }
+
+  function dateTimePicker(input) {
+    if (!input) return null;
+    if (input.__dtPicker) return input.__dtPicker;
+    var pop = null, draft = null, cursor = null, grid = null, titleEl = null, hourSel = null, minSel = null;
+    var opened = false;
+
+    /* 把内部值同步回输入框：显示人类可读文本，空值挂 .is-empty 用项目占位色 */
+    function sync() {
+      var v = dtParse(input.__dtIso);
+      input.value = v ? dtHuman(v) : '';
+      input.classList.toggle('is-empty', !v);
+      try {
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+      } catch (e) { /* 老浏览器没有 Event 构造器，忽略 */ }
+    }
+
+    function buildPop() {
+      if (pop) return;
+      titleEl = el('div', { class: 'dt-title' });
+      grid = el('div', { class: 'dt-grid' });
+      hourSel = el('select', { 'aria-label': '小时' });
+      minSel = el('select', { 'aria-label': '分钟' });
+      for (var h = 0; h < 24; h++) hourSel.appendChild(el('option', { value: pad2(h), text: pad2(h) }));
+      for (var mi = 0; mi < 60; mi++) minSel.appendChild(el('option', { value: pad2(mi), text: pad2(mi) }));
+      hourSel.addEventListener('change', function () { if (draft) draft.hh = +hourSel.value; });
+      minSel.addEventListener('change', function () { if (draft) draft.mm = +minSel.value; });
+      pop = el('div', { class: 'modal dt-pop', role: 'dialog', 'aria-label': '选择日期时间' }, [
+        el('div', { class: 'modal-head' }, [
+          el('div', {}, [
+            el('h3', { text: '选择日期时间' }),
+            el('div', { class: 'sub', text: 'DATE / TIME' })
+          ]),
+          el('button', { class: 'modal-close', type: 'button', title: '关闭', text: '✕', onclick: function () { closePop(); } })
+        ]),
+        el('div', { class: 'dt-head' }, [
+          navBtn('«', -12, '上一年'), navBtn('‹', -1, '上个月'),
+          titleEl,
+          navBtn('›', 1, '下个月'), navBtn('»', 12, '下一年')
+        ]),
+        el('div', { class: 'dt-week' }, DT_WEEK.map(function (w) { return el('span', { text: w }); })),
+        grid,
+        el('div', { class: 'dt-time' }, [
+          el('span', { text: '时间' }),
+          hourSel, el('span', { text: ':' }), minSel,
+          el('span', { class: 'sp' })
+        ]),
+        el('div', { class: 'dt-foot' }, [
+          el('button', { class: 'btn btn-xs btn-ghost', type: 'button', text: '清除', onclick: clearValue }),
+          el('button', { class: 'btn btn-xs btn-ghost', type: 'button', text: '现在', onclick: setNow }),
+          el('div', { class: 'spacer' }),
+          el('button', { class: 'btn btn-xs btn-ghost', type: 'button', text: '取消', onclick: function () { closePop(); } }),
+          el('button', { class: 'btn btn-xs btn-primary', type: 'button', text: '确定', onclick: apply })
+        ])
+      ]);
+      decorateFx(pop);
+      pop.setAttribute('data-for', input.id || '');
+      pop.hidden = true;
+      document.body.appendChild(pop);
+    }
+
+    function navBtn(txt, delta, tip) {
+      return el('button', {
+        class: 'dt-nav', type: 'button', text: txt, 'aria-label': tip, title: tip,
+        onclick: function () {
+          var total = cursor.y * 12 + (cursor.m - 1) + delta;
+          cursor = { y: Math.floor(total / 12), m: total % 12 + 1 };
+          renderGrid();
+        }
+      });
+    }
+
+    function renderGrid() {
+      clear(grid);
+      titleEl.textContent = cursor.y + ' 年 ' + cursor.m + ' 月';
+      var first = new Date(cursor.y, cursor.m - 1, 1);
+      var offset = (first.getDay() + 6) % 7; /* 周一开头 */
+      var today = dtToday();
+      for (var i = 0; i < 42; i++) {
+        var d = new Date(cursor.y, cursor.m - 1, 1 - offset + i);
+        var c = { y: d.getFullYear(), m: d.getMonth() + 1, d: d.getDate() };
+        var cls = 'dt-day';
+        if (c.m !== cursor.m) cls += ' is-other';
+        if (dtSameDay(c, today)) cls += ' is-today';
+        if (dtSameDay(c, draft)) cls += ' is-sel';
+        grid.appendChild(el('button', {
+          class: cls, type: 'button', text: String(c.d),
+          onclick: (function (cell) {
+            return function () {
+              draft.y = cell.y; draft.m = cell.m; draft.d = cell.d;
+              cursor = { y: cell.y, m: cell.m };
+              renderGrid();
+            };
+          })(c)
+        }));
+      }
+    }
+
+    function pick(v) {
+      draft = v || dtNow();
+      cursor = { y: draft.y, m: draft.m };
+      hourSel.value = pad2(draft.hh);
+      minSel.value = pad2(draft.mm);
+      renderGrid();
+    }
+
+    function setNow() { pick(dtNow()); }
+
+    function apply() {
+      if (!draft) return;
+      input.__dtIso = dtIso(draft);
+      sync();
+      closePop();
+    }
+
+    function clearValue() {
+      input.__dtIso = '';
+      sync();
+      closePop();
+    }
+
+    function place() {
+      var r = input.getBoundingClientRect();
+      var w = pop.offsetWidth || 288, h = pop.offsetHeight || 320;
+      var left = Math.max(8, Math.min(r.left, window.innerWidth - w - 8));
+      var top = r.bottom + 6;
+      if (top + h > window.innerHeight - 8) top = Math.max(8, r.top - h - 6);
+      pop.style.left = left + 'px';
+      pop.style.top = top + 'px';
+    }
+
+    function onDocDown(ev) {
+      if (!pop || pop.hidden) return;
+      if (pop.contains(ev.target) || ev.target === input) return;
+      closePop();
+    }
+    function onKey(ev) { if (ev.key === 'Escape') { ev.stopPropagation(); closePop(); } }
+
+    function openPop() {
+      if (opened) return;
+      buildPop();
+      var v = dtParse(input.__dtIso);
+      pick(v || dtNow());
+      pop.hidden = false;
+      place();
+      opened = true;
+      input.setAttribute('aria-expanded', 'true');
+      document.addEventListener('mousedown', onDocDown, true);
+      document.addEventListener('keydown', onKey, true);
+      window.addEventListener('resize', closePop);
+      /* 视图内滚动会把输入框带走，弹层跟着关掉最稳（日历本身不需要滚动） */
+      document.addEventListener('scroll', closePop, true);
+    }
+
+    function closePop() {
+      if (!opened || !pop) return;
+      opened = false;
+      pop.hidden = true;
+      input.setAttribute('aria-expanded', 'false');
+      document.removeEventListener('mousedown', onDocDown, true);
+      document.removeEventListener('keydown', onKey, true);
+      window.removeEventListener('resize', closePop);
+      document.removeEventListener('scroll', closePop, true);
+    }
+
+    input.__dtIso = input.getAttribute('data-iso') || '';
+    input.addEventListener('click', openPop);
+    input.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter' || ev.key === ' ' || ev.key === 'ArrowDown') { ev.preventDefault(); openPop(); }
+    });
+    sync();
+    input.__dtPicker = { open: openPop, close: closePop };
+    return input.__dtPicker;
+  }
+
   /* ================= 弹窗 ================= */
   function modal(cfg) {
     var root = $('#modal-root');
@@ -3873,16 +4072,11 @@
       if (arow) arow.hidden = state.mig.scope !== 'added';
       paintSelbar();
     });
-    /* datetime-local 没填时间时的原生占位文字（年/月/日 --:--）也跟项目里的占位色保持一致，
-     * 空值时挂 .is-empty 让 style.css 把分段文字调成 --txt-faint */
-    function syncAddedEmpty(ev) {
-      var el = ev && ev.target;
-      if (el && el.type === 'datetime-local') el.classList.toggle('is-empty', !el.value);
-    }
+    /* 「按添加时间」的两个时间框：换成项目风格的自绘日期时间弹层
+     * （原生 datetime-local 点开的小日历弹窗是浏览器内部绘制的，改不了样式） */
     ['exp-added-from', 'exp-added-to'].forEach(function (id) {
-      on(id, 'input', syncAddedEmpty);
-      on(id, 'change', syncAddedEmpty);
-      on(id, 'blur', syncAddedEmpty);
+      var inp = document.getElementById(id);
+      if (inp) dateTimePicker(inp);
     });
     on('exp-run', 'click', function () {
       var scope = state.mig.scope;
@@ -3899,10 +4093,11 @@
         var af = $('#exp-auto-fetch');
         payload.autoFetchDeps = !(af && af.checked === false);
       } else if (scope === 'added') {
-        /* 「按添加时间」导出：datetime-local 的值是本地时间，转成毫秒再交给后端统一规范化；
+        /* 「按添加时间」导出：自绘日期时间选择器把本地时间存成 ISO（input.__dtIso）；
          * 两端都空没有意义（等于全部），直接提示；起晚于止也拦在前端，省得白跑一趟任务。 */
-        var fv = ($('#exp-added-from') && $('#exp-added-from').value || '').trim();
-        var tv = ($('#exp-added-to') && $('#exp-added-to').value || '').trim();
+        var fromEl = $('#exp-added-from'), toEl = $('#exp-added-to');
+        var fv = dtIsoOf(fromEl);
+        var tv = dtIsoOf(toEl);
         if (!fv && !tv) { toast('请至少填写起始或结束时间（留空一端表示不限）', 'warn'); return; }
         var fms = fv ? new Date(fv).getTime() : null;
         var tms = tv ? new Date(tv).getTime() : null;
@@ -3910,7 +4105,9 @@
         if (fms !== null && tms !== null && fms > tms) { toast('起始时间不能晚于结束时间', 'warn'); return; }
         payload.addedFrom = fms !== null ? new Date(fms).toISOString() : null;
         payload.addedTo = tms !== null ? new Date(tms).toISOString() : null;
-        addedLabel = (fv || '不限') + ' ~ ' + (tv || '不限');
+        var fShow = (fromEl && fromEl.value || '').trim();
+        var tShow = (toEl && toEl.value || '').trim();
+        addedLabel = (fShow || '不限') + ' ~ ' + (tShow || '不限');
       }
       var btn = $('#exp-run');
       if (addedLabel) setText('exp-status', '正在挑选添加时间在 ' + addedLabel + ' 之间的包并打包，包较多时可能耗时较久…');
