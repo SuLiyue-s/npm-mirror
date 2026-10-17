@@ -126,8 +126,27 @@ function collectDepClosure(store, roots, { max = DEPS_MAX_PACKAGES } = {}) {
  * 导出 bundle
  * @param {object} o
  * @param {boolean} [o.withDeps] scope='selected' 时把被选包的（递归）依赖也一起导出
+ * @param {function} [o.onProgress] 进度回调：
+ *   { phase:'collect-start', total }                      开始统计要导出的包
+ *   { phase:'collect-done', packages, entries, totalBytes } 统计/文件清单准备完成
+ *   { phase:'pack', entriesDone, entriesTotal, bytes, totalBytes, pkg, pkgDone, pkgTotal }
+ *   { phase:'package', name, status:'packed', tarballs, versions, sizeBytes }  某个包的全部条目已写入
+ * @param {function} [o.isCanceled] 返回 true 时尽快中止（抛 code=ECANCELED）
  */
-async function exportBundle({ store, scope = 'all', names = [], fileName, withDeps = false, logger }) {
+async function exportBundle({
+  store, scope = 'all', names = [], fileName, withDeps = false, logger, onProgress, isCanceled,
+}) {
+  const emit = (ev) => {
+    if (!onProgress) return;
+    // 进度回调只是旁路信息：它抛错不能把已经打了半天的包搞失败
+    try { onProgress(ev); } catch { /* 忽略 */ }
+  };
+  const canceledError = () => {
+    const e = new Error('导出已取消');
+    e.code = 'ECANCELED';
+    return e;
+  };
+  const checkCancel = () => { if (isCanceled && isCanceled()) throw canceledError(); };
   const all = Array.from(store.index.keys());
   let targets = all;
   if (scope === 'private') targets = all.filter(n => { const m = store.index.get(n); return m.source === 'private' || m.private; });
@@ -151,12 +170,19 @@ async function exportBundle({ store, scope = 'all', names = [], fileName, withDe
     throw err;
   }
 
+  emit({ phase: 'collect-start', total: targets.length });
   const entries = [];
   const manifestPackages = [];
+  /* 逐包统计：每个包在 entries 里占几条、几个 tarball、多少字节，
+   * 供打包阶段的「逐包打包详情」与「当前包」进度条使用（必须在 unshift manifest 之前记下终点）。 */
+  const pkgPlan = [];
   let versions = 0, tarballs = 0, bytes = 0;
   for (const name of targets) {
+    checkCancel();
     const rec = store.get(name);
     if (!rec) continue;
+    const startAt = entries.length;
+    let entryCount = 0;
     let dir;
     try { dir = safePkgDir(name); }
     catch (e) {
@@ -183,6 +209,14 @@ async function exportBundle({ store, scope = 'all', names = [], fileName, withDe
     }
     entries.push({ name: `storage/${dir}/packument.json`, source: store.packumentPath(name) });
     if (fs.existsSync(store.metaPath(name))) entries.push({ name: `storage/${dir}/meta.json`, source: store.metaPath(name) });
+    entryCount = entries.length - startAt;
+    pkgPlan.push({
+      name,
+      entries: entryCount,
+      tarballs: pkgVersions.filter(v => v.cached).length,
+      versions: pkgVersions.length,
+      sizeBytes: pkgVersions.reduce((a, v) => a + (v.sizeBytes || 0), 0),
+    });
     manifestPackages.push({
       name,
       source: meta.source || 'upstream',
@@ -191,6 +225,8 @@ async function exportBundle({ store, scope = 'all', names = [], fileName, withDe
       private: !!meta.private,
       versions: pkgVersions,
     });
+    // 统计阶段对大镜像也要有反馈（每个包都要 stat 一遍 tarball）
+    if (manifestPackages.length % 100 === 0) emit({ phase: 'collect', packages: manifestPackages.length, total: targets.length });
   }
 
   const manifest = {
@@ -205,7 +241,15 @@ async function exportBundle({ store, scope = 'all', names = [], fileName, withDe
     missingDeps: missingDeps.slice(0, 200),
     packages: manifestPackages,
   };
+  // 先把每个条目的大小补齐（下面要拿它算「预计总字节」，好让进度条有百分比，而不是只有已写入字节）
+  for (const e of entries) {
+    if (e.size === undefined && e.source) {
+      try { e.size = fs.statSync(e.source).size; } catch { e.size = 0; }
+    }
+  }
   entries.unshift({ name: 'manifest.json', data: Buffer.from(JSON.stringify(manifest, null, 2)) });
+  const expectedBytes = entries.reduce((a, e) => a + (e.size || (e.data ? e.data.length : 0)), 0);
+  emit({ phase: 'collect-done', packages: manifestPackages.length, entries: entries.length, totalBytes: expectedBytes });
 
   ensureDir(bundleDir());
   const base = safeFileName(fileName) || `npm-mirror-${scope}-${stamp()}`;
@@ -224,7 +268,42 @@ async function exportBundle({ store, scope = 'all', names = [], fileName, withDe
     if (logger) logger.warn(`离线包同名已存在，改名保存为 ${finalName}`);
   }
   const tmpPath = path.join(bundleDir(), `.${finalName}.part`);
-  const res = await tar.packTarGz(tmpPath, entries, { gzip: true });
+  // entries[0] 是 manifest.json，所以每个包在打包进度里的「完成下标」要整体 +1
+  const pkgEnds = [];
+  {
+    let at = 1;
+    for (const p of pkgPlan) {
+      at += p.entries;
+      pkgEnds.push({ end: at, name: p.name, tarballs: p.tarballs, versions: p.versions, sizeBytes: p.sizeBytes, entries: p.entries });
+    }
+  }
+  let pkgIdx = 0;
+  const res = await tar.packTarGz(tmpPath, entries, {
+    gzip: true,
+    shouldAbort: isCanceled,
+    onProgress: (info) => {
+      // 某个包的全部条目（tarball + packument/meta）都写完了：给界面补一条「逐包打包详情」
+      while (pkgIdx < pkgEnds.length && info.count >= pkgEnds[pkgIdx].end) {
+        const p = pkgEnds[pkgIdx++];
+        emit({ phase: 'package', name: p.name, status: 'packed', tarballs: p.tarballs, versions: p.versions, sizeBytes: p.sizeBytes });
+      }
+      const cur = pkgEnds[pkgIdx] || (pkgEnds.length ? pkgEnds[pkgEnds.length - 1] : null);
+      // 当前包进度条按 tarball 个数走（packument/meta 也占条目，但界面显示「个 tarball」更直观）
+      const pkgTotal = cur ? Math.max(1, cur.tarballs) : 0;
+      const startAt = cur ? cur.end - cur.entries : 0;
+      const doneEntries = cur ? Math.max(0, Math.min(cur.entries, info.entry - 1 - startAt)) : 0;
+      emit({
+        phase: 'pack',
+        entriesDone: info.count,
+        entriesTotal: info.entriesTotal,
+        bytes: info.total,
+        totalBytes: expectedBytes,
+        pkg: cur ? cur.name : '',
+        pkgDone: Math.min(doneEntries, pkgTotal),
+        pkgTotal,
+      });
+    },
+  });
   fs.renameSync(tmpPath, finalPath);
   if (logger) logger.info(`导出离线包完成: ${finalName} (${manifestPackages.length} 个包 / ${tarballs} 个 tarball${depsAdded ? ` / 含依赖 ${depsAdded} 个` : ''})`);
   return {
@@ -263,9 +342,27 @@ async function readBundleManifest(file) {
   return manifest;
 }
 
-/** 从 bundle 导入（合并式） */
-async function importBundle({ store, file, overwrite = false, metadataOnly = false, onProgress, logger }) {
-  await readBundleManifest(file); // 先校验格式与 manifest 是否可读
+/**
+ * 从 bundle 导入（合并式）
+ * @param {object} o
+ * @param {function} [o.onProgress] 进度回调：
+ *   { phase:'extract', bytes, totalBytes, current }            正在解包到临时目录（bytes=已解出数据字节）
+ *   { phase:'extract-done', bytes, packages }                  解包完成
+ *   { phase:'package-start', index, total, name, versionTotal } 开始导入某个包
+ *   { phase:'version', name, versionDone, versionTotal }        该包内正在处理第 k/N 个版本
+ *   { phase:'package', name, status:'imported'|'skipped'|'failed', versions, tarballs, skipped, failed, reason }
+ * @param {function} [o.isCanceled] 返回 true 时在包之间/版本之间尽快停下来（结果带 canceled=true 的部分数据）
+ */
+async function importBundle({
+  store, file, overwrite = false, metadataOnly = false, onProgress, isCanceled, logger,
+}) {
+  const manifest = await readBundleManifest(file); // 先校验格式与 manifest 是否可读
+  const mstats = (manifest && manifest.stats) || {};
+  const emit = (ev) => {
+    if (!onProgress) return;
+    try { onProgress(ev); } catch { /* 进度回调不影响导入结果 */ }
+  };
+  const canceled = () => !!(isCanceled && isCanceled());
   const tmp = path.join(tmpRoot(), `import-${stamp()}-${Math.random().toString(36).slice(2, 8)}`);
   ensureDir(tmp);
   const result = {
@@ -276,27 +373,46 @@ async function importBundle({ store, file, overwrite = false, metadataOnly = fal
     // 完整镜像包（scope=all）解压后可能有数 GB，默认 2GB 上限会误伤；按包体积放宽，同时仍防解压炸弹
     let bundleSize = 0;
     try { bundleSize = fs.statSync(file).size; } catch { bundleSize = 0; }
+    // 解包进度的分母：优先用 manifest 记录的 tarball 总字节，再兜底用包体积（tgz 里 tarball 已压缩，两者量级接近）
+    const totalBytes = Math.max(1, Number(mstats.tarballBytes) || 0, bundleSize);
+    let extracted = 0;
+    const expectedPkgs = Number(mstats.packages) || 0;
+    emit({ phase: 'extract', bytes: 0, totalBytes, packages: expectedPkgs });
     await tar.extractTarGz(file, tmp, {
       filter: rel => rel === 'manifest.json' || rel.startsWith('storage/'),
-      onEntry: onProgress,
+      onEntry: (rel, written) => {
+        extracted += Number(written) || 0;
+        emit({ phase: 'extract', bytes: extracted, totalBytes, current: rel });
+      },
       maxTotalBytes: Math.max(2 * 1024 * 1024 * 1024, bundleSize * 4),
       maxEntries: 2000000,
     });
     const dirs = fs.existsSync(path.join(tmp, 'storage')) ? fs.readdirSync(path.join(tmp, 'storage')) : [];
+    emit({ phase: 'extract-done', bytes: extracted, packages: dirs.length });
 
+    let pkgIndex = 0;
     for (const dir of dirs) {
+      if (canceled()) { result.canceled = true; break; }
       const pkgDir = path.join(tmp, 'storage', dir);
       if (!fs.statSync(pkgDir).isDirectory()) continue;
       const incomingPackument = readJson(path.join(pkgDir, 'packument.json'), null);
       if (!incomingPackument || !incomingPackument.versions) continue;
       const name = incomingPackument.name || dir.replace(/__/g, '/');
+      pkgIndex++;
+      const versionEntries = Object.entries(incomingPackument.versions);
+      const versionTotal = versionEntries.length;
+      emit({ phase: 'package-start', index: pkgIndex, total: dirs.length, name, versionTotal });
       if (!isSafePkgName(name)) {
         const error = `非法包名，已跳过导入：${String(name)}`;
         result.failed.push({ name: String(name), error });
         if (logger) logger.warn(`导入离线包跳过：${error}`);
+        emit({ phase: 'package', index: pkgIndex, name: String(name), status: 'failed', versions: 0, tarballs: 0, skipped: 0, failed: 1, reason: error });
         continue;
       }
+      // 本包的计数起点：结束时用差值算出这个包实际导入/跳过/失败的数量，供界面逐包显示
+      const before = { versions: result.versions, tarballs: result.tarballs, skipped: result.skipped, failed: result.failed.length };
       const incomingMeta = readJson(path.join(pkgDir, 'meta.json'), {}) || {};
+      let versionDone = 0;
       try {
         await store.withLock(name, async () => {
           const local = store.get(name);
@@ -306,7 +422,10 @@ async function importBundle({ store, file, overwrite = false, metadataOnly = fal
           let added = 0;
           let invalidVersions = 0;
           let metadataOnlySkipped = 0;
-          for (const [v, manifestV] of Object.entries(incomingPackument.versions)) {
+          for (const [v, manifestV] of versionEntries) {
+            versionDone++;
+            emit({ phase: 'version', name, versionDone, versionTotal });
+            if ((versionDone & 15) === 0 && canceled()) { result.canceled = true; break; }
             if (!isSafeVersion(v)) { invalidVersions++; continue; }
             if (packument.versions[v] && !overwrite) { result.skipped++; continue; }
             const srcFile = path.join(pkgDir, 'tarballs', `${pkgBaseName(name)}-${v}.tgz`);
@@ -401,9 +520,29 @@ async function importBundle({ store, file, overwrite = false, metadataOnly = fal
         });
       } catch (e) {
         result.failed.push({ name, error: e.message });
+        if (logger) logger.warn(`导入 ${name} 失败：${e.message}`);
       }
+      // 逐包结果（左栏一行）：用计数差值判断这个包最终是「导入成功 / 全部已存在跳过 / 失败」
+      const dv = result.versions - before.versions;
+      const dt = result.tarballs - before.tarballs;
+      const ds = result.skipped - before.skipped;
+      const failedNow = result.failed.length - before.failed;
+      emit({
+        phase: 'package',
+        index: pkgIndex,
+        name,
+        status: dv > 0 ? 'imported' : (failedNow > 0 ? 'failed' : 'skipped'),
+        versions: dv,
+        tarballs: dt,
+        skipped: ds,
+        failed: failedNow,
+        reason: failedNow > 0 ? result.failed[result.failed.length - 1].error : '',
+      });
     }
-    if (logger) logger.info(`导入离线包完成: ${result.file} → ${result.packages} 个包 / ${result.versions} 个版本 / ${result.tarballs} 个 tarball`);
+    if (logger) {
+      const tail = result.canceled ? '（已取消，保留已导入的部分）' : '';
+      logger.info(`导入离线包完成: ${result.file} → ${result.packages} 个包 / ${result.versions} 个版本 / ${result.tarballs} 个 tarball${tail}`);
+    }
     return result;
   } finally {
     try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* 忽略 */ }

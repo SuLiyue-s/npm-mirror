@@ -20,6 +20,7 @@ function brief(t) {
   return {
     id: t.id, type: t.type, title: t.title, status: t.status,
     total: t.total, done: t.done, ok: t.ok, failed: t.failed, bytes: t.bytes,
+    bytesTotal: t.bytesTotal || 0,
     skipped: t.skipped || 0,
     versions: t.versions || 0, tarballs: t.tarballs || 0,
     current: t.current || '', currentDone: t.currentDone || 0, currentTotal: t.currentTotal || 0,

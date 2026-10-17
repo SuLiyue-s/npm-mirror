@@ -2172,17 +2172,7 @@
     }).then(function (ok) {
       if (!ok) return;
       setSideHint('IMPORTING…');
-      setText('imp-status', '正在导入 ' + file + ' …');
-      api('/bundles/import', { method: 'POST', body: { file: file, overwrite: !!ow }, timeout: 600000 }).then(function (d) {
-        setSideHint('READY');
-        var msg = '导入完成：' + fmtNum(d.packages) + ' 包 / ' + fmtNum(d.versions) + ' 版本 / ' + fmtNum(d.tarballs) + ' tarball';
-        if (d.skipped) msg += '，跳过 ' + fmtNum(d.skipped);
-        if (d.overwritten) msg += '，覆盖 ' + fmtNum((d.overwritten && d.overwritten.length) || d.overwritten);
-        setText('imp-status', msg);
-        toast(msg, (d.failed && d.failed.length) ? 'warn' : 'ok', 9000);
-        (d.failed || []).slice(0, 5).forEach(function (f) { toast('· ' + f.name + '：' + (f.error || '失败'), 'err', 7000); });
-        loadBundles(); loadPackages();
-      }, function (e) { setSideHint('ERROR'); setText('imp-status', '导入失败：' + e.message); handleErr(e); });
+      runBundleImport({ name: file, overwrite: !!ow });
     });
   }
 
@@ -2200,38 +2190,8 @@
       return;
     }
     var ow = $('#imp-overwrite') ? $('#imp-overwrite').checked : true;
-    var ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
-    var to = setTimeout(function () { if (ctrl) ctrl.abort(); }, 600000);
-    var headers = { 'X-Filename': encodeURIComponent(file.name) };
-    var tk = getToken();
-    if (tk) headers['X-Mirror-Token'] = tk;
-    var init = { method: 'POST', headers: headers, body: file };
-    if (ctrl) init.signal = ctrl.signal;
-    setBusy(true);
     setSideHint('IMPORTING…');
-    setText('imp-status', '正在上传并导入 ' + file.name + '（' + fmtBytes(file.size) + '）…');
-    fetch(API + '/bundles/import' + (ow ? '?overwrite=1' : ''), init).then(function (res) {
-      return res.text().then(function (txt) {
-        var j = null; try { j = txt ? JSON.parse(txt) : null; } catch (e) { j = null; }
-        if (res.ok && j && j.ok) {
-          var d = j.data;
-          var msg = '导入完成：' + fmtNum(d.packages) + ' 包 / ' + fmtNum(d.versions) + ' 版本 / ' + fmtNum(d.tarballs) + ' tarball';
-          if (d.skipped) msg += '，跳过 ' + fmtNum(d.skipped);
-          setText('imp-status', msg);
-          toast(msg, (d.failed && d.failed.length) ? 'warn' : 'ok', 9000);
-          loadBundles(); loadPackages();
-        } else {
-          setText('imp-status', '导入失败：' + ((j && j.error) || ('HTTP ' + res.status)));
-          toast('导入失败：' + ((j && j.error) || ('HTTP ' + res.status)), 'err');
-        }
-      });
-    }, function (e) {
-      var msg;
-      if (e && e.name === 'AbortError') msg = '上传超时（10 分钟内没传完）：大离线包建议直接放进 data\\bundles 目录后用「导入」按钮';
-      else if (limitMB) msg = '上传中断（网络错误）：文件超过网页上传上限 ' + fmtNum(limitMB) + ' MB、服务被停止或连接断开都会这样；大包请放进 data\\bundles 目录后用「导入」按钮';
-      else msg = '上传中断（网络错误）：请确认镜像源服务还在运行；大离线包建议放进 data\\bundles 目录后用「导入」按钮';
-      setText('imp-status', msg); toast(msg, 'err', 12000);
-    }).then(function () { clearTimeout(to); setBusy(false); setSideHint('READY'); });
+    runBundleImport({ file: file, overwrite: !!ow });
   }
 
   function deleteBundle(file) {
@@ -2599,6 +2559,345 @@
         if (opts.btn) btnBusy(opts.btn, false);
         handleErr(e);
       });
+  }
+
+  /* ============================================================
+   * 3.5 离线包导出 / 导入：详细进度弹窗
+   * 后端在请求里带 progress:true（网页上传走 ?progress=1）时先返回 taskId，
+   * 这里轮询 /tasks/<id> 画「整体进度条 + 统计行 + 逐包明细 + 当前包进度条」。
+   * ============================================================ */
+
+  /* 网页上传离线包（用 XHR 而不是 fetch：只有 XHR 的 upload.onprogress 能给出上传字节进度） */
+  function uploadBundleXhr(file, overwrite, onProgress) {
+    return new Promise(function (resolve, reject) {
+      var xhr = new XMLHttpRequest();
+      xhr.open('POST', API + '/bundles/import?progress=1' + (overwrite ? '&overwrite=1' : ''), true);
+      xhr.setRequestHeader('X-Filename', encodeURIComponent(file.name));
+      xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+      var tk = getToken();
+      if (tk) xhr.setRequestHeader('X-Mirror-Token', tk);
+      xhr.upload.onprogress = function (ev) {
+        if (!ev.lengthComputable) return;
+        onProgress({ kind: 'upload', name: file.name, loaded: ev.loaded, total: ev.total });
+      };
+      xhr.onload = function () {
+        var j = null;
+        try { j = JSON.parse(xhr.responseText || 'null'); } catch (e) { j = null; }
+        if (xhr.status >= 200 && xhr.status < 300 && j && j.ok) { resolve(j.data); return; }
+        var err = new Error((j && j.error) || ('HTTP ' + xhr.status));
+        err.status = xhr.status;
+        err.code = j && j.code;
+        reject(err);
+      };
+      xhr.onerror = function () {
+        reject(new Error('上传中断（网络错误）：请确认镜像源服务还在运行；大离线包也可以放进 data\\bundles 目录后用「导入」按钮'));
+      };
+      xhr.ontimeout = function () {
+        reject(new Error('上传超时（30 分钟内没传完）：建议把 .tgz 放进 data\\bundles 目录后用「导入」按钮'));
+      };
+      xhr.timeout = 1800000;
+      xhr.send(file);
+    });
+  }
+
+  /* 离线包里一个包的明细行：打包（packed）/导入（imported）/失败/跳过 共用 */
+  function bundlePkgRow(p) {
+    var status = p.status;
+    var cls = (status === 'imported' || status === 'packed') ? 'ok' : (status === 'failed' ? 'err' : 'skip');
+    var tv = el('span', { class: 'tv', text: '' });
+    if (status === 'packed') {
+      var bits0 = [];
+      if (p.tarballs) bits0.push(fmtNum(p.tarballs) + ' 个 tarball');
+      if (p.versions) bits0.push(fmtNum(p.versions) + ' 个版本');
+      if (p.sizeBytes) bits0.push(fmtBytes(p.sizeBytes));
+      tv.textContent = '✓ 已打包' + (bits0.length ? '：' + bits0.join(' · ') : '');
+    } else if (status === 'imported') {
+      var bits = [];
+      if (p.versions) bits.push(fmtNum(p.versions) + ' 个版本');
+      if (p.tarballs) bits.push(fmtNum(p.tarballs) + ' 个 tarball');
+      if (p.skipped) bits.push('跳过 ' + fmtNum(p.skipped) + ' 个已存在版本');
+      tv.textContent = '✓ 新增 ' + (bits.length ? bits.join(' · ') : '（没有新内容）');
+    } else if (status === 'failed') {
+      tv.textContent = '✕ ' + (p.reason || '导入失败');
+    } else {
+      tv.textContent = '· 跳过：' + (p.reason || '已存在或不可导入');
+    }
+    return el('div', { class: 'taskrow tr-fillrow ' + cls }, [
+      el('i', { class: 'tr-fill', style: 'width:100%' }),
+      el('div', { class: 'tr-in' }, [el('span', { class: 'tr-name', text: p.name }), tv])
+    ]);
+  }
+
+  /**
+   * 离线包导出/导入的通用进度弹窗。
+   * opts: title/sub/intro/busyText/sideHint/waitText/paneHead/paneUnit/cancelLabel/btn
+   *       extractBar   导入解包阶段用「字节」画整体条
+   *       statText(d,pct)  统计行文案
+   *       start(onProgress) -> Promise<{taskId}>；上传阶段可用 onProgress({kind:'upload',...}) 回传字节进度
+   *       onDone(d)    任务正常结束（含被取消）后的收尾：写状态行 + toast + 刷新列表
+   */
+  function bundleProgressModal(opts) {
+    var rowMap = {}, list = el('div', { class: 'tasklist' });
+    var runPane = runningPane(1, {
+      head: opts.paneHead || '当前包', unit: opts.paneUnit || '个版本', bytes: false,
+      countPrefix: '当前', endedText: '已结束', emptyText: '等待开始…', keepDone: true
+    });
+    var leftCol = el('div', { class: 'fill-col' }, [list]);
+    var cols = el('div', { class: 'fill-cols' }, [leftCol, runPane.el]);
+    var bar = el('i', { style: 'width:0' });
+    var note = el('p', { class: 'muted', text: opts.intro || '' });
+    var stat = el('div', { class: 'fill-stat', text: '' });
+    var bodyEl = el('div', {}, [note, el('div', { class: 'progressbar' }, [bar]), stat, cols]);
+    var timer = null, taskId = null, finished = false, pollFails = 0, lastCur = null;
+    var MAX_ROWS = 2000;
+    var m = taskModal({
+      title: opts.title, sub: opts.sub, body: bodyEl, sticky: true, wide: true,
+      onClose: function () { /* 关掉窗口不打断任务：结束后仍会写状态行并刷新列表 */ },
+      actions: [
+        {
+          label: opts.cancelLabel || '取消', kind: 'btn-ghost', onClick: function (c) {
+            if (finished || !taskId) return c.close();
+            api('/tasks/' + taskId + '/cancel', { method: 'POST' }).then(function () {
+              toast('已请求停止：当前包处理完就停', 'warn');
+            }, function () { c.close(); });
+          }
+        },
+        { label: '后台运行', kind: 'btn', onClick: function (c) { c.close(); toast('任务仍在后台进行，完成后可在「日志」页查看', 'info', 6000); } }
+      ]
+    });
+
+    function setBar(pct) { bar.style.width = (Math.max(0, Math.min(100, Number(pct) || 0))) + '%'; }
+
+    function paint(d) {
+      if (!d) return;
+      var pct = Number(d.percent) || 0;
+      if (opts.extractBar && d.phase === 'extract') {
+        pct = d.bytesTotal ? Math.min(100, Math.round(((d.bytes || 0) / d.bytesTotal) * 100)) : 0;
+      }
+      setBar(pct);
+      stat.textContent = opts.statText(d, pct);
+      if (d.status === 'running' && opts.phaseNote) {
+        var pn = opts.phaseNote(d);
+        if (pn) note.textContent = pn;
+      }
+      (d.packages || []).forEach(function (p) {
+        if (!p || !p.name || rowMap[p.name]) return;
+        if (list.children.length >= MAX_ROWS) return;
+        rowMap[p.name] = p;
+        list.appendChild(opts.rowEl(p));
+      });
+      var feed = [];
+      if (d.current) {
+        lastCur = { name: d.current, target: Number(d.currentTotal) || 0, done: Number(d.currentDone) || 0, at: Date.now() };
+        feed.push({ name: lastCur.name, status: 'running', target: lastCur.target, done: lastCur.done });
+      } else if (lastCur && d.status === 'running' && Date.now() - lastCur.at < 1500) {
+        // 包与包之间轮询可能正好落在间隙：保留刚处理完的包一小会儿，右栏才不会闪空
+        feed.push({ name: lastCur.name, status: 'running', target: lastCur.target, done: lastCur.done });
+      }
+      runPane.paint(feed, d.status !== 'running');
+      leftCol.scrollTop = leftCol.scrollHeight;
+    }
+
+    function finalize(d) {
+      if (finished) return;
+      finished = true;
+      if (timer) { clearInterval(timer); timer = null; }
+      paint(d);
+      setBar(100);
+      runPane.paint([], true);
+      taskFinishedButtons(m);
+      if (opts.btn) btnBusy(opts.btn, false);
+      if (d.status === 'error') {
+        note.textContent = '任务失败：' + (d.message || '未知错误');
+        setSideHint('ERROR');
+        if (opts.onDone) opts.onDone(d);   // 让调用方把失败写回页面状态行
+        handleErr(new Error(d.message || '任务失败'));
+        return;
+      }
+      opts.onDone(d);
+    }
+
+    function poll() {
+      if (finished) return;
+      api('/tasks/' + taskId).then(function (d) {
+        if (finished) return;
+        pollFails = 0;
+        paint(d);
+        if (d.status !== 'running') finalize(d);
+      }, function (e) {
+        if (finished) return;
+        pollFails++;
+        if (pollFails <= 2) {
+          note.textContent = '进度查询暂时失败：' + (e.message || '未知错误') + '（第 ' + pollFails + ' 次，自动重试中…）';
+          return;                    // 网络抖动时别直接放弃，保留轮询
+        }
+        if (timer) { clearInterval(timer); timer = null; }
+        note.textContent = '进度查询连续失败：' + (e.message || '未知错误') + '（任务可能仍在后台进行；可关闭本窗口后到「日志」页确认结果）';
+        taskFinishedButtons(m);
+      });
+    }
+
+    if (opts.btn) btnBusy(opts.btn, true, opts.busyText || '处理中…');
+    setSideHint(opts.sideHint || 'WORKING…');
+    opts.start(function (info) {
+      if (!info || info.kind !== 'upload') return;
+      var pct = info.total ? Math.round((info.loaded / info.total) * 100) : 0;
+      setBar(pct);
+      note.textContent = '正在上传 ' + info.name + '：' + fmtBytes(info.loaded) + ' / ' + fmtBytes(info.total) + '（' + pct + '%）';
+      stat.textContent = '上传完成后自动开始导入，期间请勿关闭页面';
+    }).then(function (d) {
+      taskId = d && d.taskId;
+      if (!taskId) throw new Error('服务端没有返回任务编号');
+      note.textContent = opts.waitText || '任务已开始…';
+      timer = setInterval(poll, 500);
+      poll();
+    }).catch(function (e) {
+      if (finished) return;
+      finished = true;
+      if (timer) { clearInterval(timer); timer = null; }
+      setSideHint('ERROR');
+      note.textContent = '无法开始：' + (e.message || '未知错误');
+      taskFinishedButtons(m);
+      if (opts.btn) btnBusy(opts.btn, false);
+      handleErr(e);
+    });
+    return m;
+  }
+
+  /* 导出备份：详细进度（统计 → 打包，逐包明细 + 当前包，可取消） */
+  function runBundleExport(payload, btn) {
+    function statText(d, pct) {
+      var secs = Math.round((d.elapsedMs || 0) / 1000);
+      if (d.phase === 'collect') {
+        return '正在统计要导出的包…' + (d.done || d.total ? '（已扫描 ' + fmtNum(d.done || 0) + ' / ' + fmtNum(d.total || 0) + ' 个包）' : '') + ' · 已用时 ' + fmtDur(secs);
+      }
+      var txt = '已打包 ' + fmtNum(d.done || 0) + ' / ' + fmtNum(d.total || 0) + ' 个文件（' + pct + '%）';
+      if (d.bytes || d.bytesTotal) txt += ' · ' + fmtBytes(d.bytes || 0) + (d.bytesTotal ? ' / ' + fmtBytes(d.bytesTotal) : '');
+      if (d.ok) txt += ' · 已完成 ' + fmtNum(d.ok) + ' 个包';
+      if (d.status === 'running' && d.bytesPerSec && d.bytesTotal && d.bytes < d.bytesTotal) {
+        var eta = Math.round((d.bytesTotal - (d.bytes || 0)) / d.bytesPerSec);
+        if (eta > 0) txt += ' · 剩余约 ' + fmtDur(eta);
+      }
+      txt += ' · 已用时 ' + fmtDur(secs);
+      return txt;
+    }
+    var m = bundleProgressModal({
+      title: '导出离线包', sub: 'EXPORT BUNDLE',
+      intro: '正在统计要导出的包…',
+      busyText: '导出中…', sideHint: 'EXPORTING…', waitText: '正在打包…',
+      paneHead: '正在打包 · 当前包', paneUnit: '个 tarball',
+      cancelLabel: '取消导出', btn: btn,
+      extractBar: false,
+      statText: statText,
+      rowEl: bundlePkgRow,
+      phaseNote: function (d) {
+        if (d.phase === 'collect') return '正在统计要导出的包…（这一步只读元数据，可以取消）';
+        return '正在打包并压缩（gzip），可以点「取消导出」随时停下。';
+      },
+      start: function () {
+        return api('/bundles/export', { method: 'POST', body: Object.assign({}, payload, { progress: true }), timeout: 120000 });
+      },
+      onDone: function (d) {
+        var r = d.result || {};
+        if (d.status === 'error') {
+          setText('exp-status', '导出失败：' + (d.message || '未知错误'));
+          toast('导出失败：' + (d.message || '未知错误'), 'err', 10000);
+          setSideHint('READY');
+          return;
+        }
+        if (d.status === 'canceled') {
+          setText('exp-status', '已取消导出（没有生成新的 bundle）');
+          toast('已取消导出', 'warn');
+          setSideHint('READY');
+          setTimeout(function () { m.close(); }, 1200);
+          return;
+        }
+        var msg = '已导出 ' + r.file + '：' + fmtNum(r.packages) + ' 包 / ' + fmtNum(r.versions) + ' 版本 / ' + fmtNum(r.tarballs) + ' tarball / ' + fmtBytes(r.sizeBytes);
+        if (r.depsAdded) msg += '（其中连带依赖 ' + fmtNum(r.depsAdded) + ' 个）';
+        setText('exp-status', msg);
+        toast(msg, 'ok', 9000);
+        if (r.missingDeps && r.missingDeps.length) {
+          var lst = r.missingDeps.slice(0, 8).map(function (x) { return x.name + (x.parent ? '（' + x.parent + ' 依赖）' : ''); }).join('、');
+          toast('有 ' + r.missingDeps.length + ' 个依赖不在镜像里，未导出：' + lst + (r.missingDeps.length > 8 ? ' 等' : '') + '。如需离线安装，请先把它们加入镜像。', 'warn', 14000);
+        }
+        setSideHint('READY');
+        loadBundles();
+        downloadBundle(r.file);
+        setTimeout(function () { m.close(); }, 1500);   // 成功导出自动关窗，别挡住后续操作
+      }
+    });
+    return m;
+  }
+
+  /* 导入备份：详细进度（上传/解包 → 逐包导入，可取消）。file 为网页上传的 File，name 为服务器上已有 bundle 名 */
+  function runBundleImport(opts) {
+    var isUpload = !!opts.file;
+    var label = isUpload ? opts.file.name : opts.name;
+    setText('imp-status', (isUpload ? '正在上传并导入 ' : '正在导入 ') + label + ' …');
+    function statText(d, pct) {
+      var secs = Math.round((d.elapsedMs || 0) / 1000);
+      if (d.phase === 'extract') {
+        var ep = d.bytesTotal ? Math.min(100, Math.round(((d.bytes || 0) / d.bytesTotal) * 100)) : 0;
+        return '正在解包备份文件：' + fmtBytes(d.bytes || 0) + (d.bytesTotal ? ' / ' + fmtBytes(d.bytesTotal) : '') + '（' + ep + '%） · 已用时 ' + fmtDur(secs);
+      }
+      if (d.phase !== 'import') {
+        return '正在准备导入… · 已用时 ' + fmtDur(secs);
+      }
+      var txt = '已处理 ' + fmtNum(d.done || 0) + ' / ' + fmtNum(d.total || 0) + ' 个包（' + pct + '%）'
+        + ' · 成功 ' + fmtNum(d.ok || 0) + ' · 失败 ' + fmtNum(d.failed || 0) + ' · 跳过 ' + fmtNum(d.skipped || 0)
+        + ' · 新增 ' + fmtNum(d.versions || 0) + ' 个版本 / ' + fmtNum(d.tarballs || 0) + ' 个 tarball';
+      if (d.status === 'running' && d.etaSec) txt += ' · 剩余约 ' + fmtDur(d.etaSec);
+      txt += ' · 已用时 ' + fmtDur(secs);
+      return txt;
+    }
+    var m = bundleProgressModal({
+      title: isUpload ? '上传并导入离线包' : '导入离线包', sub: 'IMPORT BUNDLE',
+      intro: isUpload
+        ? '正在上传 ' + opts.file.name + '（' + fmtBytes(opts.file.size) + '）…'
+        : '正在读取 ' + opts.name + ' …',
+      busyText: '导入中…', sideHint: 'IMPORTING…', waitText: '正在解包…',
+      paneHead: '正在导入 · 当前包', paneUnit: '个版本',
+      cancelLabel: '取消导入', btn: opts.btn || null,
+      extractBar: true,
+      statText: statText,
+      rowEl: bundlePkgRow,
+      phaseNote: function (d) {
+        if (d.phase === 'extract') return '正在解包备份文件…（可以取消，已解出的部分会清掉）';
+        return '正在把包写入本地存储…（可以取消，已导入的部分会保留）';
+      },
+      start: function (onProgress) {
+        if (isUpload) return uploadBundleXhr(opts.file, opts.overwrite, onProgress);
+        return api('/bundles/import', {
+          method: 'POST',
+          body: { file: opts.name, overwrite: !!opts.overwrite, progress: true },
+          timeout: 120000,
+        });
+      },
+      onDone: function (d) {
+        var r = d.result || {};
+        if (d.status === 'error') {
+          var emsg = '导入失败：' + (d.message || '未知错误');
+          setText('imp-status', emsg);
+          toast(emsg, 'err', 12000);
+          setSideHint('READY');
+          return;
+        }
+        var canceled = d.status === 'canceled';
+        var msg;
+        if (canceled) {
+          msg = '已取消导入（已导入的部分已保留）：' + fmtNum(r.packages || 0) + ' 包 / ' + fmtNum(r.versions || 0) + ' 版本 / ' + fmtNum(r.tarballs || 0) + ' tarball';
+        } else {
+          msg = '导入完成：' + fmtNum(r.packages || 0) + ' 包 / ' + fmtNum(r.versions || 0) + ' 版本 / ' + fmtNum(r.tarballs || 0) + ' tarball';
+          if (r.skipped) msg += '，跳过 ' + fmtNum(r.skipped);
+        }
+        setText('imp-status', msg);
+        toast(msg, (canceled || (r.failed && r.failed.length)) ? 'warn' : 'ok', 10000);
+        (r.failed || []).slice(0, 5).forEach(function (f) { toast('· ' + f.name + '：' + (f.error || '失败'), 'err', 7000); });
+        setSideHint('READY');
+        loadBundles(); loadPackages();
+      }
+    });
+    return m;
   }
 
   /* ============================================================
@@ -3117,22 +3416,8 @@
         payload.withDeps = !(wd && wd.checked === false);
       }
       var btn = $('#exp-run');
-      btnBusy(btn, true, '导出中…');
       setText('exp-status', payload.withDeps ? '正在打包（含递归依赖），包较多时可能耗时较久…' : '正在打包，包较多时可能耗时较久…');
-      setSideHint('EXPORTING…');
-      api('/bundles/export', { method: 'POST', body: payload, timeout: 600000 }).then(function (d) {
-        btnBusy(btn, false); setSideHint('READY');
-        var msg = '已导出 ' + d.file + '：' + fmtNum(d.packages) + ' 包 / ' + fmtNum(d.versions) + ' 版本 / ' + fmtNum(d.tarballs) + ' tarball / ' + fmtBytes(d.sizeBytes);
-        if (d.depsAdded) msg += '（其中连带依赖 ' + fmtNum(d.depsAdded) + ' 个）';
-        setText('exp-status', msg);
-        toast(msg, 'ok', 9000);
-        if (d.missingDeps && d.missingDeps.length) {
-          var lst = d.missingDeps.slice(0, 8).map(function (x) { return x.name + (x.parent ? '（' + x.parent + ' 依赖）' : ''); }).join('、');
-          toast('有 ' + d.missingDeps.length + ' 个依赖不在镜像里，未导出：' + lst + (d.missingDeps.length > 8 ? ' 等' : '') + '。如需离线安装，请先把它们加入镜像。', 'warn', 14000);
-        }
-        loadBundles();
-        downloadBundle(d.file);
-      }, function (e) { btnBusy(btn, false); setSideHint('ERROR'); setText('exp-status', '导出失败：' + e.message); handleErr(e); });
+      runBundleExport(payload, btn);
     });
     on('imp-run-file', 'click', function () { importBundleFile($('#imp-file') ? $('#imp-file').value : ''); });
     on('imp-pick', 'click', function (ev) { ev.stopPropagation(); var i = $('#imp-input'); if (i) i.click(); });

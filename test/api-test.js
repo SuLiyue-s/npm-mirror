@@ -1240,6 +1240,122 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
     await st2.close();
   }
 
+  // ---------------------------------------------------------------- 导出 / 导入的详细进度任务
+  section('六之四、导出 / 导入备份的详细进度任务（progress:true → taskId）');
+  {
+    const bundleMod3 = require('../src/bundle');
+    const cfgMod3 = require('../src/config');
+    const quietLog3 = { info() {}, warn() {}, error() {}, debug() {} };
+    const { Store: Store3 } = require('../src/store');
+    const st3 = new Store3({ dir: cfgMod3.storageDir(), logger: quietLog3 });
+    await st3.init();
+    const pref3 = ['ms', 'is-number', 'debug', 'semver', 'chalk', 'lodash'];
+    let pkgName3 = pref3.find((n) => st3.get(n));
+    if (!pkgName3) pkgName3 = (st3.names() || [])[0];
+    await st3.close();
+
+    async function waitTaskP(id, timeoutMs = 180000) {
+      const t0 = Date.now();
+      while (Date.now() - t0 < timeoutMs) {
+        const r = await api('/__admin/api/tasks/' + id);
+        const d = r.json && r.json.data;
+        if (d && d.status !== 'running') return d;
+        await util.sleep(200);
+      }
+      return null;
+    }
+
+    check('镜像里能找到用于进度任务的包', !!pkgName3, `pkg=${pkgName3}`);
+    const madeBundles3 = [];
+    if (pkgName3) {
+      // A) 导出带 progress:true：先回 taskId，再在后台统计/打包
+      const ex = await api('/__admin/api/bundles/export', {
+        method: 'POST', body: { scope: 'selected', names: [pkgName3], progress: true }, timeoutMs: 30000,
+      });
+      const ed = (ex.json && ex.json.data) || {};
+      check('POST /bundles/export {progress:true} 立即返回 taskId（不再同步等打包完）',
+        ex.status === 200 && ed.async === true && !!ed.taskId, `status=${ex.status} data=${JSON.stringify(ed)}`);
+      let exTask = null;
+      if (ed.taskId) {
+        exTask = await waitTaskP(ed.taskId);
+        const r = (exTask && exTask.result) || {};
+        if (r.file) madeBundles3.push(r.file);
+        check('导出进度任务：status=done 且整体进度跑满（total/done/bytesTotal）',
+          !!exTask && exTask.status === 'done' && exTask.total > 0 && exTask.done === exTask.total && exTask.bytesTotal > 0,
+          `status=${exTask && exTask.status} total=${exTask && exTask.total} done=${exTask && exTask.done} bytesTotal=${exTask && exTask.bytesTotal}`);
+        const rows = (exTask && exTask.packages) || [];
+        check('导出进度任务：逐包明细 status=packed，带 versions/tarballs/sizeBytes（左栏数据源）',
+          rows.length >= 1 && rows.every((p) => p.status === 'packed' && p.tarballs >= 1 && p.versions >= 1 && p.sizeBytes > 0),
+          JSON.stringify(rows.slice(0, 3)));
+        check('导出进度任务：result.file 指向真实生成的 bundle 文件',
+          !!r.file && fs.existsSync(path.join(bundleMod3.bundleDir(), r.file)) && Number(r.sizeBytes) > 0,
+          `file=${r.file} size=${r.sizeBytes}`);
+      }
+
+      if (madeBundles3.length) {
+        // B) 导入带 progress:true（按服务器上已有文件名）：先回 taskId，再后台解包 + 逐包导入
+        const im = await api('/__admin/api/bundles/import', {
+          method: 'POST', body: { file: madeBundles3[0], overwrite: true, progress: true }, timeoutMs: 30000,
+        });
+        const id = (im.json && im.json.data) || {};
+        check('POST /bundles/import {progress:true} 立即返回 taskId',
+          im.status === 200 && id.async === true && !!id.taskId, `status=${im.status} data=${JSON.stringify(id)}`);
+        if (id.taskId) {
+          const it = await waitTaskP(id.taskId);
+          const r = (it && it.result) || {};
+          check('导入进度任务：phase=import、包进度跑满、成功/失败有统计',
+            !!it && it.status === 'done' && it.phase === 'import' && it.total >= 1 && it.done === it.total && (it.ok + it.failed) >= 1,
+            `status=${it && it.status} phase=${it && it.phase} total=${it && it.total} done=${it && it.done} ok=${it && it.ok} failed=${it && it.failed}`);
+          const rows = (it && it.packages) || [];
+          check('导入进度任务：逐包明细 imported/skipped/failed + versions/tarballs（左栏数据源）',
+            rows.length >= 1 && rows.every((p) => ['imported', 'skipped', 'failed'].includes(p.status))
+              && rows.some((p) => Number.isFinite(Number(p.versions)) && Number.isFinite(Number(p.tarballs))),
+            JSON.stringify(rows.slice(0, 3)));
+          check('导入进度任务：result 带 packages/versions/tarballs/failed',
+            Number(r.packages) >= 1 && Number.isFinite(Number(r.versions)) && Array.isArray(r.failed),
+            JSON.stringify(r));
+        }
+
+        // C) 原始体上传 + ?progress=1：边收边落盘，收完立刻回 taskId（前端上传进度条 → 任务进度）
+        const upBuf = fs.readFileSync(path.join(bundleMod3.bundleDir(), madeBundles3[0]));
+        const up = await api('/__admin/api/bundles/import?progress=1&overwrite=1', {
+          method: 'POST', raw: upBuf, timeoutMs: 120000,
+          headers: { 'Content-Type': 'application/octet-stream', 'X-Filename': encodeURIComponent(madeBundles3[0]) },
+        });
+        const ud = (up.json && up.json.data) || {};
+        check('原始体上传带 ?progress=1：落盘后立即返回 taskId',
+          up.status === 200 && ud.async === true && !!ud.taskId, `status=${up.status} data=${JSON.stringify(ud)}`);
+        if (ud.taskId) {
+          const ut = await waitTaskP(ud.taskId);
+          check('原始体上传的导入任务同样跑到 done（结果字段与同步路径一致）',
+            !!ut && ut.status === 'done' && !!ut.result && Number(ut.result.packages) >= 1 && ut.result.failed.length === 0,
+            `status=${ut && ut.status} result=${JSON.stringify(ut && ut.result)}`);
+        }
+
+        // D) 取消：导出刚建任务就请求取消（前端「取消导出」走同一接口）
+        const ex2 = await api('/__admin/api/bundles/export', {
+          method: 'POST', body: { scope: 'selected', names: [pkgName3], progress: true }, timeoutMs: 30000,
+        });
+        const id2 = (ex2.json && ex2.json.data && ex2.json.data.taskId) || null;
+        if (id2) {
+          const c = await api('/__admin/api/tasks/' + id2 + '/cancel', { method: 'POST' });
+          const ct = await waitTaskP(id2);
+          const r2 = (ct && ct.result) || null;
+          if (r2 && r2.file) madeBundles3.push(r2.file);   // 包太小、取消晚了一步跑完时也别留垃圾
+          check('取消导出任务：cancel 返回 200，任务以 canceled 收尾（包很小、取消晚一步时可能已经 done）',
+            c.status === 200 && !!ct && (ct.status === 'canceled' ? !r2 : ct.status === 'done'),
+            `cancel=${c.status} status=${ct && ct.status} msg=${ct && ct.message} result=${JSON.stringify(r2)}`);
+        }
+
+        // E) 任务结束后临时目录不留残渣（原始体上传的临时文件必须删掉）
+        const tmpDir3 = path.join(__dirname, '..', 'data', 'tmp');
+        const residue3 = fs.existsSync(tmpDir3) ? fs.readdirSync(tmpDir3) : [];
+        check('进度任务（含原始体上传）结束后 data\\tmp 无残留', residue3.length === 0, `residue=${residue3.join(',')}`);
+      }
+    }
+    for (const f of madeBundles3) await api(`/__admin/api/bundles?file=${encodeURIComponent(f)}`, { method: 'DELETE' });
+  }
+
   // ---------------------------------------------------------------- 版本删除
   section('七、单版本删除与取消发布');
   {

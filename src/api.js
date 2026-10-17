@@ -70,6 +70,32 @@ function parsePackageRoute(pathname) {
   return { name: segs[0], tail: segs.slice(1) };
 }
 
+/* 离线包「导出 / 导入」的长任务封装：建任务 → 后台跑 → 进度写进 tasks → 收敛成终态。
+ * progress:true 的请求立刻拿到 { taskId, async:true }，界面轮询 /tasks/<id> 显示详细进度；
+ * 不带该参数的旧调用仍走同步路径（命令行、脚本不受影响）。 */
+function startBundleTask({ type, title, phase = '', total = 0, run, log }) {
+  const task = tasks.create({ type, title, phase, total });
+  const isCanceled = () => {
+    const t = tasks.get(task.id);
+    return !!(t && t.cancelRequested);
+  };
+  const update = (patch) => tasks.update(task.id, patch);
+  (async () => {
+    try {
+      const r = await run({ taskId: task.id, update, isCanceled });
+      const canceled = !!(r && r.canceled) || isCanceled();
+      tasks.finish(task.id, { status: canceled ? 'canceled' : 'done', result: r || null });
+      if (log) log.info(`${title} 任务结束${canceled ? '（已取消）' : ''}`);
+    } catch (e) {
+      // 取消时底层抛 ECANCELED 也收敛成「已取消」，不要让界面看到一条红色失败
+      const canceled = isCanceled() || (e && e.code === 'ECANCELED');
+      tasks.finish(task.id, { status: canceled ? 'canceled' : 'error', message: (e && e.message) || String(e) });
+      if (!canceled && log) log.warn(`${title} 任务失败：${(e && e.message) || e}`);
+    }
+  })();
+  return task.id;
+}
+
 async function handleAdmin(ctx) {
   const { req, res, url, method, store, log } = ctx;
   const cfg = ctx.cfg();
@@ -778,11 +804,79 @@ async function handleAdmin(ctx) {
     const scope = rawScope || (Array.isArray(body.names) && body.names.length ? 'selected' : 'all');
     // 指定导出选中的包时，默认把它们的（递归）依赖也一起导出；显式传 withDeps:false 可关闭
     const withDeps = scope === 'selected' && (body.withDeps === undefined ? true : !!body.withDeps);
+    const names = Array.isArray(body.names) ? body.names.filter(n => typeof n === 'string') : [];
+    /* progress:true —— 长任务模式：立即返回 taskId，界面用 /tasks/<id> 轮询
+     * 「统计 → 打包」两阶段进度、逐包打包详情与「当前包」进度条；可取消。 */
+    if (body.progress === true) {
+      const pkgs = [];
+      const taskId = startBundleTask({
+        type: 'bundle-export',
+        title: '导出离线包',
+        phase: 'collect',
+        total: 0,
+        log,
+        run: ({ update, isCanceled }) => ctx.bundle.exportBundle({
+          store,
+          scope,
+          names,
+          fileName: body.name || body.fileName,
+          withDeps,
+          logger: log,
+          isCanceled,
+          onProgress: (ev) => {
+            if (ev.phase === 'collect-start') {
+              update({ phase: 'collect', total: Number(ev.total) || 0, message: '正在统计要导出的包…' });
+              return;
+            }
+            if (ev.phase === 'collect-done') {
+              update({
+                phase: 'pack',
+                total: Number(ev.entries) || 0,
+                bytesTotal: Number(ev.totalBytes) || 0,
+                done: 0,
+                message: '',
+                title: `导出离线包 · ${Number(ev.packages).toLocaleString('en-US')} 个包`,
+              });
+              return;
+            }
+            if (ev.phase === 'collect') {
+              // 统计阶段也有反馈：大镜像逐个 stat tarball 可能要几秒，界面显示「已扫描 N / M 个包」
+              update({ phase: 'collect', done: Number(ev.packages) || 0, total: Number(ev.total) || 0 });
+              return;
+            }
+            if (ev.phase === 'package') {
+              pkgs.push({
+                name: ev.name,
+                status: 'packed',
+                versions: Number(ev.versions) || 0,
+                tarballs: Number(ev.tarballs) || 0,
+                sizeBytes: Number(ev.sizeBytes) || 0,
+              });
+              update({ packages: pkgs.slice(-2000), ok: pkgs.length });
+              return;
+            }
+            if (ev.phase === 'pack') {
+              update({
+                phase: 'pack',
+                done: Number(ev.entriesDone) || 0,
+                total: Number(ev.entriesTotal) || 0,
+                bytes: Number(ev.bytes) || 0,
+                bytesTotal: Number(ev.totalBytes) || 0,
+                current: ev.pkg || '',
+                currentDone: Number(ev.pkgDone) || 0,
+                currentTotal: Number(ev.pkgTotal) || 0,
+              });
+            }
+          },
+        }),
+      });
+      return ok(res, { taskId, async: true });
+    }
     try {
       const r = await ctx.bundle.exportBundle({
         store,
         scope,
-        names: Array.isArray(body.names) ? body.names.filter(n => typeof n === 'string') : [],
+        names,
         fileName: body.name || body.fileName,
         withDeps,
         logger: log,
@@ -797,10 +891,12 @@ async function handleAdmin(ctx) {
     let overwrite = q.get('overwrite') === '1' || q.get('overwrite') === 'true';
     let file = '';
     let temp = null;
+    let wantProgress = q.get('progress') === '1' || q.get('progress') === 'true';
     const ctype = String(req.headers['content-type'] || '');
     if (ctype.includes('application/json')) {
       const body = await readJson(req);
       overwrite = body.overwrite === true || overwrite;
+      if (body.progress === true) wantProgress = true;
       const name = path.basename(String(body.file || ''));
       if (!name) return fail(res, 400, '请提供 file 字段（离线包文件名）', 'EBADREQ');
       file = path.join(rootPath('data', 'bundles'), name);
@@ -840,13 +936,110 @@ async function handleAdmin(ctx) {
         return fail(res, e.status || 400, `${e.message}${hint}`, e.code || 'EBADREQ');
       }
     }
+    // 临时文件的生命周期交给实际执行导入的那段代码（同步或后台任务都一样）：
+    // progress 模式下响应已经先返回，绝不能在这里提前删掉还在读的文件。
+    const tempFile = temp;
+    temp = null;
+    const doImport = async ({ update, isCanceled }) => {
+      const pkgs = [];
+      let curTotal = 0;
+      let pkgTotal = 0;
+      try {
+        const r = await ctx.bundle.importBundle({
+          store,
+          file,
+          overwrite,
+          logger: log,
+          isCanceled,
+          onProgress: (ev) => {
+            if (ev.phase === 'extract') {
+              update({
+                phase: 'extract',
+                bytes: Number(ev.bytes) || 0,
+                bytesTotal: Number(ev.totalBytes) || 0,
+                total: Number(ev.packages) || 0,
+                current: ev.current || '',
+              });
+              return;
+            }
+            if (ev.phase === 'extract-done') {
+              update({
+                phase: 'import',
+                total: Number(ev.packages) || 0,
+                done: 0,
+                bytes: Number(ev.bytes) || 0,
+                bytesTotal: Number(ev.bytes) || 0,
+                current: '', currentDone: 0, currentTotal: 0,
+                message: '',
+              });
+              return;
+            }
+            if (ev.phase === 'package-start') {
+              pkgTotal = Number(ev.total) || pkgTotal;
+              curTotal = Number(ev.versionTotal) || 0;
+              update({
+                phase: 'import',
+                total: pkgTotal,
+                done: Math.max(0, (Number(ev.index) || 1) - 1),
+                current: ev.name,
+                currentDone: 0,
+                currentTotal: curTotal,
+              });
+              return;
+            }
+            if (ev.phase === 'version') {
+              curTotal = Number(ev.versionTotal) || curTotal;
+              update({ current: ev.name, currentDone: Number(ev.versionDone) || 0, currentTotal: curTotal });
+              return;
+            }
+            if (ev.phase === 'package') {
+              pkgs.push({
+                name: ev.name,
+                status: ev.status,
+                versions: Number(ev.versions) || 0,
+                tarballs: Number(ev.tarballs) || 0,
+                skipped: Number(ev.skipped) || 0,
+                failed: Number(ev.failed) || 0,
+                reason: ev.reason || '',
+              });
+              update({
+                done: Number(ev.index) || pkgs.length,
+                total: Math.max(pkgTotal, Number(ev.index) || 0),
+                ok: pkgs.filter(p => p.status === 'imported').length,
+                failed: pkgs.filter(p => p.status === 'failed').length,
+                skipped: pkgs.filter(p => p.status === 'skipped').length,
+                packages: pkgs.slice(-2000),
+                versions: pkgs.reduce((a, p) => a + p.versions, 0),
+                tarballs: pkgs.reduce((a, p) => a + p.tarballs, 0),
+                current: ev.name,
+                currentDone: curTotal,
+                currentTotal: curTotal,
+                errors: pkgs.filter(p => p.status === 'failed').slice(-50).map(p => ({ name: p.name, error: p.reason })),
+              });
+            }
+          },
+        });
+        return { ...r, total: r.packages, failedCount: r.failed.length };
+      } finally {
+        if (tempFile) { try { fs.unlinkSync(tempFile); } catch { /* 忽略 */ } }
+      }
+    };
+    if (wantProgress) {
+      const taskId = startBundleTask({
+        type: 'bundle-import',
+        title: `导入离线包 · ${path.basename(file)}`,
+        phase: 'extract',
+        total: 0,
+        log,
+        run: doImport,
+      });
+      return ok(res, { taskId, async: true });
+    }
     try {
-      const r = await ctx.bundle.importBundle({ store, file, overwrite, logger: log });
-      return ok(res, { ...r, total: r.packages, failedCount: r.failed.length });
+      const r = await doImport({ update: () => {}, isCanceled: () => false });
+      return ok(res, r);
     } catch (e) {
       return fail(res, 400, `导入失败：${e.message}`, e.code || 'EIMPORT');
-    } finally {
-      if (temp) { try { fs.unlinkSync(temp); } catch { /* 忽略 */ } }
     }
   }
 

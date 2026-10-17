@@ -126,13 +126,37 @@ function createWriter(outFile, gzip) {
 /**
  * 打包为 tar.gz
  * entries: [{ name, source? , data?, mtime?, size? }]
+ * onProgress({ count, entriesTotal, total, current, entry })：
+ *   count = 已写完的条目数；entriesTotal = 总条目数；total = 已写入的数据字节（不含 tar 头与对齐填充）；
+ *   current = 刚写完（或正在读）的条目名；entry = 当前正在处理的条目序号（1 起）。
+ *   每个条目完成时回调一次，大文件流式读取期间每 250ms 再补一次，
+ *   让界面上的体积进度条不会在大 tarball 上卡住不动。
+ * shouldAbort()：返回 true 时抛 code=ECANCELED（每个条目开始前检查一次）。
  */
-async function packTarGz(outFile, entries, { gzip = true, onProgress } = {}) {
+async function packTarGz(outFile, entries, { gzip = true, onProgress, shouldAbort } = {}) {
   const w = createWriter(outFile, gzip);
+  const entriesTotal = entries.length;
   let total = 0;
   let count = 0;
+  let currentEntry = 0;
+  let lastEmit = 0;
+  const emit = (current, force) => {
+    if (!onProgress) return;
+    const now = Date.now();
+    // 回调抛错不能影响打包本身：进度只是旁路信息
+    if (!force && now - lastEmit < 250) return;
+    lastEmit = now;
+    try { onProgress({ count, entriesTotal, total, current: current || '', entry: currentEntry }); } catch { /* 忽略 */ }
+  };
   try {
-    for (let e of entries) {
+    for (let i = 0; i < entries.length; i++) {
+      if (shouldAbort && shouldAbort()) {
+        const e = new Error('打包已取消');
+        e.code = 'ECANCELED';
+        throw e;
+      }
+      let e = entries[i];
+      currentEntry = i + 1;
       let size = e.size;
       const data = e.data;
       if (data !== undefined && data !== null) {
@@ -147,7 +171,7 @@ async function packTarGz(outFile, entries, { gzip = true, onProgress } = {}) {
         if (st.isDirectory()) {
           await w.write(makeHeader({ ...e, size: 0, type: '5' }));
           count++;
-          if (onProgress && count % 25 === 0) onProgress({ count, total });
+          emit(e.name, true);
           continue;
         }
         size = st.size;
@@ -181,6 +205,7 @@ async function packTarGz(outFile, entries, { gzip = true, onProgress } = {}) {
           rs.on('data', chunk => {
             total += chunk.length;
             readBytes += chunk.length;
+            emit(e.name, false);          // 大 tarball 读取期间按时间节流补进度
             rs.pause();
             w.write(chunk).then(() => { if (!settled) rs.resume(); }, fail);
           });
@@ -197,7 +222,7 @@ async function packTarGz(outFile, entries, { gzip = true, onProgress } = {}) {
         if (pad) await w.write(Buffer.alloc(pad));
       }
       count++;
-      if (onProgress && count % 25 === 0) onProgress({ count, total });
+      emit(e.name, true);
     }
     await w.write(Buffer.alloc(BLOCK * 2));
     await w.end();

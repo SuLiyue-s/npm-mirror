@@ -271,6 +271,63 @@ async function get(p, { json = false } = {}) {
     check('413/408 记 warn 日志（原来只在 debug，日志里完全看不到上传失败）', /code === 413 \|\| code === 408\) log\.warn/.test(srvSrc));
   }
 
+  console.log('\x1b[1m八、导出 / 导入备份：详细进度条（上传进度 → 任务进度 → 逐包明细）\x1b[0m');
+  {
+    const bundleSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'bundle.js'), 'utf8');
+    const tarSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'tar.js'), 'utf8');
+    const tasksSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'tasks.js'), 'utf8');
+
+    // ① 页面入口：导出、导入（网页上传 + 服务器已有文件）都走进度弹窗
+    check('导出备份走进度弹窗（#exp-run 绑定调用 runBundleExport）',
+      /function runBundleExport\s*\(/.test(js.text) && /runBundleExport\(payload, btn\)/.test(js.text)
+        && !/#exp-run'\)\.addEventListener\('click'[\s\S]{0,2000}?api\('\/bundles\/export'/.test(js.text));
+    check('导入备份两条通路都走进度弹窗（服务器已有 bundle / 网页上传 → runBundleImport）',
+      /function runBundleImport\s*\(/.test(js.text)
+        && /runBundleImport\(\{ name: file, overwrite: !!ow \}\)/.test(js.text)
+        && /runBundleImport\(\{ file: file, overwrite: !!ow \}\)/.test(js.text));
+    check('进度弹窗有整体进度条 + 统计行 + 左右两栏（复用缓存导入的样式）',
+      /function bundleProgressModal\s*\(/.test(js.text)
+        && /class: 'progressbar'/.test(js.text) && /class: 'fill-stat'/.test(js.text)
+        && /class: 'fill-cols'/.test(js.text) && /function runningPane\s*\(/.test(js.text));
+
+    // ② 细节：逐包明细一行一包、当前包大进度条、上传字节进度、轮询与取消
+    check('逐包明细行区分 已打包 / 已导入 / 失败 / 跳过（左栏数据源）',
+      /function bundlePkgRow\s*\(/.test(js.text) && /✓ 已打包/.test(js.text) && /✓ 新增 /.test(js.text)
+        && /· 跳过：/.test(js.text) && /✕ /.test(js.text));
+    check('网页上传用 XHR 的 upload.onprogress 显示上传字节进度（fetch 拿不到上传进度）',
+      /function uploadBundleXhr\s*\(/.test(js.text) && /new XMLHttpRequest\(\)/.test(js.text)
+        && /xhr\.upload\.onprogress/.test(js.text) && /kind: 'upload'/.test(js.text)
+        && /\/bundles\/import\?progress=1/.test(js.text));
+    check('上传完成后切到任务进度：轮询 /tasks/<id>（500ms，连续失败重试 2 次再放弃）',
+      /api\('\/tasks\/' \+ taskId\)/.test(js.text) && /setInterval\(poll, 500\)/.test(js.text)
+        && /pollFails <= 2/.test(js.text));
+    check('进度弹窗可取消（调用 /tasks/<id>/cancel，并提示当前包处理完就停）',
+      /\/tasks\/' \+ taskId \+ '\/cancel'/.test(js.text) && /已请求停止/.test(js.text));
+    check('导出/导入结束仍写页面状态行（#exp-status 已导出、#imp-status 导入完成）且导出后自动下载',
+      /'已导出 ' \+ r\.file/.test(js.text) && /'导入完成：'/.test(js.text) && /downloadBundle\(r\.file\)/.test(js.text));
+    check('导出成功后自动关窗、导入保留详情窗（与缓存导入一致）',
+      /成功导出自动关窗/.test(js.text) && /taskFinishedButtons\(m\)/.test(js.text));
+
+    // ③ 后端：长任务范式 + 事件流
+    check('后端 export/import 支持 progress 长任务（startBundleTask → {taskId,async:true}）',
+      /function startBundleTask\s*\(/.test(apiSrc) && /taskId, async: true/.test(apiSrc)
+        && /body\.progress === true/.test(apiSrc) && /get\('progress'\)/.test(apiSrc));
+    check('导出进度事件：collect / package / pack（逐包已打包 + 当前包 tarball 进度）',
+      /phase: 'collect-start'/.test(bundleSrc) && /phase: 'collect-done'/.test(bundleSrc)
+        && /phase: 'package'/.test(bundleSrc) && /phase: 'pack'/.test(bundleSrc));
+    check('导入进度事件：extract / extract-done / package-start / version / package',
+      /phase: 'extract'/.test(bundleSrc) && /phase: 'extract-done'/.test(bundleSrc)
+        && /phase: 'package-start'/.test(bundleSrc) && /phase: 'version'/.test(bundleSrc)
+        && /phase: 'package'/.test(bundleSrc));
+    check('打包可中断（packTarGz 支持 shouldAbort，取消时删半成品）',
+      /shouldAbort/.test(tarSrc) && /ECANCELED/.test(bundleSrc) && /导出已取消/.test(bundleSrc));
+    check('任务快照暴露 bytesTotal（解包阶段按字节画整体进度条）', /bytesTotal: t\.bytesTotal/.test(tasksSrc));
+    check('弹窗的说明文字随阶段变化（phaseNote：统计/打包、解包/写入本地）',
+      /opts\.phaseNote/.test(js.text) && /d\.status === 'running' && opts\.phaseNote/.test(js.text)
+        && /正在统计要导出的包/.test(js.text) && /正在打包并压缩/.test(js.text)
+        && /正在解包备份文件…（可以取消/.test(js.text) && /正在把包写入本地存储/.test(js.text));
+  }
+
   console.log(`\n\x1b[1m结果：${pass}/${pass + fail} 通过\x1b[0m\n`);
   finish(fail === 0 ? 0 : 1);
 })().catch((e) => { console.error('自检异常：', e); finish(1); });
