@@ -813,7 +813,7 @@ async function handleAdmin(ctx) {
     const autoFetchDeps = body.autoFetchDeps === undefined ? true : !!body.autoFetchDeps;
     const names = Array.isArray(body.names) ? body.names.filter(n => typeof n === 'string') : [];
     /* progress:true —— 长任务模式：立即返回 taskId，界面用 /tasks/<id> 轮询
-     * 「统计 → 打包」两阶段进度、逐包打包详情与「当前包」进度条；可取消。 */
+     * 「统计 → 打包」两阶段进度、逐包打包详情与「并行打包的每个包」进度条；可取消。 */
     if (body.progress === true) {
       const pkgs = [];
       const conc = Math.max(1, Number(cfg.storage.bundleExportConcurrency) || 4);
@@ -824,74 +824,83 @@ async function handleAdmin(ctx) {
         total: 0,
         concurrency: conc,
         log,
-        run: ({ update, isCanceled }) => ctx.bundle.exportBundle({
-          store,
-          ctx,
-          scope,
-          names,
-          fileName: body.name || body.fileName,
-          withDeps,
-          autoFetchDeps,
-          logger: log,
-          isCanceled,
-          concurrency: conc,
-          onProgress: (ev) => {
-            if (ev.phase === 'deps-fetch') {
-              // 自动补依赖阶段：沿用 collect 阶段显示，只换文案（进度按「已处理 N 个依赖」算）
-              const doneN = (Number(ev.downloaded) || 0) + (Number(ev.failed) || 0);
-              update({
-                phase: 'collect',
-                message: ev.message || '正在自动补齐缺失依赖…',
-                done: doneN,
-                total: Math.max(doneN, Number(ev.total) || 0),
-              });
-              return;
-            }
-            if (ev.phase === 'collect-start') {
-              update({ phase: 'collect', total: Number(ev.total) || 0, message: '正在统计要导出的包…' });
-              return;
-            }
-            if (ev.phase === 'collect-done') {
-              update({
-                phase: 'pack',
-                total: Number(ev.entries) || 0,
-                bytesTotal: Number(ev.totalBytes) || 0,
-                done: 0,
-                message: '',
-                title: `导出离线包 · ${Number(ev.packages).toLocaleString('en-US')} 个包`,
-              });
-              return;
-            }
-            if (ev.phase === 'collect') {
-              // 统计阶段也有反馈：大镜像逐个 stat tarball 可能要几秒，界面显示「已扫描 N / M 个包」
-              update({ phase: 'collect', done: Number(ev.packages) || 0, total: Number(ev.total) || 0 });
-              return;
-            }
-            if (ev.phase === 'package') {
-              pkgs.push({
-                name: ev.name,
-                status: 'packed',
-                versions: Number(ev.versions) || 0,
-                tarballs: Number(ev.tarballs) || 0,
-                sizeBytes: Number(ev.sizeBytes) || 0,
-              });
-              update({ packages: pkgs.slice(-2000), ok: pkgs.length });
-              return;
-            }
-            if (ev.phase === 'pack') {
-              update({
-                phase: 'pack',
-                done: Number(ev.entriesDone) || 0,
-                total: Number(ev.entriesTotal) || 0,
-                bytes: Number(ev.bytes) || 0,
-                bytesTotal: Number(ev.totalBytes) || 0,
-                current: ev.pkg || '',
-                currentDone: Number(ev.pkgDone) || 0,
-                currentTotal: Number(ev.pkgTotal) || 0,
-              });
-            }
-          },
-        }),
+        run: async ({ update, isCanceled }) => {
+          try {
+            return await ctx.bundle.exportBundle({
+              store,
+              ctx,
+              scope,
+              names,
+              fileName: body.name || body.fileName,
+              withDeps,
+              autoFetchDeps,
+              logger: log,
+              isCanceled,
+              concurrency: conc,
+              onProgress: (ev) => {
+                if (ev.phase === 'deps-fetch') {
+                  // 自动补依赖阶段：沿用 collect 阶段显示，只换文案（进度按「已处理 N 个依赖」算）
+                  const doneN = (Number(ev.downloaded) || 0) + (Number(ev.failed) || 0);
+                  update({
+                    phase: 'collect',
+                    message: ev.message || '正在自动补齐缺失依赖…',
+                    done: doneN,
+                    total: Math.max(doneN, Number(ev.total) || 0),
+                  });
+                  return;
+                }
+                if (ev.phase === 'collect-start') {
+                  update({ phase: 'collect', total: Number(ev.total) || 0, message: '正在统计要导出的包…' });
+                  return;
+                }
+                if (ev.phase === 'collect-done') {
+                  update({
+                    phase: 'pack',
+                    total: Number(ev.entries) || 0,
+                    bytesTotal: Number(ev.totalBytes) || 0,
+                    done: 0,
+                    message: '',
+                    title: `导出离线包 · ${Number(ev.packages).toLocaleString('en-US')} 个包`,
+                  });
+                  return;
+                }
+                if (ev.phase === 'collect') {
+                  // 统计阶段也有反馈：大镜像逐个 stat tarball 可能要几秒，界面显示「已扫描 N / M 个包」
+                  update({ phase: 'collect', done: Number(ev.packages) || 0, total: Number(ev.total) || 0 });
+                  return;
+                }
+                if (ev.phase === 'package') {
+                  pkgs.push({
+                    name: ev.name,
+                    status: 'packed',
+                    versions: Number(ev.versions) || 0,
+                    tarballs: Number(ev.tarballs) || 0,
+                    sizeBytes: Number(ev.sizeBytes) || 0,
+                  });
+                  update({ packages: pkgs.slice(-2000), ok: pkgs.length });
+                  return;
+                }
+                if (ev.phase === 'pack') {
+                  update({
+                    phase: 'pack',
+                    done: Number(ev.entriesDone) || 0,
+                    total: Number(ev.entriesTotal) || 0,
+                    bytes: Number(ev.bytes) || 0,
+                    bytesTotal: Number(ev.totalBytes) || 0,
+                    current: ev.pkg || '',
+                    currentDone: Number(ev.pkgDone) || 0,
+                    currentTotal: Number(ev.pkgTotal) || 0,
+                    // 并行打包时同时有多个包在写，右栏按它渲染多行（current 保留，兼容旧前端/串行时）
+                    inFlight: Array.isArray(ev.inFlight) ? ev.inFlight.slice(0, 64) : [],
+                  });
+                }
+              },
+            });
+          } finally {
+            // 任务收尾（成功/取消/失败）都要把「并行包」清空，右栏才不会留下已结束的行
+            update({ inFlight: [] });
+          }
+        },
       });
       return ok(res, { taskId, async: true });
     }
@@ -997,6 +1006,7 @@ async function handleAdmin(ctx) {
                 bytes: Number(ev.bytes) || 0,
                 bytesTotal: Number(ev.bytes) || 0,
                 current: '', currentDone: 0, currentTotal: 0,
+                inFlight: [],
                 message: '',
               });
               return;
@@ -1012,12 +1022,16 @@ async function handleAdmin(ctx) {
                 current: ev.name,
                 currentDone: 0,
                 currentTotal: curTotal,
+                inFlight: Array.isArray(ev.inFlight) ? ev.inFlight.slice(0, 64) : [],
               });
               return;
             }
             if (ev.phase === 'version') {
               curTotal = Number(ev.versionTotal) || curTotal;
-              update({ current: ev.name, currentDone: Number(ev.versionDone) || 0, currentTotal: curTotal });
+              update({
+                current: ev.name, currentDone: Number(ev.versionDone) || 0, currentTotal: curTotal,
+                inFlight: Array.isArray(ev.inFlight) ? ev.inFlight.slice(0, 64) : [],
+              });
               return;
             }
             if (ev.phase === 'package') {
@@ -1042,6 +1056,7 @@ async function handleAdmin(ctx) {
                 current: ev.name,
                 currentDone: curTotal,
                 currentTotal: curTotal,
+                inFlight: Array.isArray(ev.inFlight) ? ev.inFlight.slice(0, 64) : [],
                 errors: pkgs.filter(p => p.status === 'failed').slice(-50).map(p => ({ name: p.name, error: p.reason })),
               });
             }
@@ -1060,7 +1075,14 @@ async function handleAdmin(ctx) {
         total: 0,
         concurrency: Math.max(1, Number(cfg.storage.bundleImportConcurrency) || 4),
         log,
-        run: doImport,
+        run: async (o) => {
+          try {
+            return await doImport(o);
+          } finally {
+            // 收尾（成功/取消/失败）都清空「并行导入的包」，右栏不留残行
+            o.update({ inFlight: [] });
+          }
+        },
       });
       return ok(res, { taskId, async: true });
     }

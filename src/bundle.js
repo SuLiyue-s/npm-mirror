@@ -274,7 +274,8 @@ async function autoFillDeps({ ctx, store, roots, logger, emit = () => {}, isCanc
  *   { phase:'collect-start', total }                      开始统计要导出的包
  *   { phase:'deps-fetch', status, total, done, message }   正在自动补齐缺失依赖（status=resolve/download/skipped）
  *   { phase:'collect-done', packages, entries, totalBytes } 统计/文件清单准备完成
- *   { phase:'pack', entriesDone, entriesTotal, bytes, totalBytes, pkg, pkgDone, pkgTotal }
+ *   { phase:'pack', entriesDone, entriesTotal, bytes, totalBytes, pkg, pkgDone, pkgTotal,
+ *     inFlight:[{name,done,total,tarballs,versions}] }  打包进度；inFlight 是并行时同时在写的包（多个）
  *   { phase:'package', name, status:'packed', tarballs, versions, sizeBytes }  某个包的全部条目已写入
  * @param {function} [o.isCanceled] 返回 true 时尽快中止（抛 code=ECANCELED）
  * @param {number} [o.concurrency=1] 打包并发：>1 时按体积切成多段并行 gzip 压缩（产物仍是标准 tar.gz）
@@ -463,6 +464,22 @@ async function exportBundle({
     },
     onProgress: (info) => {
       const cur = info.entry > 0 ? entryPkg[info.entry - 1] : null;
+      /* 并行打包时同时有多个包在写：把「正在写的条目」映射成包，去重后交给界面显示
+       * （原来只报最近完成的那个包，界面右栏就只剩 1 条，看起来像没有并行）。 */
+      const inFlight = [];
+      const seenFlight = new Set();
+      for (const idx of Array.isArray(info.active) ? info.active : []) {
+        const p = entryPkg[idx];
+        if (!p || seenFlight.has(p.name)) continue;
+        seenFlight.add(p.name);
+        inFlight.push({
+          name: p.name,
+          done: Math.min(pkgSeen.get(p.name) || 0, p.entries),
+          total: p.entries,
+          tarballs: p.tarballs,
+          versions: p.versions,
+        });
+      }
       emit({
         phase: 'pack',
         entriesDone: info.count,
@@ -472,6 +489,7 @@ async function exportBundle({
         pkg: cur ? cur.name : '',
         pkgDone: cur ? Math.min(pkgSeen.get(cur.name) || 0, cur.entries) : 0,
         pkgTotal: cur ? cur.entries : 0,
+        inFlight,
       });
     },
   });
@@ -526,9 +544,10 @@ async function readBundleManifest(file) {
  * @param {function} [o.onProgress] 进度回调：
  *   { phase:'extract', bytes, totalBytes, current }            正在解包到临时目录（bytes=已解出数据字节）
  *   { phase:'extract-done', bytes, packages }                  解包完成
- *   { phase:'package-start', index, total, name, versionTotal, running } 开始导入某个包（并行时会有多个包同时开始）
- *   { phase:'version', name, versionDone, versionTotal }        该包内正在处理第 k/N 个版本
- *   { phase:'package', name, status:'imported'|'skipped'|'failed', versions, tarballs, skipped, failed, reason }
+ *   { phase:'package-start', index, total, name, versionTotal, running, inFlight } 开始导入某个包（并行时会有多个包同时开始）
+ *   { phase:'version', name, versionDone, versionTotal, inFlight } 该包内正在处理第 k/N 个版本
+ *   { phase:'package', name, status:'imported'|'skipped'|'failed', versions, tarballs, skipped, failed, reason, inFlight }
+ *     inFlight 是并行导入时「同时在处理的包」列表（{name,done,total}，done/total = 版本数），界面右栏按它显示多行
  *     status='skipped' 时 reason 会说明原因（版本已存在 / bundle 内缺少 tarball 等）
  * @param {function} [o.isCanceled] 返回 true 时在包之间/版本之间尽快停下来（结果带 canceled=true 的部分数据）
  * @param {number} [o.concurrency=1] 包级并发：不同包并行导入（包内版本仍按顺序写）
@@ -538,9 +557,21 @@ async function importBundle({
 }) {
   const manifest = await readBundleManifest(file); // 先校验格式与 manifest 是否可读
   const mstats = (manifest && manifest.stats) || {};
+  /* 并行导入时同时有多个包在处理：维护「正在导入的包」集合，随每个事件带给界面，
+   * 右栏才能像补 tarball 那样一条包一行（原来只留单个 current，并行 4 路也只显示 1 条）。 */
+  const running = new Map();          // name -> {name, done, total}
+  const flight = () => Array.from(running.values()).map(x => ({ name: x.name, done: x.done, total: x.total }));
   const emit = (ev) => {
     if (!onProgress) return;
-    try { onProgress(ev); } catch { /* 进度回调不影响导入结果 */ }
+    if (ev && ev.phase === 'package-start') {
+      running.set(ev.name, { name: ev.name, done: 0, total: Number(ev.versionTotal) || 0 });
+    } else if (ev && ev.phase === 'version') {
+      const it = running.get(ev.name);
+      if (it) { it.done = Number(ev.versionDone) || 0; it.total = Number(ev.versionTotal) || it.total; }
+    } else if (ev && ev.phase === 'package') {
+      running.delete(ev.name);
+    }
+    try { onProgress({ ...ev, inFlight: flight() }); } catch { /* 进度回调不影响导入结果 */ }
   };
   const canceled = () => !!(isCanceled && isCanceled());
   const tmp = path.join(tmpRoot(), `import-${stamp()}-${Math.random().toString(36).slice(2, 8)}`);

@@ -1482,7 +1482,15 @@
       cnt.textContent = running.length ? (countPrefix + ' ' + running.length + ' 个') : '';
     }
 
-    return { el: col, paint: paint };
+    return {
+      el: col,
+      paint: paint,
+      /* 并发数在任务快照里（导出/导入可能 4~10 路），弹窗建栏时还不知道，拿到快照后再放宽行数上限 */
+      setMax: function (n) {
+        var v = Math.max(1, Math.min(32, Number(n) || 1));
+        if (v !== max) max = v;
+      }
+    };
   }
 
   /**
@@ -2913,13 +2921,22 @@
         list.appendChild(opts.rowEl(p));
       });
       var feed = [];
-      if (d.current) {
+      /* 并行打包/导入：任务快照里 inFlight 是「同时在处理的包」列表（导出=文件数，导入=版本数），
+       * 一条包一行；旧字段 current（单个包）保留给缓存导入等串行任务做兜底。 */
+      if (Array.isArray(d.inFlight) && d.inFlight.length) {
+        d.inFlight.forEach(function (p) {
+          if (!p || !p.name) return;
+          feed.push({ name: p.name, status: 'running', target: Number(p.total) || 0, done: Number(p.done) || 0 });
+        });
+        lastCur = null;
+      } else if (d.current) {
         lastCur = { name: d.current, target: Number(d.currentTotal) || 0, done: Number(d.currentDone) || 0, at: Date.now() };
         feed.push({ name: lastCur.name, status: 'running', target: lastCur.target, done: lastCur.done });
       } else if (lastCur && d.status === 'running' && Date.now() - lastCur.at < 1500) {
         // 包与包之间轮询可能正好落在间隙：保留刚处理完的包一小会儿，右栏才不会闪空
         feed.push({ name: lastCur.name, status: 'running', target: lastCur.target, done: lastCur.done });
       }
+      runPane.setMax(d.concurrency || 1);
       runPane.paint(feed, d.status !== 'running');
       leftCol.scrollTop = leftCol.scrollHeight;
     }
@@ -3017,7 +3034,7 @@
       title: '导出离线包', sub: 'EXPORT BUNDLE',
       intro: '正在统计要导出的包…',
       busyText: '导出中…', sideHint: 'EXPORTING…', waitText: '正在打包…',
-      paneHead: '正在打包 · 当前包', paneUnit: '个文件',
+      paneHead: '正在打包 · 并行包', paneUnit: '个文件',
       cancelLabel: '取消导出', btn: btn,
       extractBar: false,
       statText: statText,
@@ -3160,7 +3177,7 @@
         ? '正在上传 ' + opts.file.name + '（' + fmtBytes(opts.file.size) + '）…'
         : '正在读取 ' + opts.name + ' …',
       busyText: '导入中…', sideHint: 'IMPORTING…', waitText: '正在解包…',
-      paneHead: '正在导入 · 当前包', paneUnit: '个版本',
+      paneHead: '正在导入 · 并行包', paneUnit: '个版本',
       cancelLabel: '取消导入', btn: opts.btn || null,
       extractBar: true,
       statText: statText,

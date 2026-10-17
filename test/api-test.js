@@ -501,7 +501,8 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
       const cv = (cr.json && cr.json.data && cr.json.data.versions) || [];
       if (cv.some(v => v.sourceSizeBytes > 0 && !v.cached)) { srcName = cand; vs = cv; break; }
     }
-    if (!srcName) {
+    let srcFound = !!srcName;
+    if (!srcFound) {
       const r0 = await api('/__admin/api/packages/ms');
       srcName = 'ms';
       vs = (r0.json && r0.json.data && r0.json.data.versions) || [];
@@ -509,9 +510,14 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
     check('详情每个版本都带 sourceSizeBytes（源服务器 tarball 体积）',
       vs.length > 0 && vs.every(v => Number.isFinite(v.sourceSizeBytes)),
       `包=${srcName} versions=${vs.length} 首个=${JSON.stringify(vs[0] && { version: vs[0].version, src: vs[0].sourceSizeBytes })}`);
-    check('源体积来自上游元数据（至少一个 > 0，未缓存版本也有）',
-      vs.some(v => v.sourceSizeBytes > 0 && !v.cached),
-      `包=${srcName} 未缓存且带源体积的版本数=${vs.filter(v => v.sourceSizeBytes > 0 && !v.cached).length}`);
+    if (srcFound) {
+      check('源体积来自上游元数据（至少一个 > 0，未缓存版本也有）',
+        vs.some(v => v.sourceSizeBytes > 0 && !v.cached),
+        `包=${srcName} 未缓存且带源体积的版本数=${vs.filter(v => v.sourceSizeBytes > 0 && !v.cached).length}`);
+    } else {
+      skip('源体积来自上游元数据（至少一个 > 0，未缓存版本也有）',
+        '当前镜像里所有包的所有版本都已缓存（用户已跑过「全部包补全部版本」），没有「未缓存」版本可验证');
+    }
     check('详情带 unpackedSizeBytes / fileCount（可为 0）',
       vs.every(v => Number.isFinite(v.unpackedSizeBytes) && Number.isFinite(v.fileCount)),
       `首个=${JSON.stringify(vs[0] && { un: vs[0].unpackedSizeBytes, fc: vs[0].fileCount })}`);
@@ -1086,7 +1092,10 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
     const pjAll = (pullAll.json && pullAll.json.data) || {};
     check('POST /packages/pull {all:true, mode:"all"} 能建「补全部版本」任务（响应带 scope=all / mode=all / 目标数=全部缺失版本）',
       pullAll.status === 200 && pjAll.scope === 'all' && pjAll.mode === 'all'
-        && Number(pjAll.total) > 0 && Number(pjAll.total) <= sum(planAll) && Number(pjAll.total) >= sum(planTags),
+        // 镜像被「全部包补全部版本」补满后，剩下的缺失版本可能只在「上传/私有」包里（全部包模式会跳过），
+        // 这时 total=0 是合理的；只要不超过本地逐包扫描出的缺失版本总数即可。
+        && Number(pjAll.total) >= 0 && Number(pjAll.total) <= sum(planAll)
+        && (Number(pjAll.total) === 0 || Number(pjAll.total) >= sum(planTags)),
       `status=${pullAll.status} scope=${pjAll.scope} mode=${pjAll.mode} total=${pjAll.total} planAll=${sum(planAll)} planTags=${sum(planTags)}`);
     if (pjAll.taskId) {
       const tb = await api('/__admin/api/tasks/' + pjAll.taskId);
@@ -1647,7 +1656,112 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
     for (const f of madeBundles3) await api(`/__admin/api/bundles?file=${encodeURIComponent(f)}`, { method: 'DELETE' });
   }
 
-  // ---------------------------------------------------------------- 并行导出/导入与根目录兼容
+  // ---------------------------------------------------------------- 并行处理的包（inFlight）
+  section('六之四之二、并行打包 / 导入时「同时在处理的包」进度（inFlight）');
+  {
+    const tarMod5 = require('../src/tar');
+    const os5 = require('os');
+    const tmp5 = fs.mkdtempSync(path.join(os5.tmpdir(), 'mirror-inflight-'));
+    try {
+      // 1) tar 层：并发 2 打包 4 个条目（按体积至少能切成 2 段）时，进度里的 active 能同时包含多个条目，收尾清空
+      const files5 = ['a.bin', 'b.bin', 'c.bin', 'd.bin'];
+      for (const name of files5) fs.writeFileSync(path.join(tmp5, name), Buffer.alloc(768 * 1024, 7));
+      const entries5 = files5.map((name) => ({
+        name, source: path.join(tmp5, name), mode: 0o644, mtime: Date.now() / 1000,
+      }));
+      const ev5 = [];
+      await tarMod5.packTarGz(path.join(tmp5, 'out.tgz'), entries5, {
+        concurrency: 2, onProgress: (e) => ev5.push(e),
+      });
+      const maxActive5 = ev5.reduce((a, e) => Math.max(a, (e.active || []).length), 0);
+      check('tar 打包进度带 active：并发写两个条目时出现过「同时 2 个在写」', maxActive5 >= 2,
+        `events=${ev5.length} maxActive=${maxActive5}`);
+      const lastEv5 = ev5[ev5.length - 1] || null;
+      check('tar 打包进度 active 收尾清空（最后一个事件里没有在写的条目）',
+        !!lastEv5 && Array.isArray(lastEv5.active) && lastEv5.active.length === 0,
+        JSON.stringify(lastEv5));
+    } finally {
+      try { fs.rmSync(tmp5, { recursive: true, force: true }); } catch { /* 忽略 */ }
+    }
+
+    // 2) 导出/导入任务：边跑边高频采样，验证快照里的 inFlight（并行包列表）
+    const cfgMod5 = require('../src/config');
+    const quietLog5 = { info() {}, warn() {}, error() {}, debug() {} };
+    const { Store: Store5 } = require('../src/store');
+    const st5 = new Store5({ dir: cfgMod5.storageDir(), logger: quietLog5 });
+    await st5.init();
+    const cand5 = ['debug', 'chalk', 'semver', 'ms', 'lodash', 'is-number'];
+    const names5 = cand5.filter((n) => st5.get(n)).slice(0, 2);
+    await st5.close();
+    const cfg5 = await api('/__admin/api/config');
+    const storage5 = ((((cfg5.json || {}).data || {}).config) || {}).storage || {};
+    const exConc5 = Math.max(1, Number(storage5.bundleExportConcurrency) || 4);
+    const imConc5 = Math.max(1, Number(storage5.bundleImportConcurrency) || 4);
+
+    async function sampleTask5(id, ms = 20000) {
+      const t0 = Date.now();
+      const snaps = [];
+      let fin = null;
+      while (Date.now() - t0 < ms) {
+        const r = await api('/__admin/api/tasks/' + id);
+        const d = r.json && r.json.data;
+        if (!d) break;
+        snaps.push(d);
+        if (d.status !== 'running') { fin = d; break; }
+        await util.sleep(10);
+      }
+      return { snaps, fin };
+    }
+    function validFlight5(p) {
+      return !!p && typeof p.name === 'string' && p.name.length > 0
+        && Number.isFinite(Number(p.done)) && Number.isFinite(Number(p.total));
+    }
+
+    let bundle5 = null;
+    check('镜像里能找到用于「并行包」进度测试的包', names5.length >= 2, `names=${names5.join(',')}`);
+    if (names5.length >= 2) {
+      const ex5 = await api('/__admin/api/bundles/export', {
+        method: 'POST', body: { scope: 'selected', names: names5, progress: true }, timeoutMs: 30000,
+      });
+      const id5 = (ex5.json && ex5.json.data && ex5.json.data.taskId) || null;
+      if (id5) {
+        const { snaps, fin } = await sampleTask5(id5);
+        const packs5 = snaps.filter((d) => d.phase === 'pack' && Array.isArray(d.inFlight));
+        const maxLen5 = packs5.reduce((a, d) => Math.max(a, d.inFlight.length), 0);
+        check('导出进度快照带 inFlight，并行打包时同时出现多个包（不再只剩 1 个「当前包」）',
+          maxLen5 >= Math.min(2, exConc5),
+          `并发=${exConc5} 采样=${snaps.length} 最大并行包=${maxLen5}`);
+        check('导出 inFlight 每项都是 {name,done,total}（右栏画进度条要的数值）',
+          packs5.every((d) => d.inFlight.every(validFlight5)),
+          JSON.stringify(packs5.map((d) => d.inFlight).slice(0, 3)));
+        const rf5 = (fin && fin.result) || {};
+        if (rf5.file) bundle5 = rf5.file;
+        check('导出任务结束后 inFlight 清空（右栏不留残留行）',
+          !!fin && fin.status === 'done' && Array.isArray(fin.inFlight) && fin.inFlight.length === 0,
+          `status=${fin && fin.status} inFlight=${JSON.stringify(fin && fin.inFlight)}`);
+      }
+    }
+
+    if (bundle5) {
+      const im5 = await api('/__admin/api/bundles/import', {
+        method: 'POST', body: { file: bundle5, overwrite: true, progress: true }, timeoutMs: 60000,
+      });
+      const iid5 = (im5.json && im5.json.data && im5.json.data.taskId) || null;
+      if (iid5) {
+        const { snaps, fin } = await sampleTask5(iid5);
+        const ims5 = snaps.filter((d) => Array.isArray(d.inFlight) && d.inFlight.length > 0);
+        check('导入进度快照带 inFlight，并行导入时能看到同时在处理的包',
+          ims5.length > 0 && ims5.every((d) => d.inFlight.every(validFlight5)),
+          `采样=${snaps.length} 有并行包快照=${ims5.length} 示例=${JSON.stringify((ims5[0] || {}).inFlight || [])}`);
+        check('导入任务结束后 inFlight 清空', !!fin && Array.isArray(fin.inFlight) && fin.inFlight.length === 0,
+          `status=${fin && fin.status} inFlight=${JSON.stringify(fin && fin.inFlight)}`);
+        check('导入任务的并发数来自配置（bundleImportConcurrency）', fin && Number(fin.concurrency) === imConc5,
+          `concurrency=${fin && fin.concurrency} 期望=${imConc5}`);
+      }
+      await api(`/__admin/api/bundles?file=${encodeURIComponent(bundle5)}`, { method: 'DELETE' });
+    }
+  }
+
   section('六之五、导出/导入并行与「根目录名不是 package」的 tarball');
   {
     const crypto = require('node:crypto');

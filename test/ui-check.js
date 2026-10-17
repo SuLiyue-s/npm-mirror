@@ -489,6 +489,19 @@ async function get(p, { json = false } = {}) {
       /opts\.phaseNote/.test(js.text) && /d\.status === 'running' && opts\.phaseNote/.test(js.text)
         && /正在统计要导出的包/.test(js.text) && /正在打包并压缩/.test(js.text)
         && /正在解包备份文件…（可以取消/.test(js.text) && /正在把包写入本地存储/.test(js.text));
+
+    // ④ 并行进度：右栏「同时在处理的包」多行（原来并行 10 路也只显示 1 条「当前包」）
+    check('后端记录并行包：tar 上报 active、bundle 导出/导入事件带 inFlight、任务快照透传',
+      /active: Array\.from\(active\)/.test(tarSrc) && /inFlight/.test(bundleSrc)
+        && /const flight = \(\) =>/.test(bundleSrc) && /inFlight: Array\.isArray\(ev\.inFlight\)/.test(apiSrc)
+        && /inFlight: t\.inFlight \|\| \[\]/.test(tasksSrc));
+    check('右栏按 inFlight 渲染多行，标题改成「并行包」，并发上限来自任务快照',
+      /Array\.isArray\(d\.inFlight\) && d\.inFlight\.length/.test(js.text)
+        && /runPane\.setMax\(d\.concurrency \|\| 1\)/.test(js.text)
+        && /setMax: function \(n\)/.test(js.text)
+        && /正在打包 · 并行包/.test(js.text) && /正在导入 · 并行包/.test(js.text));
+    check('任务收尾清空 inFlight（导出/导入结束后右栏不留残行）',
+      /update\(\{ inFlight: \[\] \}\)/.test(apiSrc) && /o\.update\(\{ inFlight: \[\] \}\)/.test(apiSrc));
   }
 
   console.log('\x1b[1m九、离线包并行导出 / 导入 + 「根目录名不是 package」兼容\x1b[0m');

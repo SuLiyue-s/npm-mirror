@@ -160,8 +160,10 @@ async function unlinkQuiet(files) {
 
 /** 把一个条目的 tar 头 + 内容写进 w（数据源可能是内存 Buffer 或磁盘文件） */
 async function writeEntry(w, entries, i, ctx) {
-  const { state, emit, onEntryDone, shouldAbort } = ctx;
+  const { state, emit, onEntryDone, shouldAbort, active } = ctx;
   let e = entries[i];
+  // 条目刚开始写就强制上报一次：并行时上层能立刻拿到「同时在写的包」，右栏不会等第一个条目写完才出现第二行
+  if (active) { active.add(i); emit(e.name, true); }
   let size = e.size;
   const data = e.data;
   if (data !== undefined && data !== null) {
@@ -176,6 +178,7 @@ async function writeEntry(w, entries, i, ctx) {
     if (st.isDirectory()) {
       await w.write(makeHeader({ ...e, size: 0, type: '5' }));
       emit(e.name, true);
+      if (active) active.delete(i);
       onEntryDone(i, e);
       return;
     }
@@ -229,6 +232,7 @@ async function writeEntry(w, entries, i, ctx) {
     if (pad) await w.write(Buffer.alloc(pad));
   }
   // 条目完成必须强制上报一次：并行分段时每条目的进度靠它累计，缺了会让整体进度停在很小的值
+  if (active) active.delete(i);
   emit(e.name, true);
   onEntryDone(i, e);
 }
@@ -259,7 +263,8 @@ async function concatFiles(parts, outFile) {
 /**
  * 打包为 tar.gz
  * entries: [{ name, source? , data?, mtime?, size? }]
- * onProgress({ count, entriesTotal, total, current, entry })：
+ * onProgress({ count, entriesTotal, total, current, entry, active })：
+ *   active 是「正在写」的条目下标数组（并行分段时可能有多个），上层用来显示并行处理中的包。
  *   count = 已写完的条目数；entriesTotal = 总条目数；total = 已写入的数据字节（不含 tar 头与对齐填充）；
  *   current = 刚写完（或正在读）的条目名；entry = 当前正在处理的条目序号（1 起）。
  *   每个条目完成时回调一次，大文件流式读取期间每 250ms 再补一次，
@@ -275,6 +280,7 @@ async function packTarGz(outFile, entries, { gzip = true, onProgress, shouldAbor
   const entriesTotal = entries.length;
   const parts = gzip ? Math.max(1, Math.min(Number(concurrency) || 1, entriesTotal || 1)) : 1;
   const state = { count: 0, total: 0, entry: 0 };
+  const active = new Set();        // 正在写的条目下标（并行打包时可能同时有多个），供上层映射成「并行处理中的包」
   let lastEmit = 0;
   const emit = (current, force) => {
     if (!onProgress) return;
@@ -282,7 +288,7 @@ async function packTarGz(outFile, entries, { gzip = true, onProgress, shouldAbor
     // 回调抛错不能影响打包本身：进度只是旁路信息
     if (!force && now - lastEmit < 250) return;
     lastEmit = now;
-    try { onProgress({ count: state.count, entriesTotal, total: state.total, current: current || '', entry: state.entry }); } catch { /* 忽略 */ }
+    try { onProgress({ count: state.count, entriesTotal, total: state.total, current: current || '', entry: state.entry, active: Array.from(active) }); } catch { /* 忽略 */ }
   };
   const entryBytes = (e) => (e.data !== undefined && e.data !== null) ? e.data.length : (Number(e.size) || 0);
   const done = (i, e) => {
@@ -290,7 +296,7 @@ async function packTarGz(outFile, entries, { gzip = true, onProgress, shouldAbor
     state.count++;
     if (onEntryDone) { try { onEntryDone({ index: i, name: e.name, bytes: entryBytes(e) }); } catch { /* 忽略 */ } }
   };
-  const ctx = { state, emit, onEntryDone: done, shouldAbort };
+  const ctx = { state, emit, onEntryDone: done, shouldAbort, active };
 
   if (parts <= 1) {
     const w = createWriter(outFile, gzip);

@@ -26,6 +26,9 @@ function brief(t) {
     current: t.current || '', currentDone: t.currentDone || 0, currentTotal: t.currentTotal || 0,
     /* 正在并发下载的每个版本（tarball）的实时字节进度：{name,version,received,total}[] */
     downloads: t.downloads || [],
+    /* 并行打包/导入时同时在处理的包：{name,done,total}[]（导出 done/total = 已写/总文件数）
+     * 注意这是白名单字段：不加进来，/tasks/<id> 快照里就看不到 */
+    inFlight: t.inFlight || [],
     percent, elapsedMs, ratePerSec: Number(rate.toFixed(2)),
     bytesPerSec: Math.round(t.bytes / sec), etaSec,
     concurrency: t.concurrency,
