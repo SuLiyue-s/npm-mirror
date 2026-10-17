@@ -1485,6 +1485,80 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
     await api(`/__admin/api/packages/${encodeURIComponent(fmtName)}`, { method: 'DELETE' });
     fs.rmSync(work2, { recursive: true, force: true });
 
+    // A3) 任务快照里每个包都要带人话原因（前端「导入结果详情」直接消费这些数据）：
+    //     - 缺 tarball 的包 → skipped + reason「bundle 内缺少 N 个版本的 tarball…」
+    //     - 校验失败的包 → failed + reason 说明是哪一类不一致
+    {
+      const skipName = 'mirror-selftest-skipreason';
+      const badName = 'mirror-selftest-badreason';
+      const w3 = path.join(os.tmpdir(), `mirror-selftest-reason-${util.stamp()}`);
+      util.ensureDir(w3);
+      const mkPkg = (name) => {
+        const root = path.join(w3, `${name}-root`);
+        util.ensureDir(path.join(root, 'package'));
+        fs.writeFileSync(path.join(root, 'package', 'package.json'), JSON.stringify({ name, version: '1.0.0' }));
+      };
+      mkPkg(skipName); mkPkg(badName);
+      const badTgz = path.join(w3, 'bad.tgz');
+      await tar.packTarGz(badTgz, [{ name: 'package/package.json', source: path.join(w3, `${badName}-root`, 'package', 'package.json') }], {});
+      const badBuf = fs.readFileSync(badTgz);
+      const b64 = crypto.createHash('sha512').update(badBuf).digest('base64');
+      const flipped = b64.slice(0, -1) + (b64.endsWith('A') ? 'B' : 'A');
+      const badIntegrity = `sha512-${flipped}`;
+      const w3entries = [
+        {
+          name: 'manifest.json',
+          data: Buffer.from(JSON.stringify({
+            format: bundleMod4.FORMAT, formatVersion: bundleMod4.FORMAT_VERSION,
+            createdAt: new Date().toISOString(), tool: 'api-test', scope: 'selected',
+            stats: { packages: 2, versions: 2, tarballs: 1, tarballBytes: badBuf.length, depsAdded: 0, depsMissing: [] },
+          })),
+        },
+        {
+          name: `storage/${skipName}/packument.json`,
+          data: Buffer.from(JSON.stringify({
+            name: skipName, 'dist-tags': { latest: '1.0.0' },
+            versions: { '1.0.0': { name: skipName, version: '1.0.0', dist: { tarball: `${skipName}/-/${skipName}-1.0.0.tgz`, integrity: null } } },
+          })),
+        },
+        { name: `storage/${skipName}/meta.json`, data: Buffer.from(JSON.stringify({ files: {}, sizes: {}, deprecated: {} })) },
+        {
+          name: `storage/${badName}/packument.json`,
+          data: Buffer.from(JSON.stringify({
+            name: badName, 'dist-tags': { latest: '1.0.0' },
+            versions: { '1.0.0': { name: badName, version: '1.0.0', dist: { tarball: `${badName}/-/${badName}-1.0.0.tgz`, integrity: badIntegrity } } },
+          })),
+        },
+        { name: `storage/${badName}/meta.json`, data: Buffer.from(JSON.stringify({ files: { '1.0.0': `${badName}-1.0.0.tgz` }, sizes: { '1.0.0': badBuf.length }, deprecated: {} })) },
+        { name: `storage/${badName}/tarballs/${badName}-1.0.0.tgz`, source: badTgz },
+      ];
+      const reasonBundle = path.join(w3, 'reason-bundle.tgz');
+      await tar.packTarGz(reasonBundle, w3entries, {});
+      const up3 = await api('/__admin/api/bundles/import?progress=1', {
+        method: 'POST', raw: fs.readFileSync(reasonBundle), timeoutMs: 120000,
+        headers: { 'Content-Type': 'application/octet-stream', 'X-Filename': encodeURIComponent(`selftest-reason-${util.stamp()}.tgz`) },
+      });
+      const tid3 = ((up3.json || {}).data || {}).taskId;
+      let task3 = null;
+      const t30 = Date.now();
+      while (tid3 && Date.now() - t30 < 60000) {
+        const r3 = await api('/__admin/api/tasks/' + tid3);
+        const d3 = r3.json && r3.json.data;
+        if (d3 && d3.status !== 'running') { task3 = d3; break; }
+        await util.sleep(200);
+      }
+      const rows3 = (task3 && task3.packages) || [];
+      const skipRow = rows3.find((p) => p.name === skipName);
+      const badRow = rows3.find((p) => p.name === badName);
+      check('缺 tarball 的包在任务快照里是 skipped 且原因写清「bundle 内缺少 N 个版本的 tarball」',
+        !!skipRow && skipRow.status === 'skipped' && /bundle 内缺少 \d+ 个版本的 tarball/.test(String(skipRow.reason)),
+        JSON.stringify(skipRow));
+      check('校验失败的包在任务快照里是 failed 且原因是 integrity 不一致（前端据此整理成失败清单）',
+        !!badRow && badRow.status === 'failed' && /integrity/.test(String(badRow.reason)),
+        JSON.stringify(badRow));
+      fs.rmSync(w3, { recursive: true, force: true });
+    }
+
     // B) 并发配置项：默认值、非法值、改大后任务并发度跟着变
     const cfg0 = await api('/__admin/api/config');
     const st0 = (((cfg0.json || {}).data || {}).config || {}).storage || {};
@@ -1787,3 +1861,4 @@ function finish(code) {
   process.exitCode = code;
   setTimeout(() => process.exit(code), 400);
 }
+

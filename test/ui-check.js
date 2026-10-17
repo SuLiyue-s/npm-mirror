@@ -382,6 +382,40 @@ async function get(p, { json = false } = {}) {
       /bundleExportConcurrency\) \|\| 4/.test(cliSrc) && /bundleImportConcurrency\) \|\| 4/.test(cliSrc));
   }
 
+  console.log('\x1b[1m十、导入备份结束后的「失败 / 跳过详情」（整理在弹窗最下方，可一键复制）\x1b[0m');
+  {
+    const cssSrc = fs.readFileSync(path.join(__dirname, '..', 'public', 'style.css'), 'utf8');
+
+    check('进度弹窗支持结束后追加内容（onFinalize 钩子，拿到弹窗 body 与左栏列表）',
+      /opts\.onFinalize/.test(js.text) && /opts\.onFinalize\(d, \{ body: bodyEl, list: list \}\)/.test(js.text));
+
+    check('导入结束会调用失败详情面板（bundleImportFailPanel + runBundleImport 传 onFinalize）',
+      /function bundleImportFailPanel\(d\)/.test(js.text) && /bundleImportFailPanel\(d\)/.test(js.text)
+        && /onFinalize: function \(d, ui\)/.test(js.text) && /ui\.body\.appendChild\(box\)/.test(js.text));
+
+    check('详情块放在弹窗最下方：可滚动容器 + 顶部标题 + 「复制清单」按钮',
+      /class: 'fill-err bundle-fail'/.test(js.text) && /fill-err-head/.test(js.text)
+        && /text: '复制清单'/.test(js.text) && /\.fill-err\.bundle-fail\{max-height:230px\}/.test(cssSrc)
+        && /\.fill-err \.fill-err-head\{/.test(cssSrc));
+
+    check('失败逐条列出「name@version：error」（错误文案自带前缀时不重复），条数很多时提示复制拿全部',
+      /var pre = f\.name \+ \(f\.version \? '@' \+ f\.version : ''\)/.test(js.text)
+        && /if \(why\.indexOf\(pre \+ '：'\) === 0\) why = why\.slice\(pre\.length \+ 1\)/.test(js.text)
+        && /var line = '✕ ' \+ pre \+ '：' \+ why/.test(js.text)
+        && /var MAX_SHOW = 500/.test(js.text) && /其余 ' \+ fmtNum\(fails\.length - MAX_SHOW\) \+ ' 条/.test(js.text)
+        && /点右上角「复制清单」可拿到全部/.test(js.text));
+
+    check('跳过按原因归类计数（不认识的写法原样保留），并给出示例包名',
+      /var groups = \{\}, order = \[\]/.test(js.text) && /p\.reason \|\| '其它原因'/.test(js.text)
+        && /跳过（按原因归类，/.test(js.text) && /× ' \+ fmtNum\(names\.length\)/.test(js.text)
+        && /例：' \+ sample/.test(js.text));
+
+    check('复制走剪贴板 API，失败时回退到 execCommand，并给出已复制条数提示',
+      /navigator\.clipboard\.writeText\(txt\)\.then\(copied, fallback\)/.test(js.text)
+        && /document\.execCommand\('copy'\)/.test(js.text)
+        && /已复制 ' \+ fmtNum\(lines\.length\) \+ ' 条到剪贴板/.test(js.text));
+  }
+
   console.log(`\n\x1b[1m结果：${pass}/${pass + fail} 通过\x1b[0m\n`);
   finish(fail === 0 ? 0 : 1);
 })().catch((e) => { console.error('自检异常：', e); finish(1); });

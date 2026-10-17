@@ -2711,9 +2711,12 @@
         note.textContent = '任务失败：' + (d.message || '未知错误');
         setSideHint('ERROR');
         if (opts.onDone) opts.onDone(d);   // 让调用方把失败写回页面状态行
+        if (opts.onFinalize) { try { opts.onFinalize(d, { body: bodyEl, list: list }); } catch (e) { /* 附加详情渲染失败不影响主流程 */ } }
         handleErr(new Error(d.message || '任务失败'));
         return;
       }
+      // 结果详情（例如导入失败清单）由调用方追加到弹窗最下方，避免用户去左栏一条条翻
+      if (opts.onFinalize) { try { opts.onFinalize(d, { body: bodyEl, list: list }); } catch (e) { /* 附加详情渲染失败不影响主流程 */ } }
       opts.onDone(d);
     }
 
@@ -2831,6 +2834,74 @@
   }
 
   /* 导入备份：详细进度（上传/解包 → 逐包导入，可取消）。file 为网页上传的 File，name 为服务器上已有 bundle 名 */
+  /* 导入结束后：把失败 / 跳过整理成弹窗最下方的可滚动详情（可一键复制），不用在左栏逐条翻 */
+  function bundleImportFailPanel(d) {
+    var r = (d && d.result) || {};
+    var fails = Array.isArray(r.failed) ? r.failed.slice() : [];
+    var rows = Array.isArray(d && d.packages) ? d.packages : [];
+    var skipped = rows.filter(function (p) { return p && p.status === 'skipped'; });
+    if (!fails.length && !skipped.length) return null;
+    var lines = [];
+    var box = el('div', { class: 'fill-err bundle-fail' });
+    var head = el('div', { class: 'fill-err-head' });
+    var headText = [];
+    if (fails.length) headText.push('失败 ' + fmtNum(fails.length) + ' 条');
+    if (skipped.length) headText.push('跳过 ' + fmtNum(skipped.length) + ' 个包');
+    head.appendChild(el('b', { text: '导入结果详情（' + headText.join(' · ') + '）' }));
+    var copyBtn = el('button', { class: 'btn btn-ghost btn-xs', type: 'button', text: '复制清单' });
+    copyBtn.onclick = function () {
+      var txt = lines.join('\n');
+      function copied() { toast('已复制 ' + fmtNum(lines.length) + ' 条到剪贴板', 'ok', 4000); }
+      function fallback() {
+        try {
+          var ta = document.createElement('textarea');
+          ta.value = txt;
+          ta.style.position = 'fixed'; ta.style.top = '-1000px'; ta.style.opacity = '0';
+          document.body.appendChild(ta); ta.select();
+          document.execCommand('copy');
+          document.body.removeChild(ta);
+          copied();
+        } catch (e) { toast('复制失败，请手动选中文本复制', 'err'); }
+      }
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(txt).then(copied, fallback);
+      else fallback();
+    };
+    head.appendChild(copyBtn);
+    box.appendChild(head);
+    var MAX_SHOW = 500;
+    if (fails.length) {
+      box.appendChild(el('div', { class: 'fill-err-group', text: '失败（逐条，' + fmtNum(fails.length) + ' 条）：' }));
+      fails.slice(0, MAX_SHOW).forEach(function (f) {
+        var pre = f.name + (f.version ? '@' + f.version : '');
+        var why = String(f.error || '导入失败');
+        // 后端有些错误文案本身已经带「name@version：」前缀，避免显示成「a@1：a@1：...」
+        if (why.indexOf(pre + '：') === 0) why = why.slice(pre.length + 1);
+        var line = '✕ ' + pre + '：' + why;
+        lines.push(line);
+        box.appendChild(el('div', { text: line }));
+      });
+      if (fails.length > MAX_SHOW) {
+        box.appendChild(el('div', { class: 'fill-err-more', text: '… 其余 ' + fmtNum(fails.length - MAX_SHOW) + ' 条不在这里展开，点右上角「复制清单」可拿到全部' }));
+      }
+    }
+    if (skipped.length) {
+      var groups = {}, order = [];
+      skipped.forEach(function (p) {
+        var why = p.reason || '其它原因';
+        if (!groups[why]) { groups[why] = []; order.push(why); }
+        groups[why].push(p.name);
+      });
+      box.appendChild(el('div', { class: 'fill-err-group', text: '跳过（按原因归类，' + fmtNum(skipped.length) + ' 个包）：' }));
+      order.forEach(function (why) {
+        var names = groups[why];
+        var sample = names.slice(0, 6).join('、') + (names.length > 6 ? ' 等' : '');
+        lines.push('· 跳过 ' + fmtNum(names.length) + ' 个（' + why + '）：' + names.join('、'));
+        box.appendChild(el('div', { text: '· ' + why + ' × ' + fmtNum(names.length) + '（例：' + sample + '）' }));
+      });
+    }
+    return box;
+  }
+
   function runBundleImport(opts) {
     var isUpload = !!opts.file;
     var label = isUpload ? opts.file.name : opts.name;
@@ -2866,6 +2937,11 @@
       phaseNote: function (d) {
         if (d.phase === 'extract') return '正在解包备份文件…（可以取消，已解出的部分会清掉）';
         return '正在把包写入本地存储…（可以取消，已导入的部分会保留）';
+      },
+      onFinalize: function (d, ui) {
+        // 失败 / 跳过整理到弹窗最下方，结束时可整块看、可复制
+        var box = bundleImportFailPanel(d);
+        if (box) ui.body.appendChild(box);
       },
       start: function (onProgress) {
         if (isUpload) return uploadBundleXhr(opts.file, opts.overwrite, onProgress);

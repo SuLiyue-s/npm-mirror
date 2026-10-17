@@ -479,6 +479,17 @@ input[type=checkbox]:disabled{opacity:.4;cursor:not-allowed}
   max-height:150px;overflow:auto;
 }
 .fill-err div{padding:1px 0;white-space:normal;overflow-wrap:anywhere;line-height:1.5}
+/* 导入备份结束后追加在弹窗最下方的「失败 / 跳过详情」：可滚动 + 一键复制，不用再在左栏逐条翻 */
+.fill-err.bundle-fail{max-height:230px}
+.fill-err .fill-err-head{
+  display:flex;align-items:center;justify-content:space-between;gap:10px;
+  position:sticky;top:-9px;margin:-2px 0 5px;padding:4px 0 5px;
+  background:linear-gradient(180deg,rgba(29,14,14,.99),rgba(29,14,14,.93));
+  border-bottom:1px solid rgba(255,95,86,.22);
+}
+.fill-err .fill-err-head b{font-weight:600;color:#ffd0cc;letter-spacing:.02em}
+.fill-err .fill-err-group{margin:7px 0 2px;color:#ffd0cc;font-weight:600}
+.fill-err .fill-err-more{color:var(--txt-dim)}
 
 /* 分页 */
 .pager{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:11px;font-size:12px;color:var(--txt-dim)}

@@ -438,7 +438,6 @@ async function importBundle({
           const files = {}; const sizes = {}; const origins = {}; const deprecated = {};
           let added = 0;
           let invalidVersions = 0;
-          let metadataOnlySkipped = 0;
           for (const [v, manifestV] of versionEntries) {
             versionDone++;
             emit({ phase: 'version', name, versionDone, versionTotal });
