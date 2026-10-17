@@ -3,6 +3,25 @@
   "version": "1.0.0",
   "private": true,
   "description": "零依赖、可离线迁移的私人 npm 镜像源：本地缓存 + 私有包仓库 + 中文可视化管理界面",
+  "keywords": [
+    "npm",
+    "registry",
+    "mirror",
+    "private-registry",
+    "offline",
+    "cache",
+    "npm-mirror"
+  ],
+  "author": "苏离月 (SuLiyue)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/SuLiyue-s/npm-mirror.git"
+  },
+  "bugs": {
+    "url": "https://github.com/SuLiyue-s/npm-mirror/issues"
+  },
+  "homepage": "https://github.com/SuLiyue-s/npm-mirror#readme",
   "main": "src/server.js",
   "bin": {
     "npm-mirror": "cli.js"

@@ -3,7 +3,7 @@
 /*
  * 一键跑完所有自检：
  *   1. 先确认镜像源在运行（不在运行会给出提示）
- *   2. 执行 test/api-test.js（注册表协议 + 管理 API + 发布/删除 + 离线包导入导出 + 安全回归 共 152 项；环境不足的项会显式 SKIP）
+ *   2. 执行 test/api-test.js（注册表协议 + 管理 API + 发布/删除 + 离线包导入导出 + 安全回归 共 153 项，默认执行 150 项 + 3 项显式跳过；环境不足 / 破坏性用例会显式 SKIP）
  * 用法：node test/run-all.js [--base http://127.0.0.1:4873]
  * 说明：真实 npm 客户端的验收（install/publish/dist-tag/deprecate/unpublish）由
  *       test/acceptance-npm.ps1 负责，需要本机有 npm。
