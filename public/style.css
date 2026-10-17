@@ -464,12 +464,7 @@ input.dt-input.is-empty{color:var(--txt-faint)}
   padding:3px;background:linear-gradient(180deg,#111a23,#0b1016);
   border:1px solid var(--line-2);border-radius:var(--r);
   box-shadow:0 12px 32px rgba(0,0,0,.55),0 0 0 1px rgba(0,0,0,.35);
-  scrollbar-width:thin;
 }
-.dt-menu::-webkit-scrollbar{width:6px}
-.dt-menu::-webkit-scrollbar-track{background:transparent}
-.dt-menu::-webkit-scrollbar-thumb{background:#22303e;border:1px solid #0b1016;border-radius:3px}
-.dt-menu::-webkit-scrollbar-thumb:hover{background:var(--line-3)}
 .dt-menu[hidden]{display:none!important}
 .dt-opt{
   display:block;width:100%;height:24px;padding:0 9px;text-align:left;
