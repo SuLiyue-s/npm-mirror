@@ -88,7 +88,7 @@ registry=http://127.0.0.1:4873/
 | `node cli.js scan-cache [--cache 目录] [--any-registry] [--refresh]` | 扫描本机 npm 缓存 |
 | `node cli.js import-cache [--all] [--overwrite] [包名...]` | 从本机 npm 缓存导入 |
 | `node cli.js doctor` / `logs [--lines 100] [--level info]` | 环境自检 / 查看日志 |
-| `node cli.js autostart on\|off\|status` | 开机自启（写入「启动」文件夹，无需管理员） |
+| `node cli.js autostart on\|off\|status` | 开机自启（登录后隐藏启动并注册托盘图标与右键快捷菜单，写入「启动」文件夹，无需管理员） |
 
 完整参数与界面操作见 **[使用说明.md](使用说明.md)**。
 
@@ -190,7 +190,7 @@ pwsh -File test/acceptance-npm.ps1   # 真实 npm 客户端验收（Windows / Po
 | --- | --- | --- |
 | `test/api-test.js` | npm 协议、管理接口、发布/删除、离线导入导出、进度任务（含逐版本 `downloads[]` 实时进度）、并行导出导入与根目录/版本写法兼容、导出时自动补齐缺失依赖、全部包补全部版本规划、安全回归、包管理页「缺 tarball / 不缺 tarball」快捷筛选等 231 项（上游可达时会额外执行 3 项自动补依赖用例，共 234 项） | **225 通过 + 6 跳过，0 失败**（上游可达时 229 通过 + 5 跳过） |
 | `test/ui-check.js` | 前端与后端接口/页面元素契约（含导入结果的失败/跳过详情面板、导出自动补依赖勾选项、全部包补全部版本入口、补 tarball 弹窗「版本进度」栏、「缺 tarball / 不缺 tarball」快捷筛选、悬停提示自绘浮层（首页无原生 title、el() 把 title 映射成 data-tip、uiTip 控制器、`.ui-tip` 样式与项目配色变量）、补 tarball 左栏行数上限回收（`reclaimRow` 只收已完成行、失败行保留、提示条）、导出/导入进度弹窗右栏多行进度（`inFlight`：导出按「并行文件」一行一个正在压缩的条目、导入一个包一行）、导出收尾写盘阶段（`concat` 字节进度 → 任务快照 `concatDone/concatTotal` → 右栏「正在写入 · 拼接分片」，压缩阶段最多 95%）、favicon 声明） | **126/126 通过** |
-| `test/tray-check.js` | 托盘脚本/项目图标/启动脚本/favicon 路由契约（含右键菜单「打开管理界面」），并真跑一次托盘自检（Windows） | **35/35 通过** |
+| `test/tray-check.js` | 托盘脚本/项目图标/启动脚本/favicon 路由契约（含右键菜单「打开管理界面」）、**开机自启（`.vbs` 隐藏启动项 / UTF-16LE BOM / 旧 `.cmd` 清理 / `off` 幂等，临时目录真跑）**，并真跑一次托盘自检（Windows） | **48/48 通过** |
 | `test/tray-e2e.ps1` | 托盘端到端：隔离副本启动 → 窗口隐藏 → 可重新显示 → 停服务后托盘退出并关窗 | **8/8 通过（手工）** |
 | `test/acceptance-npm.ps1` | 真实 `npm install / publish / dist-tag / deprecate / unpublish` | **16/16 通过** |
 | `test/ui-e2e-*.js` | 浏览器端端到端（需要 Chrome 调试端口，可选） | 需本机 Chrome CDP 环境 |

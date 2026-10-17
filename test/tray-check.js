@@ -106,6 +106,10 @@ function readIco(buf) {
       /WM_SETICON/.test(tray) && /ICON_BIG/.test(tray) && /ICON_SMALL/.test(tray));
     check('自检参数 -SelfTest / -SelfTestOut 可用（供本脚本调用）',
       /\[switch\]\$SelfTest/.test(tray) && /\[string\]\$SelfTestOut/.test(tray));
+    check('隐藏后点「打开控制台」显示窗口时带 SW_RESTORE 兜底（开机自启的窗口是「启动即隐藏」创建的）',
+      /\$SW_RESTORE = 9/.test(tray) &&
+      /if \(-not \[MirrorTrayNative\]::IsWindowVisible\(\$script:ConsoleHwnd\)\)/.test(tray) &&
+      /ShowWindow\(\$script:ConsoleHwnd, \$SW_RESTORE\)/.test(tray));
   }
 
   // ---------- 二、项目图标 ----------
@@ -151,6 +155,59 @@ function readIco(buf) {
       /左键单击托盘图标/.test(cmdSrc) && /右键单击托盘图标/.test(cmdSrc));
     check('找不到 PowerShell 时回退为普通窗口（托盘不可用但不影响启动）',
       /where powershell\.exe/.test(cmdSrc) && /托盘图标不可用/.test(cmdSrc));
+    check('启动脚本支持参数透传 + 开机自启模式（输出写 data\\logs\\autostart.log，失败不停住）',
+      /node "%~dp0cli\.js" start %\*/.test(cmdSrc) &&
+      /if defined MIRROR_AUTOSTART/.test(cmdSrc) &&
+      /data\\logs\\autostart\.log/.test(cmdSrc));
+  }
+
+  // ---------- 三之二、开机自启 ----------
+  console.log('\x1b[1m三之二、开机自启 Startup 文件夹\x1b[0m');
+  const cliPath = path.join(ROOT, 'cli.js');
+  const cliSrc = fs.readFileSync(cliPath, 'utf8');
+  check('cli.js 的 autostart 写 .vbs 启动项（UTF-16LE 带 BOM，避免中文路径被 WSH 按 ANSI 误读）',
+    /私人npm镜像源\.vbs/.test(cliSrc) && /'utf16le'/.test(cliSrc) && /\\uFEFF/.test(cliSrc));
+  check('自启的 VBS 走「启动镜像源.cmd --no-open」并置 MIRROR_AUTOSTART=1（窗口完全隐藏、同一条托盘路径）',
+    /MIRROR_AUTOSTART/.test(cliSrc) && /--no-open/.test(cliSrc) &&
+    /启动镜像源\.cmd/.test(cliSrc) && /, 0, False/.test(cliSrc));
+  check('开启时清理旧版 .cmd 启动项（升级用户不会登录时同时起来两份）',
+    /legacyStartupFile/.test(cliSrc) && /已移除旧版/.test(cliSrc));
+  // 真跑一遍：隔离到临时 Startup 目录，不碰用户真正的「启动」文件夹
+  const startupDir = fs.mkdtempSync(path.join(os.tmpdir(), 'npm-mirror-startup-'));
+  const legacyFile = path.join(startupDir, '私人npm镜像源.cmd');
+  const vbsFile = path.join(startupDir, '私人npm镜像源.vbs');
+  const runCli = (args) => spawnSync(process.execPath, [cliPath, ...args], {
+    cwd: ROOT,
+    env: { ...process.env, MIRROR_STARTUP_DIR: startupDir },
+    stdio: 'ignore',
+    timeout: 60000,
+    windowsHide: true,
+  });
+  try {
+    fs.writeFileSync(legacyFile, '@echo off\r\nrem 旧版启动项\r\n', 'utf8');
+    const rOn = runCli(['autostart', 'on']);
+    check('autostart on 成功退出（写入 Startup 目录）', rOn.status === 0, `exit=${rOn.status}`);
+    const hasVbs = fs.existsSync(vbsFile);
+    check('生成 .vbs 启动项', hasVbs);
+    if (hasVbs) {
+      const vb = fs.readFileSync(vbsFile);
+      check('启动项是 UTF-16LE 带 BOM（前 2 字节 FF FE）',
+        vb.length > 2 && vb[0] === 0xff && vb[1] === 0xfe, `前2字节=${[...vb.slice(0, 2)].join(',')}`);
+      let vbsText = '';
+      try { vbsText = vb.toString('utf16le').replace(/^\uFEFF/, ''); } catch { /* 忽略 */ }
+      check('启动项内容：隐藏启动「启动镜像源.cmd --no-open」+ MIRROR_AUTOSTART=1 + 窗口样式 0',
+        /MIRROR_AUTOSTART"\) = "1"/.test(vbsText) && /启动镜像源\.cmd/.test(vbsText) &&
+        /--no-open", 0, False/.test(vbsText) && /WScript\.Shell/.test(vbsText));
+    }
+    check('旧版 .cmd 启动项已被清理（升级不会登录起来两份）', !fs.existsSync(legacyFile));
+    const rOff = runCli(['autostart', 'off']);
+    check('autostart off 删除 .vbs 启动项', rOff.status === 0 && !fs.existsSync(vbsFile));
+    const rOff2 = runCli(['autostart', 'off']);
+    check('autostart off 幂等（本来就关闭时也不报错）', rOff2.status === 0);
+    const rSt = runCli(['autostart', 'status']);
+    check('autostart status 正常可用', rSt.status === 0);
+  } finally {
+    try { fs.rmSync(startupDir, { recursive: true, force: true }); } catch { /* 忽略 */ }
   }
 
   // ---------- 四、服务端 favicon ----------

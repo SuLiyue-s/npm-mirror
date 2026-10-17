@@ -19,7 +19,7 @@
 - **依赖递归添加**：自动解析依赖闭包，支持层级/数量限制、多版本共存、非注册表依赖识别、带空格版本范围与 `npm:` 别名
 - **批量补 tarball**：按版本、只补最新、全部包批量补齐，后台任务可看进度、可取消、失败明细可查
 - **完整的命令行**：`start/stop/restart/status/open/init/config/token/use/unuse/list/add/remove/stats/export/import/scan-cache/import-cache/doctor/logs/autostart` 共 21 个命令
-- **开机自启**：写入用户「启动」文件夹，无需管理员权限
+- **开机自启**：写入用户「启动」文件夹（`.vbs`，登录后隐藏启动），启动后与双击 `启动镜像源.cmd` 一样注册托盘图标与右键快捷菜单（打开 / 隐藏控制台、打开管理界面、退出镜像源），无需管理员权限
 - **零依赖实现**：HTTP 服务、tar.gz 打包解包、semver 比较、registry 协议、断点与完整性校验全部手写实现
 
 ### 安全

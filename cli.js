@@ -139,7 +139,7 @@ commands.help = function () {
     '  node cli.js token             显示访问令牌',
     '  node cli.js use [--project]   把本机 npm 源切换为镜像源（会备份原 ~/.npmrc）',
     '  node cli.js unuse             还原 npm 源为切换前的状态',
-    '  node cli.js autostart on|off|status   开机自启开关（写入「启动」文件夹，无需管理员）',
+    '  node cli.js autostart on|off|status   开机自启开关（写「启动」文件夹，登录后隐藏启动并注册托盘，无需管理员）',
     '',
     `${C.cyan}包管理（离线可用，无需启动服务）${C.reset}`,
     '  node cli.js list [--q 关键字] [--source all|upstream|private|upload|cache] [--size 50]',
@@ -188,40 +188,72 @@ commands.token = function () {
   log(config.get().security.token);
 };
 
-/** 开机自启：用「启动」文件夹里的一个 .cmd 实现，不需要管理员权限，也不写注册表 */
+/**
+ * 开机自启：在用户「启动」文件夹放一个 .vbs，登录时用隐藏窗口拉起「启动镜像源.cmd」——
+ * 和双击启动完全同一条路径：托盘宿主一起启动，服务就绪后命令行窗口隐藏到右下角，
+ * 左键打开控制台、右键打开管理界面 / 退出镜像源都能用。
+ * 不写注册表、不需要管理员权限；环境变量 MIRROR_STARTUP_DIR 可改「启动」文件夹位置（自检用）。
+ */
 function startupDir() {
+  if (process.env.MIRROR_STARTUP_DIR) return path.resolve(process.env.MIRROR_STARTUP_DIR);
   const appData = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
   return path.join(appData, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup');
 }
-function startupFile() { return path.join(startupDir(), '私人npm镜像源.cmd'); }
+function startupFile() { return path.join(startupDir(), '私人npm镜像源.vbs'); }
+function legacyStartupFile() { return path.join(startupDir(), '私人npm镜像源.cmd'); }
+function removeQuiet(file) { try { fs.unlinkSync(file); return true; } catch { return false; } }
 
 commands.autostart = async function () {
   const action = positional[0] || 'status';
   const file = startupFile();
+  const legacy = legacyStartupFile();
   if (action === 'on' || action === 'enable') {
+    const launcher = path.join(util.ROOT, '启动镜像源.cmd');
+    if (!fs.existsSync(launcher)) {
+      log(`${C.red}找不到启动脚本：${launcher}${C.reset}`);
+      process.exitCode = 1;
+      return;
+    }
     util.ensureDir(startupDir());
-    const cli = path.join(util.ROOT, 'cli.js');
-    const body = [
-      '@echo off',
-      'chcp 65001 >nul',
-      'rem 由 cli.js autostart on 生成：开机后自动在后台启动私人 npm 镜像源',
-      `start "" /min "${process.execPath}" "${cli}" start --no-open`,
+    /* 启动项用 .vbs（WSH）而不是 .cmd：Run 的窗口样式 0 = 完全隐藏，
+     * 开机登录时不会闪黑窗口；脚本内部再做与双击启动相同的托盘注册。
+     * 文件按 UTF-16LE + BOM 写：WSH 认这个编码，中文路径不会被按系统 ANSI 误读。 */
+    const lines = [
+      "' 由 node cli.js autostart on 生成：登录 Windows 后隐藏启动「私人 npm 镜像源」",
+      "' 与双击「启动镜像源.cmd」同一条启动路径：服务就绪后窗口隐藏到右下角托盘（含右键菜单）",
+      "' 关闭开机自启：node cli.js autostart off（或双击「开机自启-关闭.cmd」）",
+      'Option Explicit',
+      'Dim sh',
+      'Set sh = CreateObject("WScript.Shell")',
+      "' MIRROR_AUTOSTART=1：告诉「启动镜像源.cmd」这是开机自启（窗口本来隐藏），启动失败时不要停在那里等按键",
+      'sh.Environment("Process").Item("MIRROR_AUTOSTART") = "1"',
+      `sh.Run Chr(34) & "${launcher.replace(/"/g, '""')}" & Chr(34) & " --no-open", 0, False`,
       '',
-    ].join('\r\n');
-    fs.writeFileSync(file, body, 'utf8');
-    log(`${C.green}已开启开机自启${C.reset}`);
-    log(`  启动项文件：${file}`);
-    log(`${C.dim}如需关闭：node cli.js autostart off${C.reset}`);
+    ];
+    fs.writeFileSync(file, Buffer.from('\uFEFF' + lines.join('\r\n'), 'utf16le'));
+    const removedLegacy = removeQuiet(legacy);
+    log(`${C.green}已开启开机自启${C.reset}（登录后隐藏启动，右下角出现托盘图标，不会闪窗口）`);
+    log(`  启动项文件：${file}${removedLegacy ? '（已移除旧版 .cmd 启动项）' : ''}`);
+    log(`  实际启动：${launcher} --no-open`);
+    log(`${C.dim}托盘：左键 = 打开控制台；右键 = 打开管理界面 / 退出镜像源。关闭自启：node cli.js autostart off${C.reset}`);
     return;
   }
   if (action === 'off' || action === 'disable') {
-    let removed = false;
-    try { fs.unlinkSync(file); removed = true; } catch { /* 不存在 */ }
-    log(removed ? `${C.green}已关闭开机自启${C.reset}（已删除 ${file}）` : `${C.yellow}开机自启本来就是关闭状态${C.reset}`);
+    const removed = removeQuiet(file);
+    const removedLegacy = removeQuiet(legacy);
+    if (removed || removedLegacy) {
+      log(`${C.green}已关闭开机自启${C.reset}（已删除 ${removed ? file : legacy}）`);
+    } else {
+      log(`${C.yellow}开机自启本来就是关闭状态${C.reset}`);
+    }
     return;
   }
   log(`开机自启：${fs.existsSync(file) ? C.green + '已开启' + C.reset : C.yellow + '未开启' + C.reset}`);
   log(`  启动项文件：${file}`);
+  if (fs.existsSync(legacy)) {
+    log(`  ${C.yellow}发现旧版启动项：${legacy}（只有最小化窗口、没有托盘图标）${C.reset}`);
+    log(`  ${C.dim}执行 node cli.js autostart on 可升级为带托盘的版本${C.reset}`);
+  }
   log(`${C.dim}用法：node cli.js autostart on|off|status${C.reset}`);
 };
 

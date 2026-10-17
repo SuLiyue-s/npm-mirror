@@ -96,6 +96,7 @@ Add-Type -AssemblyName System.Drawing
 
 $SW_HIDE = 0
 $SW_SHOW = 5
+$SW_RESTORE = 9
 $WM_CLOSE = 0x0010
 $WM_SETICON = 0x0080
 $ICON_SMALL = [IntPtr]0
@@ -178,12 +179,20 @@ function Test-ConsoleVisible {
 
 function Set-ConsoleVisible([bool]$Visible) {
   if ($script:ConsoleHwnd -eq [IntPtr]::Zero) { return $false }
-  $cmd = if ($Visible) { $SW_SHOW } else { $SW_HIDE }
-  [void][MirrorTrayNative]::ShowWindow($script:ConsoleHwnd, $cmd)
-  [void][MirrorTrayNative]::ShowWindowAsync($script:ConsoleHwnd, $cmd)
-  Start-Sleep -Milliseconds 120
   if ($Visible) {
+    [void][MirrorTrayNative]::ShowWindow($script:ConsoleHwnd, $SW_SHOW)
+    [void][MirrorTrayNative]::ShowWindowAsync($script:ConsoleHwnd, $SW_SHOW)
+    Start-Sleep -Milliseconds 120
+    if (-not [MirrorTrayNative]::IsWindowVisible($script:ConsoleHwnd)) {
+      # 开机自启的窗口是「启动即隐藏」创建的，个别系统上 SW_SHOW 不能恢复，再补一次 SW_RESTORE
+      [void][MirrorTrayNative]::ShowWindow($script:ConsoleHwnd, $SW_RESTORE)
+      Start-Sleep -Milliseconds 80
+    }
     try { [void][MirrorTrayNative]::SetForegroundWindow($script:ConsoleHwnd) } catch { /* 忽略 */ }
+  } else {
+    [void][MirrorTrayNative]::ShowWindow($script:ConsoleHwnd, $SW_HIDE)
+    [void][MirrorTrayNative]::ShowWindowAsync($script:ConsoleHwnd, $SW_HIDE)
+    Start-Sleep -Milliseconds 120
   }
   return [bool](([MirrorTrayNative]::IsWindowVisible($script:ConsoleHwnd)) -eq $Visible)
 }
