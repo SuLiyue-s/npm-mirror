@@ -148,7 +148,7 @@ commands.help = function () {
     '                                递归添加：连它的依赖、依赖的依赖一起加进来（npm: 别名会解析到真实包）',
     '  node cli.js remove <包名> [--version 1.2.3] [--yes]   删除包或单个版本',
     '  node cli.js stats             统计包/版本/占用空间',
-    '  node cli.js export [--scope all|private|upstream] [--out 文件名] [--no-deps] [--no-fetch-deps] [包名...]',
+    '  node cli.js export [--scope all|private|upstream|selected|added] [--from 时间] [--to 时间] [--out 文件名] [--no-deps] [--no-fetch-deps] [包名...]',
     '                                导出选中包时默认连带递归依赖；镜像里没有的依赖在 cache/proxy 模式下自动下载入库再打包',
     '  node cli.js import <文件.tgz|文件.json> [--overwrite]',
     '  node cli.js scan-cache [--cache 目录] [--any-registry] [--refresh]',
@@ -518,9 +518,18 @@ commands.stats = function () {
 commands.export = async function () {
   const { store, lg } = makeStore(false);
   const scope = flags.scope || (positional.length ? 'selected' : 'all');
+  const ALLOWED_SCOPE = ['all', 'private', 'upstream', 'selected', 'added'];
+  if (!ALLOWED_SCOPE.includes(scope)) {
+    log(`${C.red}不支持的导出范围：${scope}（可选 all / private / upstream / selected / added）${C.reset}`);
+    store.close();
+    process.exitCode = 1;
+    return;
+  }
   // 导出选中包时默认连带依赖；镜像里没有的依赖在 cache/proxy 模式下自动下载入库再打包
   const withDeps = scope === 'selected' && !flags['no-deps'];
   const autoFetchDeps = !flags['no-fetch-deps'];
+  const addedFrom = scope === 'added' ? flags.from : undefined;
+  const addedTo = scope === 'added' ? flags.to : undefined;
   const { Upstream } = require('./src/upstream');
   const registry = require('./src/registry');
   const upstream = new Upstream(() => config.get(), lg);
@@ -528,6 +537,7 @@ commands.export = async function () {
   const t0 = Date.now();
   try {
     if (withDeps) log(`${C.dim}导出选中包时会连带依赖；镜像里没有的依赖会在联网模式下自动下载（--no-deps / --no-fetch-deps 可关闭）。${C.reset}`);
+    if (scope === 'added') log(`${C.dim}只导出添加时间在 ${addedFrom || '(不限)'} ~ ${addedTo || '(不限)'} 之间的包（本地镜像首次入库时间，闭区间）。${C.reset}`);
     const r = await bundle.exportBundle({
       store,
       ctx,
@@ -537,6 +547,8 @@ commands.export = async function () {
       withDeps,
       autoFetchDeps,
       logger: lg,
+      addedFrom,
+      addedTo,
       concurrency: Math.max(1, Number(config.get().storage.bundleExportConcurrency) || 4),
       onProgress: (p) => {
         if (!flags.verbose) return;

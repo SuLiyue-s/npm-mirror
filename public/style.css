@@ -381,12 +381,15 @@ code,kbd,pre{font-family:var(--mono)}
 .field{display:flex;flex-direction:column;gap:4px;min-width:0}
 .field.grow{flex:1;min-width:170px}
 .field>label{font-size:10.5px;letter-spacing:.1em;color:var(--txt-faint);font-family:var(--mono);text-transform:uppercase}
-input[type=text],input[type=search],input[type=number],input[type=password],select,textarea{
+input[type=text],input[type=search],input[type=number],input[type=password],input[type=datetime-local],select,textarea{
   padding:6px 9px;min-width:0;
   background:#080d12;border:1px solid var(--line);border-radius:var(--r);
   color:var(--txt-hi);font-size:12.5px;font-family:var(--body);
   transition:border-color .15s,box-shadow .15s,background .15s;
 }
+/* 深色主题下日期时间选择器的小日历图标默认是黑的，反相一下才看得见（只影响原生控件） */
+input[type=datetime-local]::-webkit-calendar-picker-indicator{filter:invert(.7);cursor:pointer;opacity:.8}
+input[type=datetime-local]::-webkit-calendar-picker-indicator:hover{opacity:1}
 input.mono,textarea.mono{font-family:var(--mono);font-size:12px}
 input:focus,select:focus,textarea:focus{outline:0;border-color:rgba(46,230,196,.6);box-shadow:0 0 0 2px var(--cy-glow);background:#0a1117}
 input::placeholder,textarea::placeholder{color:var(--txt-faint)}

@@ -1938,6 +1938,126 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
     }
   }
 
+  section('六之四之四、按添加时间导出（scope=added）');
+  {
+    const bundleModAdd = require('../src/bundle');
+    const { Store: StoreAdd } = require('../src/store');
+    const quietLogAdd = { info() {}, warn() {}, error() {}, debug() {} };
+
+    // A) 时间参数解析/规范化：ISO 字符串、毫秒、空值、非法、起晚于止
+    check('parseTimeBound 接受 ISO 字符串/毫秒，空值表示「不限」',
+      bundleModAdd.parseTimeBound('2026-01-02T03:04:05.000Z', 'x') === Date.UTC(2026, 0, 2, 3, 4, 5)
+      && bundleModAdd.parseTimeBound(1700000000000, 'x') === 1700000000000
+      && bundleModAdd.parseTimeBound('', 'x') === null
+      && bundleModAdd.parseTimeBound(undefined, 'x') === null);
+    const rangeCodes = [];
+    for (const arg of [{}, { addedFrom: '不是时间' }, { addedFrom: '2026-07-01T00:00:00.000Z', addedTo: '2026-02-01T00:00:00.000Z' }]) {
+      try { bundleModAdd.normalizeAddedRange(arg); rangeCodes.push('NO_THROW'); } catch (e) { rangeCodes.push(e.code); }
+    }
+    check('normalizeAddedRange 对「两端都不给 / 时间非法 / 起晚于止」都报 EBADTIME（接口层返回 400）',
+      rangeCodes.every((c) => c === 'EBADTIME'), JSON.stringify(rangeCodes));
+    const metaBound = { createdAt: '2026-06-15T00:00:00.000Z' };
+    const boundMs = Date.parse('2026-06-15T00:00:00.000Z');
+    check('pkgAddedInRange 按 meta.createdAt 做闭区间判断（起止端点都算在区间内）',
+      bundleModAdd.pkgAddedInRange(metaBound, boundMs, boundMs)
+      && bundleModAdd.pkgAddedInRange(metaBound, null, boundMs)
+      && bundleModAdd.pkgAddedInRange(metaBound, boundMs, null)
+      && !bundleModAdd.pkgAddedInRange({ createdAt: '2026-06-15T00:00:00.001Z' }, null, boundMs)
+      && !bundleModAdd.pkgAddedInRange({ createdAt: '2026-06-14T23:59:59.999Z' }, boundMs, null));
+
+    // B) 接口参数校验：非法时间范围直接 400 + EBADTIME，不启动导出任务
+    const badReq1 = await api('/__admin/api/bundles/export', { method: 'POST', body: { scope: 'added' }, timeoutMs: 15000 });
+    check('POST /bundles/export {scope:added} 不给起止时间 → 400 EBADTIME',
+      badReq1.status === 400 && badReq1.json && badReq1.json.code === 'EBADTIME', `status=${badReq1.status} ${badReq1.text.slice(0, 160)}`);
+    const badReq2 = await api('/__admin/api/bundles/export', {
+      method: 'POST',
+      body: { scope: 'added', addedFrom: '2026-07-01T00:00:00.000Z', addedTo: '2026-02-01T00:00:00.000Z' },
+      timeoutMs: 15000,
+    });
+    check('POST /bundles/export {scope:added} 起始晚于结束 → 400 EBADTIME',
+      badReq2.status === 400 && badReq2.json && badReq2.json.code === 'EBADTIME'
+      && /起始时间不能晚于结束时间/.test(badReq2.json.error || badReq2.json.message || ''),
+      `status=${badReq2.status} ${badReq2.text.slice(0, 160)}`);
+    const badReq3 = await api('/__admin/api/bundles/export', {
+      method: 'POST', body: { scope: 'added', addedFrom: '不是时间' }, timeoutMs: 15000,
+    });
+    check('POST /bundles/export {scope:added} 时间格式非法 → 400 EBADTIME',
+      badReq3.status === 400 && badReq3.json && badReq3.json.code === 'EBADTIME',
+      `status=${badReq3.status} ${badReq3.text.slice(0, 160)}`);
+
+    // C) 临时 Store 端到端：3 个包的添加时间分别落在 2026-01 / 2026-06 / 2026-12
+    const workAdd = fs.mkdtempSync(path.join(os.tmpdir(), 'mirror-added-export-'));
+    const exportedAdd = [];
+    try {
+      const stAdd = new StoreAdd({ dir: path.join(workAdd, 'storage'), logger: quietLogAdd });
+      await stAdd.init();
+      const mkAddedPkg = async (name, createdAt) => {
+        const version = '1.0.0';
+        const srcDir = path.join(workAdd, 'src', name, 'package');
+        util.ensureDir(srcDir);
+        fs.writeFileSync(path.join(srcDir, 'package.json'), JSON.stringify({ name, version }));
+        const tgz = path.join(workAdd, `${name}.tgz`);
+        await tar.packTarGz(tgz, [{ name: 'package/package.json', source: path.join(srcDir, 'package.json') }], { gzip: true });
+        const put = stAdd.putTarball(name, version, fs.readFileSync(tgz));
+        stAdd.save(name, {
+          name,
+          'dist-tags': { latest: version },
+          versions: {
+            [version]: {
+              name, version,
+              dist: { tarball: `${BASE}/${name}/-/${put.file}`, integrity: put.integrity, shasum: put.shasum },
+            },
+          },
+        }, { source: 'private', createdAt, files: { [version]: put.file }, sizes: { [version]: put.sizeBytes } });
+        return put;
+      };
+      await mkAddedPkg('mirror-selftest-added-old', '2026-01-01T00:00:00.000Z');
+      await mkAddedPkg('mirror-selftest-added-mid', '2026-06-15T00:00:00.000Z');
+      await mkAddedPkg('mirror-selftest-added-new', '2026-12-01T00:00:00.000Z');
+
+      const rAdd = await bundleModAdd.exportBundle({
+        store: stAdd, scope: 'added',
+        addedFrom: '2026-02-01T00:00:00.000Z', addedTo: '2026-07-01T00:00:00.000Z',
+        autoFetchDeps: false, logger: quietLogAdd,
+      });
+      exportedAdd.push(rAdd.file);
+      const manAdd = await bundleModAdd.readBundleManifest(rAdd.path);
+      const namesAdd = (manAdd.packages || []).map((p) => p.name);
+      check('导出 scope=added 只挑添加时间落区间内的包（2026-02~07 只命中 2026-06 那个）',
+        rAdd.packages === 1 && rAdd.tarballs === 1 && namesAdd.length === 1 && namesAdd[0] === 'mirror-selftest-added-mid',
+        `packages=${rAdd.packages} tarballs=${rAdd.tarballs} names=${JSON.stringify(namesAdd)}`);
+      check('scope=added 的 bundle manifest 记录 scope 与 addedTimeRange（起止 ISO）',
+        manAdd.scope === 'added' && !!manAdd.addedTimeRange
+        && manAdd.addedTimeRange.from === '2026-02-01T00:00:00.000Z'
+        && manAdd.addedTimeRange.to === '2026-07-01T00:00:00.000Z',
+        JSON.stringify(manAdd.addedTimeRange));
+
+      const rOpen = await bundleModAdd.exportBundle({
+        store: stAdd, scope: 'added', addedFrom: '2026-06-01T00:00:00.000Z',
+        autoFetchDeps: false, logger: quietLogAdd,
+      });
+      exportedAdd.push(rOpen.file);
+      check('只给起始时间时上端开放（2026-06 之后命中 2 个包）', rOpen.packages === 2, `packages=${rOpen.packages}`);
+
+      let emptyErr = null;
+      try {
+        await bundleModAdd.exportBundle({
+          store: stAdd, scope: 'added', addedFrom: '2027-01-01T00:00:00.000Z',
+          autoFetchDeps: false, logger: quietLogAdd,
+        });
+      } catch (e) { emptyErr = e; }
+      check('区间内没有包时报 EMPTY，并给出人话提示（界面/CLI 直接展示）',
+        !!emptyErr && emptyErr.code === 'EMPTY' && /所选时间段内没有添加进本地镜像的包/.test(emptyErr.message || ''),
+        emptyErr ? `${emptyErr.code} ${emptyErr.message}` : '没有抛错');
+      await stAdd.close();
+    } finally {
+      for (const f of exportedAdd) {
+        try { fs.unlinkSync(path.join(util.rootPath('data', 'bundles'), f)); } catch { /* 忽略 */ }
+      }
+      try { fs.rmSync(workAdd, { recursive: true, force: true }); } catch { /* 忽略 */ }
+    }
+  }
+
   section('六之五、导出/导入并行与「根目录名不是 package」的 tarball');
   {
     const crypto = require('node:crypto');

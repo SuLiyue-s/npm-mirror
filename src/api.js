@@ -802,11 +802,22 @@ async function handleAdmin(ctx) {
   if (rel === '/bundles/export' && method === 'POST') {
     const body = await readJson(req);
     const rawScope = typeof body.scope === 'string' ? body.scope : '';
-    const ALLOWED_SCOPE = ['all', 'private', 'upstream', 'selected'];
+    const ALLOWED_SCOPE = ['all', 'private', 'upstream', 'selected', 'added'];
     if (rawScope && !ALLOWED_SCOPE.includes(rawScope)) {
-      return fail(res, 400, `不支持的导出范围：${rawScope}（可选 all / private / upstream / selected）`, 'EBADSCOPE');
+      return fail(res, 400, `不支持的导出范围：${rawScope}（可选 all / private / upstream / selected / added）`, 'EBADSCOPE');
     }
     const scope = rawScope || (Array.isArray(body.names) && body.names.length ? 'selected' : 'all');
+    /* 「按添加时间」导出：把起止时间（ISO 字符串或毫秒）规范化为闭区间；
+     * 格式不对 / 两个都不给 / 起晚于止 都直接 400，不启动任务。 */
+    let addedRange = null;
+    if (scope === 'added') {
+      try {
+        addedRange = ctx.bundle.normalizeAddedRange({ addedFrom: body.addedFrom, addedTo: body.addedTo });
+      } catch (e) {
+        return fail(res, 400, e.message, e.code || 'EBADTIME');
+      }
+    }
+    const addedRangeOpts = addedRange ? { addedFrom: addedRange.from, addedTo: addedRange.to } : {};
     // 指定导出选中的包时，默认把它们的（递归）依赖也一起导出；显式传 withDeps:false 可关闭
     const withDeps = scope === 'selected' && (body.withDeps === undefined ? true : !!body.withDeps);
     // 镜像里没有的依赖：默认在 cache/proxy 模式下自动下载并入库（离线模式只会提示）；显式 autoFetchDeps:false 可关闭
@@ -837,6 +848,7 @@ async function handleAdmin(ctx) {
               logger: log,
               isCanceled,
               concurrency: conc,
+              ...addedRangeOpts,
               onProgress: (ev) => {
                 if (ev.phase === 'deps-fetch') {
                   // 自动补依赖阶段：沿用 collect 阶段显示，只换文案（进度按「已处理 N 个依赖」算）
@@ -936,6 +948,7 @@ async function handleAdmin(ctx) {
         autoFetchDeps,
         logger: log,
         concurrency: Math.max(1, Number(cfg.storage.bundleExportConcurrency) || 4),
+        ...addedRangeOpts,
       });
       return ok(res, r);
     } catch (e) {

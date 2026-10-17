@@ -642,6 +642,58 @@ async function get(p, { json = false } = {}) {
       coverage ? '' : '有容器类型没铺动效');
   }
 
+  console.log('\x1b[1m十之三、导出「按添加时间」与取消按钮等待期禁用\x1b[0m');
+  {
+    const htmlAdd = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
+    const jsAdd = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
+    const cssAdd = fs.readFileSync(path.join(__dirname, '..', 'public', 'style.css'), 'utf8');
+    const apiAdd = fs.readFileSync(path.join(__dirname, '..', 'src', 'api.js'), 'utf8');
+    const bundleAdd = fs.readFileSync(path.join(__dirname, '..', 'src', 'bundle.js'), 'utf8');
+    const cliAdd = fs.readFileSync(path.join(__dirname, '..', 'cli.js'), 'utf8');
+
+    check('导出面板新增「按添加时间」范围与起止时间输入框（datetime-local，默认隐藏）',
+      /data-scope="added"[^>]*>按添加时间</.test(htmlAdd)
+        && /id="exp-added-row" hidden/.test(htmlAdd)
+        && /id="exp-added-from"[^>]*type="datetime-local"/.test(htmlAdd)
+        && /id="exp-added-to"[^>]*type="datetime-local"/.test(htmlAdd));
+
+    check('切换范围时显示/隐藏「按添加时间」行，导出前校验起止时间并换成 ISO 时间戳提交',
+      /var arow = \$\('#exp-added-row'\);\s*\n\s*if \(arow\) arow\.hidden = state\.mig\.scope !== 'added';/.test(jsAdd)
+        && /请至少填写起始或结束时间/.test(jsAdd)
+        && /起始时间不能晚于结束时间/.test(jsAdd)
+        && /payload\.addedFrom = fms !== null \? new Date\(fms\)\.toISOString\(\) : null/.test(jsAdd)
+        && /payload\.addedTo = tms !== null \? new Date\(tms\)\.toISOString\(\) : null/.test(jsAdd));
+
+    check('日期时间输入框复用深色输入样式（含日历图标反相，暗色主题下看得见）',
+      /input\[type=datetime-local\],select,textarea\{/.test(cssAdd)
+        && /input\[type=datetime-local\]::-webkit-calendar-picker-indicator\{filter:invert\(\.7\)/.test(cssAdd));
+
+    check('后端支持 scope=added：按 meta.createdAt 闭区间筛选、manifest 记录 addedTimeRange，参数非法返回 400',
+      /else if \(scope === 'added'\) \{/.test(bundleAdd)
+        && /pkgAddedInRange\(store\.index\.get\(n\), addedRange\.from, addedRange\.to\)/.test(bundleAdd)
+        && /addedTimeRange: addedRange \? \{ from: addedRange\.fromIso, to: addedRange\.toIso \} : null/.test(bundleAdd)
+        && /ALLOWED_SCOPE = \['all', 'private', 'upstream', 'selected', 'added'\]/.test(apiAdd)
+        && /ctx\.bundle\.normalizeAddedRange\(\{ addedFrom: body\.addedFrom, addedTo: body\.addedTo \}\)/.test(apiAdd)
+        && /fail\(res, 400, e\.message, e\.code \|\| 'EBADTIME'\)/.test(apiAdd));
+
+    check('CLI 同步支持 --scope added 与 --from/--to',
+      /export \[--scope all\|private\|upstream\|selected\|added\] \[--from 时间\] \[--to 时间\]/.test(cliAdd)
+        && /const addedFrom = scope === 'added' \? flags\.from : undefined;/.test(cliAdd)
+        && /const addedTo = scope === 'added' \? flags\.to : undefined;/.test(cliAdd));
+
+    check('进度弹窗「取消」等待期禁用置灰（防重复点），成功后保持禁用、失败才恢复可点',
+      /function requestTaskCancel\(btn, taskId, opts\)/.test(jsAdd)
+        && /if \(!btn \|\| btn\.__canceling\) return;/.test(jsAdd)
+        && /btn\.disabled = true;/.test(jsAdd)
+        && /btn\.setAttribute\('aria-disabled', 'true'\)/.test(jsAdd)
+        && /'正在取消…'/.test(jsAdd)
+        && /btn\.disabled = false;/.test(jsAdd)
+        && /取消失败：/.test(jsAdd));
+    const cancelCalls = (jsAdd.match(/requestTaskCancel\(/g) || []).length;
+    check('4 个会起任务进度的弹窗都改用 requestTaskCancel（定义 1 处 + 调用 4 处）',
+      cancelCalls >= 5, `出现 ${cancelCalls} 次`);
+  }
+
   console.log(`\n\x1b[1m结果：${pass}/${pass + fail} 通过\x1b[0m\n`);
   finish(fail === 0 ? 0 : 1);
 })().catch((e) => { console.error('自检异常：', e); finish(1); });

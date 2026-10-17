@@ -17,6 +17,64 @@ const FORMAT_VERSION = 1;
 /** 连带导出依赖时最多纳入多少个包（防止误点「全部包」把整个镜像拖进来） */
 const DEPS_MAX_PACKAGES = 3000;
 
+/**
+ * 解析「按添加时间导出」的时间边界。
+ * 接受 ISO 字符串（2026-10-01T12:30、2026-10-01）或毫秒数；空值返回 null。
+ * 时间边界是闭区间（含端点），与前端 datetime-local 的直觉一致。
+ */
+function parseTimeBound(v, label) {
+  if (v === undefined || v === null || v === '') return null;
+  if (typeof v === 'number' && Number.isFinite(v)) return v;
+  const s = String(v).trim();
+  if (!s) return null;
+  const t = Date.parse(s);
+  if (!Number.isFinite(t)) {
+    const err = new Error(`${label}格式不正确：${s}（例：2026-10-01T00:00 或 2026-10-01T23:59）`);
+    err.code = 'EBADTIME';
+    err.status = 400;
+    throw err;
+  }
+  return t;
+}
+
+/**
+ * 规范化「按添加时间」导出区间：{ from, to }（毫秒，null 表示不设边界）。
+ * - 至少给一个边界；
+ * - from 不能晚于 to；
+ * - 额外回传 fromIso/toIso 供 manifest 记录。
+ */
+function normalizeAddedRange({ addedFrom, addedTo } = {}) {
+  const from = parseTimeBound(addedFrom, '起始时间');
+  const to = parseTimeBound(addedTo, '结束时间');
+  if (from === null && to === null) {
+    const err = new Error('按添加时间导出需要至少给出起始时间或结束时间');
+    err.code = 'EBADTIME';
+    err.status = 400;
+    throw err;
+  }
+  if (from !== null && to !== null && from > to) {
+    const err = new Error('起始时间不能晚于结束时间');
+    err.code = 'EBADTIME';
+    err.status = 400;
+    throw err;
+  }
+  return {
+    from, to,
+    fromIso: from === null ? null : new Date(from).toISOString(),
+    toIso: to === null ? null : new Date(to).toISOString(),
+  };
+}
+
+/** 包是否在区间内：用本地镜像记录的「首次添加时间」meta.createdAt（闭区间） */
+function pkgAddedInRange(meta, from, to) {
+  const t = Date.parse((meta && meta.createdAt) || '');
+  if (!Number.isFinite(t)) return false;
+  if (from !== null && t < from) return false;
+  if (to !== null && t > to) return false;
+  return true;
+}
+
+
 function bundleDir() { return rootPath('data', 'bundles'); }
 function tmpRoot() { return rootPath('data', 'tmp'); }
 
@@ -270,6 +328,9 @@ async function autoFillDeps({ ctx, store, roots, logger, emit = () => {}, isCanc
  * @param {boolean} [o.withDeps] scope='selected' 时把被选包的（递归）依赖也一起导出
  * @param {boolean} [o.autoFetchDeps=true] 是否自动下载镜像里缺失的依赖（仅 withDeps 生效）
  * @param {object} [o.autoDeps] 自动补依赖的预算 { limit=300, concurrency=6, maxRounds=3 }
+ * @param {string} [o.scope='all'] 'all' | 'private' | 'upstream' | 'selected' | 'added'
+ * @param {string|number} [o.addedFrom] scope='added' 的起始时间（ISO 字符串或毫秒，闭区间）
+ * @param {string|number} [o.addedTo] scope='added' 的结束时间（ISO 字符串或毫秒，闭区间）
  * @param {function} [o.onProgress] 进度回调：
  *   { phase:'collect-start', total }                      开始统计要导出的包
  *   { phase:'deps-fetch', status, total, done, message }   正在自动补齐缺失依赖（status=resolve/download/skipped）
@@ -283,6 +344,7 @@ async function autoFillDeps({ ctx, store, roots, logger, emit = () => {}, isCanc
 async function exportBundle({
   store, ctx = null, scope = 'all', names = [], fileName, withDeps = false,
   autoFetchDeps = true, autoDeps = null, logger, onProgress, isCanceled, concurrency = 1,
+  addedFrom = null, addedTo = null,
 }) {
   const emit = (ev) => {
     if (!onProgress) return;
@@ -296,10 +358,17 @@ async function exportBundle({
   };
   const checkCancel = () => { if (isCanceled && isCanceled()) throw canceledError(); };
   const all = Array.from(store.index.keys());
+  let addedRange = null;
   let targets = all;
   if (scope === 'private') targets = all.filter(n => { const m = store.index.get(n); return m.source === 'private' || m.private; });
   else if (scope === 'upstream') targets = all.filter(n => { const m = store.index.get(n); return m.source !== 'private' && !m.private; });
   else if (scope === 'selected') targets = names.filter(n => store.index.has(n));
+  else if (scope === 'added') {
+    /* 「按添加时间」导出：只挑首次进本地镜像的时间（meta.createdAt）落在区间内的包。
+     * 时间边界按闭区间处理；起始/结束可以只给一个。 */
+    addedRange = normalizeAddedRange({ addedFrom, addedTo });
+    targets = all.filter(n => pkgAddedInRange(store.index.get(n), addedRange.from, addedRange.to));
+  }
   targets = Array.from(new Set(targets)).sort();
 
   const roots = targets.slice();
@@ -330,7 +399,9 @@ async function exportBundle({
   }
 
   if (!targets.length) {
-    const err = new Error('没有符合条件的包可以导出');
+    const err = new Error(scope === 'added'
+      ? '所选时间段内没有添加进本地镜像的包（时间按本机时区、含起止；可放宽范围或留空一端再试）'
+      : '没有符合条件的包可以导出');
     err.code = 'EMPTY';
     throw err;
   }
@@ -418,6 +489,7 @@ async function exportBundle({
     scope,
     withDeps: !!withDeps,
     roots,
+    addedTimeRange: addedRange ? { from: addedRange.fromIso, to: addedRange.toIso } : null,
     stats: { packages: manifestPackages.length, versions, tarballs, tarballBytes: bytes, depsAdded, depsFetched: autoFetch ? autoFetch.downloaded.length : 0, depsMissing: missingDeps.length },
     // 自动补依赖的结果摘要（失败明细放顶层，限制条数，避免 manifest 过大）
     autoFetch: autoFetch ? {
@@ -925,4 +997,5 @@ module.exports = {
   FORMAT, FORMAT_VERSION, bundleDir, exportBundle, importBundle, importTarballFile,
   importPackumentJson, readBundleManifest, listBundles, safeFileName,
   depTargetName, collectDepClosure, autoFillDeps, AUTO_DEPS, DEPS_MAX_PACKAGES,
+  parseTimeBound, normalizeAddedRange, pkgAddedInRange,
 };

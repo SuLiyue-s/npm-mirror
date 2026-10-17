@@ -263,6 +263,39 @@
     else { btn.classList.remove('is-busy'); btn.disabled = false; if (btn.dataset._t) { btn.textContent = btn.dataset._t; delete btn.dataset._t; } }
   }
 
+  /**
+   * 进度弹窗里的「取消」按钮：点一次后立刻禁用置灰并显示「正在取消…」，
+   * 防止用户等任务收尾时反复点击重复发请求；等任务真正结束由
+   * taskFinishedButtons() 统一换成【关闭】。
+   * 如果取消请求本身失败（网络错误 / 服务异常），恢复按钮文字与可点状态，
+   * 让用户能再试一次（任务还在跑，不能把出口堵死）。
+   * opts: { waitText, okText, failText, isFinished() }
+   */
+  function requestTaskCancel(btn, taskId, opts) {
+    opts = opts || {};
+    if (!btn || btn.__canceling) return;
+    btn.__canceling = true;
+    btn.__cancelOrig = btn.textContent;
+    btn.disabled = true;
+    btn.classList.add('is-busy');
+    btn.setAttribute('aria-disabled', 'true');
+    btn.textContent = opts.waitText || '正在取消…';
+    api('/tasks/' + taskId + '/cancel', { method: 'POST' }).then(function () {
+      /* 请求已受理：按钮保持禁用，直到任务真正结束（taskFinishedButtons 收尾） */
+      toast(opts.okText || '已请求停止：当前包处理完就停', 'warn');
+      setSideHint('CANCELING…');
+    }, function (e) {
+      btn.__canceling = false;
+      if (opts.isFinished && opts.isFinished()) return;   // 任务恰好已结束：交给收尾逻辑
+      btn.disabled = false;
+      btn.classList.remove('is-busy');
+      btn.removeAttribute('aria-disabled');
+      btn.textContent = btn.__cancelOrig || btn.textContent;
+      delete btn.__cancelOrig;
+      toast(opts.failText || ('取消失败：' + ((e && e.message) || '请稍后重试')), 'err');
+    });
+  }
+
   /* ================= Toast ================= */
   var TOAST_ICON = { ok: '✓', err: '✕', warn: '!', info: 'i' };
   function toast(msg, type, ms) {
@@ -1681,9 +1714,10 @@
         {
           label: '取消下载', kind: 'btn-ghost', onClick: function (c) {
             if (finished || !taskId) return c.close();
-            api('/tasks/' + taskId + '/cancel', { method: 'POST' }).then(function () {
-              toast('已请求停止，正在结束已开始的下载…', 'warn');
-            }, function () { c.close(); });
+            requestTaskCancel(c.btn, taskId, {
+              waitText: '正在取消…', okText: '已请求停止，正在结束已开始的下载…',
+              isFinished: function () { return finished; }
+            });
           }
         },
         { label: '后台运行', kind: 'btn', onClick: function (c) { c.close(); toast('下载仍在后台进行，完成后可到「日志」页查看', 'info', 6000); } }
@@ -1892,9 +1926,10 @@
         {
           label: '取消', kind: 'btn-ghost', onClick: function (c) {
             if (finished || !taskId) return c.close();
-            api('/tasks/' + taskId + '/cancel', { method: 'POST' }).then(function () {
-              toast('已请求停止，正在结束已开始的下载…', 'warn');
-            }, function () { c.close(); });
+            requestTaskCancel(c.btn, taskId, {
+              waitText: '正在取消…', okText: '已请求停止，正在结束已开始的下载…',
+              isFinished: function () { return finished; }
+            });
           }
         },
         { label: '后台运行', kind: 'btn', onClick: function (c) { c.close(); toast('任务仍在后台进行，完成后可到「日志」页查看', 'info', 6000); } }
@@ -2693,9 +2728,10 @@
         {
           label: '取消导入', kind: 'btn-ghost', onClick: function (c) {
             if (finished || !taskId) return c.close();
-            api('/tasks/' + taskId + '/cancel', { method: 'POST' }).then(function () {
-              toast('已请求停止：当前包处理完就停', 'warn');
-            }, function () { c.close(); });
+            requestTaskCancel(c.btn, taskId, {
+              waitText: '正在取消…', okText: '已请求停止：当前包处理完就停',
+              isFinished: function () { return finished; }
+            });
           }
         },
         { label: '后台运行', kind: 'btn', onClick: function (c) { c.close(); toast('导入仍在后台进行，完成后可在「日志」页查看', 'info', 6000); } }
@@ -2929,9 +2965,10 @@
         {
           label: opts.cancelLabel || '取消', kind: 'btn-ghost', onClick: function (c) {
             if (finished || !taskId) return c.close();
-            api('/tasks/' + taskId + '/cancel', { method: 'POST' }).then(function () {
-              toast('已请求停止：当前包处理完就停', 'warn');
-            }, function () { c.close(); });
+            requestTaskCancel(c.btn, taskId, {
+              waitText: '正在取消…', okText: '已请求停止：当前包处理完就停',
+              isFinished: function () { return finished; }
+            });
           }
         },
         { label: '后台运行', kind: 'btn', onClick: function (c) { c.close(); toast('任务仍在后台进行，完成后可在「日志」页查看', 'info', 6000); } }
@@ -3075,6 +3112,7 @@
   function runBundleExport(payload, btn) {
     function statText(d, pct) {
       var secs = Math.round((d.elapsedMs || 0) / 1000);
+      if (d.status === 'error') return '没有生成文件 · 已用时 ' + fmtDur(secs);
       if (d.phase === 'collect') {
         var head = d.message || '正在统计要导出的包…';
         var cnt = (d.done || d.total) ? '（' + fmtNum(d.done || 0) + ' / ' + fmtNum(d.total || 0) + '）' : '';
@@ -3153,6 +3191,7 @@
           return;
         }
         var msg = '已导出 ' + r.file + '：' + fmtNum(r.packages) + ' 包 / ' + fmtNum(r.versions) + ' 版本 / ' + fmtNum(r.tarballs) + ' tarball / ' + fmtBytes(r.sizeBytes);
+        if (payload.scope === 'added') msg = '已按添加时间导出（' + (payload.addedFrom ? '从 ' + dtShort(payload.addedFrom) : '起始不限') + ' 到 ' + (payload.addedTo ? dtShort(payload.addedTo) : '现在') + '）：' + fmtNum(r.packages) + ' 包 / ' + fmtNum(r.versions) + ' 版本 / ' + fmtNum(r.tarballs) + ' tarball / ' + fmtBytes(r.sizeBytes);
         if (r.depsAdded) msg += '（其中连带依赖 ' + fmtNum(r.depsAdded) + ' 个' + (r.depsFetched ? '，自动下载 ' + fmtNum(r.depsFetched) + ' 个' : '') + '）';
         setText('exp-status', msg);
         toast(msg, 'ok', 9000);
@@ -3830,6 +3869,8 @@
       if (row) row.hidden = state.mig.scope !== 'selected';
       var drow = $('#exp-deps-row');
       if (drow) drow.hidden = state.mig.scope !== 'selected';
+      var arow = $('#exp-added-row');
+      if (arow) arow.hidden = state.mig.scope !== 'added';
       paintSelbar();
     });
     on('exp-run', 'click', function () {
@@ -3837,6 +3878,7 @@
       var payload = { scope: scope };
       var nm = ($('#exp-name') && $('#exp-name').value || '').trim();
       if (nm) payload.name = nm;
+      var addedLabel = '';
       if (scope === 'selected') {
         var names = selectedNames();
         if (!names.length) { toast('请先在「包管理」页勾选要导出的包', 'warn'); return; }
@@ -3845,9 +3887,23 @@
         payload.withDeps = !(wd && wd.checked === false);
         var af = $('#exp-auto-fetch');
         payload.autoFetchDeps = !(af && af.checked === false);
+      } else if (scope === 'added') {
+        /* 「按添加时间」导出：datetime-local 的值是本地时间，转成毫秒再交给后端统一规范化；
+         * 两端都空没有意义（等于全部），直接提示；起晚于止也拦在前端，省得白跑一趟任务。 */
+        var fv = ($('#exp-added-from') && $('#exp-added-from').value || '').trim();
+        var tv = ($('#exp-added-to') && $('#exp-added-to').value || '').trim();
+        if (!fv && !tv) { toast('请至少填写起始或结束时间（留空一端表示不限）', 'warn'); return; }
+        var fms = fv ? new Date(fv).getTime() : null;
+        var tms = tv ? new Date(tv).getTime() : null;
+        if ((fms !== null && !isFinite(fms)) || (tms !== null && !isFinite(tms))) { toast('添加时间格式不正确，请重新选择', 'warn'); return; }
+        if (fms !== null && tms !== null && fms > tms) { toast('起始时间不能晚于结束时间', 'warn'); return; }
+        payload.addedFrom = fms !== null ? new Date(fms).toISOString() : null;
+        payload.addedTo = tms !== null ? new Date(tms).toISOString() : null;
+        addedLabel = (fv || '不限') + ' ~ ' + (tv || '不限');
       }
       var btn = $('#exp-run');
-      setText('exp-status', payload.withDeps ? '正在打包（含递归依赖），包较多时可能耗时较久…' : '正在打包，包较多时可能耗时较久…');
+      if (addedLabel) setText('exp-status', '正在挑选添加时间在 ' + addedLabel + ' 之间的包并打包，包较多时可能耗时较久…');
+      else setText('exp-status', payload.withDeps ? '正在打包（含递归依赖），包较多时可能耗时较久…' : '正在打包，包较多时可能耗时较久…');
       runBundleExport(payload, btn);
     });
     on('imp-run-file', 'click', function () { importBundleFile($('#imp-file') ? $('#imp-file').value : ''); });
