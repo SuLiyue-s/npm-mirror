@@ -102,6 +102,35 @@ code,kbd,pre{font-family:var(--mono)}
   background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='180' height='180'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3' stitchTiles='stitch'/></filter><rect width='180' height='180' filter='url(%23n)'/></svg>");
 }
 
+/* ---------- 2.1 动效铺进弹窗与容器内部 ----------
+ * 整页的网格 / 扫描线 / 光晕 / 噪点 / 扫过亮带，同样铺到弹窗、抽屉、面板与
+ * 统计卡的内部背景。容器用 isolation 建立独立层叠上下文，内部插一层 .fx-box
+ * （absolute + z-index:-1 + pointer-events:none），它只垫在容器背景之上、所有
+ * 内容之下，所以文字、按钮、滚动条都不受影响，也不挡点击。 */
+.panel,.stat,.modal,.drawer{isolation:isolate}
+.fx-box{
+  position:absolute;inset:0;z-index:-1;pointer-events:none;
+  border-radius:inherit;overflow:hidden;
+  background-image:
+    linear-gradient(rgba(38,56,74,.22) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(38,56,74,.22) 1px,transparent 1px),
+    radial-gradient(620px 340px at 12% -16%,rgba(46,230,196,.05),transparent 62%),
+    radial-gradient(520px 300px at 104% 8%,rgba(255,179,71,.035),transparent 60%),
+    repeating-linear-gradient(to bottom,rgba(46,230,196,.018) 0 1px,transparent 1px 3px);
+  background-size:32px 32px,32px 32px,100% 100%,100% 100%,auto;
+}
+/* 扫过的亮带：与整页 .fx-scan 同周期（9s），用 transform 平移，不触发重排 */
+.fx-box::before{
+  content:"";position:absolute;left:0;right:0;top:0;height:150px;
+  background:linear-gradient(to bottom,transparent,rgba(46,230,196,.055) 48%,transparent);
+  animation:fx-sweep 9s linear infinite;will-change:transform;
+}
+@keyframes fx-sweep{from{transform:translateY(-160px)}to{transform:translateY(1200px)}}
+.fx-box::after{
+  content:"";position:absolute;inset:0;opacity:.03;
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='180' height='180'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3' stitchTiles='stitch'/></filter><rect width='180' height='180' filter='url(%23n)'/></svg>");
+}
+
 /* ---------- 3. 顶栏 ---------- */
 .topbar{
   position:relative;z-index:20;height:var(--topbar-h);

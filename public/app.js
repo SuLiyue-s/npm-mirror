@@ -284,6 +284,19 @@
     setTimeout(kill, ms || (type === 'err' ? 7000 : 4200));
   }
 
+  /* ================= 背景动效铺进弹窗/容器 =================
+   * 整页的动效背景（网格 / 扫描线 / 光晕 / 噪点 / 扫过亮带）同样铺进弹窗、
+   * 抽屉、面板与统计卡的内部背景：给容器插一层 .fx-box 即可（样式见
+   * style.css 的 2.1 节）。容器由 CSS isolation:isolate 建立层叠上下文，
+   * .fx-box 用 z-index:-1 垫在容器背景之上、内容之下——不挡点击、不影响
+   * 滚动和布局。重复调用安全（元素上记 __fxBox 防重复插入）。 */
+  function decorateFx(node) {
+    if (!node || node.nodeType !== 1 || node.__fxBox) return node;
+    node.__fxBox = el('div', { class: 'fx-box', 'aria-hidden': 'true' });
+    node.insertBefore(node.__fxBox, node.firstChild);
+    return node;
+  }
+
   /* ================= 弹窗 ================= */
   function modal(cfg) {
     var root = $('#modal-root');
@@ -298,6 +311,7 @@
     if (cfg.body) body.appendChild(cfg.body);
     var foot = el('div', { class: 'modal-foot' });
     var box = el('div', { class: 'modal ' + (cfg.wide ? 'wide' : '') }, [head, body, foot]);
+    decorateFx(box);
     var back = el('div', { class: 'backdrop' }, [box]);
     var closed = false;
 
@@ -560,16 +574,16 @@
 
   function skeletonCards(n) {
     var f = document.createDocumentFragment();
-    for (var i = 0; i < n; i++) f.appendChild(el('div', { class: 'stat skeleton skel-card' }));
+    for (var i = 0; i < n; i++) f.appendChild(decorateFx(el('div', { class: 'stat skeleton skel-card' })));
     return f;
   }
 
   function statCard(label, en, value, unit, sub, cls) {
-    return el('div', { class: 'stat ' + (cls || '') }, [
+    return decorateFx(el('div', { class: 'stat ' + (cls || '') }, [
       el('div', { class: 'stat-label' }, [el('span', { text: label }), el('em', { text: en || '' })]),
       el('div', { class: 'stat-value' }, [String(value), unit ? el('span', { class: 'stat-unit', text: unit }) : null]),
       sub ? el('div', { class: 'stat-sub', text: sub }) : null
-    ]);
+    ]));
   }
 
   function paintOverview(d) {
@@ -874,6 +888,7 @@
       ]),
       el('div', { class: 'drawer-body' }, [el('div', { class: 'center-box', text: '读取中…' })])
     ]);
+    decorateFx(panel);
     root.appendChild(back); root.appendChild(panel);
 
     api('/packages/' + encName(name)).then(function (d) {
@@ -3969,6 +3984,9 @@
     consumeUrlToken();
     startClock();
     bindGlobal();
+    /* 静态的容器框（面板 / 统计卡）在页面加载后统一铺上背景动效；
+     * 弹窗与抽屉在创建时由 modal()/openDetail() 自己插。 */
+    $$('.panel,.stat').forEach(decorateFx);
 
     /* 恢复最后一次筛选状态 */
     if ($('#pkg-size')) state.pkg.size = Number($('#pkg-size').value) || 20;

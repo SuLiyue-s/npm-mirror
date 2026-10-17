@@ -609,6 +609,39 @@ async function get(p, { json = false } = {}) {
         && /已复制 ' \+ fmtNum\(lines\.length\) \+ ' 条到剪贴板/.test(js.text));
   }
 
+  console.log('\x1b[1m十之二、页面背景动效铺进弹窗与容器框内部背景\x1b[0m');
+  {
+    const cssFx = fs.readFileSync(path.join(__dirname, '..', 'public', 'style.css'), 'utf8');
+    const jsFx = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
+
+    const boxRule = /\.fx-box\{[\s\S]*?position\s*:\s*absolute[\s\S]*?inset\s*:\s*0[\s\S]*?z-index\s*:\s*-1[\s\S]*?pointer-events\s*:\s*none[\s\S]*?border-radius\s*:\s*inherit[\s\S]*?overflow\s*:\s*hidden[\s\S]*?\}/.test(cssFx);
+    check('样式表有 .fx-box 动效层（绝对定位铺满容器、z-index:-1 垫在内容下面、pointer-events:none 不挡点击、圆角裁剪）',
+      boxRule, boxRule ? '' : '缺少 .fx-box 基础规则');
+
+    const layers = /\.fx-box\{[\s\S]*?linear-gradient\(rgba\(38,56,74,\.22\) 1px,transparent 1px\)[\s\S]*?linear-gradient\(90deg,rgba\(38,56,74,\.22\) 1px,transparent 1px\)[\s\S]*?radial-gradient\(620px 340px at 12% -16%,rgba\(46,230,196,\.05\)[\s\S]*?repeating-linear-gradient\(to bottom,rgba\(46,230,196,\.018\)/.test(cssFx);
+    const anim = /\.fx-box::before\{[\s\S]*?animation\s*:\s*fx-sweep 9s linear infinite/.test(cssFx)
+      && /@keyframes fx-sweep\{from\{transform:translateY\(-160px\)\}\s*to\{transform:translateY\(1200px\)\}\}/.test(cssFx)
+      && /will-change\s*:\s*transform/.test(cssFx);
+    const grain = /\.fx-box::after\{[\s\S]*?opacity\s*:\s*\.03[\s\S]*?feTurbulence/.test(cssFx);
+    const iso = /\.panel,\.stat,\.modal,\.drawer\{isolation\s*:\s*isolate\}/.test(cssFx);
+    check('动效层与整页一致：32px 网格 + 双色光晕 + 扫描线 + 噪点，并有 9s 扫过亮带（transform 平移）',
+      layers && anim && grain, `${layers ? '' : '背景层缺失 '}${anim ? '' : '扫过动画缺失 '}${grain ? '' : '噪点缺失'}`);
+    check('弹窗/面板/统计卡/抽屉建立独立层叠上下文（isolation:isolate，动效层才不会跑到容器背景后面去）', iso);
+
+    const helper = /function decorateFx\(node\)/.test(jsFx)
+      && /class: 'fx-box', 'aria-hidden': 'true'/.test(jsFx)
+      && /node\.__fxBox/.test(jsFx) && /node\.insertBefore\(node\.__fxBox, node\.firstChild\)/.test(jsFx);
+    check('app.js 有 decorateFx()：给容器插一层 .fx-box（防重复插入、aria-hidden）', helper);
+
+    const coverage = /var box = el\('div', \{ class: 'modal '[\s\S]{0,80}decorateFx\(box\)/.test(jsFx)
+      && /var panel = el\('div', \{ class: 'drawer' \}[\s\S]{0,1200}decorateFx\(panel\)/.test(jsFx)
+      && /return decorateFx\(el\('div', \{ class: 'stat ' \+ \(cls \|\| ''\)/.test(jsFx)
+      && /decorateFx\(el\('div', \{ class: 'stat skeleton skel-card' \}\)\)/.test(jsFx)
+      && /\$\$\('\.panel,\.stat'\)\.forEach\(decorateFx\)/.test(jsFx);
+    check('覆盖到每个弹窗（modal）、抽屉（drawer）、面板（panel）与统计卡（stat，含骨架屏）', coverage,
+      coverage ? '' : '有容器类型没铺动效');
+  }
+
   console.log(`\n\x1b[1m结果：${pass}/${pass + fail} 通过\x1b[0m\n`);
   finish(fail === 0 ? 0 : 1);
 })().catch((e) => { console.error('自检异常：', e); finish(1); });
