@@ -189,9 +189,29 @@ function Set-ConsoleVisible([bool]$Visible) {
 }
 
 # 右键菜单文案（按当前命令行窗口显示状态决定；自检也用同一个函数）
+# 「打开管理界面」与窗口状态无关，始终存在，方便直接从托盘打开网页端管理页面
 function Get-MenuLabels([bool]$ConsoleVisible) {
-  if ($ConsoleVisible) { return @('隐藏控制台', '退出镜像源') }
-  return @('打开控制台', '退出镜像源')
+  $toggle = if ($ConsoleVisible) { '隐藏控制台' } else { '打开控制台' }
+  return @($toggle, '打开管理界面', '退出镜像源')
+}
+
+# 打开管理界面：用系统默认浏览器打开镜像源的网页端首页
+function Open-ManagementUi {
+  $url = Get-ServiceUrl '/'
+  Write-TrayLog ('用户选择「打开管理界面」：{0}' -f $url)
+  try {
+    Start-Process -FilePath $url | Out-Null
+    return $true
+  } catch {
+    Write-TrayLog ('调用默认浏览器失败（{0}），改用 explorer 打开' -f $_.Exception.Message)
+    try {
+      Start-Process -FilePath 'explorer.exe' -ArgumentList $url | Out-Null
+      return $true
+    } catch {
+      Write-TrayLog ('打开管理界面失败：{0}' -f $_.Exception.Message)
+      return $false
+    }
+  }
 }
 
 # ---------- 自检模式（不注册托盘、不改变窗口状态） ----------
@@ -217,6 +237,7 @@ if ($SelfTest) {
     visibleMenu = @(Get-MenuLabels $true)
     hiddenMenu = @(Get-MenuLabels $false)
     servicePort = $script:Port
+    managementUrl = Get-ServiceUrl '/'
   }
   $json = ($result | ConvertTo-Json -Compress)
   if ($SelfTestOut) {
@@ -323,7 +344,7 @@ try {
   }
 } catch { Write-TrayLog ('设置命令行窗口图标失败：{0}' -f $_.Exception.Message) }
 
-# ---------- 右键菜单（每次弹出时按当前窗口状态重建，保证只显示该显示的两项） ----------
+# ---------- 右键菜单（每次弹出时按当前窗口状态重建，保证只显示该显示的控制台项；「打开管理界面」「退出镜像源」始终在） ----------
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 function Rebuild-Menu {
   $menu.Items.Clear()
@@ -332,8 +353,10 @@ function Rebuild-Menu {
   $toggle.add_Click({
     if (Test-ConsoleVisible) { [void](Set-ConsoleVisible $false) } else { [void](Set-ConsoleVisible $true) }
   })
+  $openUi = $menu.Items.Add($labels[1])
+  $openUi.add_Click({ [void](Open-ManagementUi) })
   [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
-  $exit = $menu.Items.Add($labels[1])
+  $exit = $menu.Items.Add($labels[2])
   $exit.add_Click({ Stop-MirrorAndExit })
 }
 $menu.add_Opening({ Rebuild-Menu })

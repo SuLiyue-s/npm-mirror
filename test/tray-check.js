@@ -2,7 +2,7 @@
 'use strict';
 /*
  * Windows 托盘自检（对应需求：启动脚本注册托盘项目图标、启动后隐藏命令行窗口、
- * 左键打开控制台、右键菜单按窗口状态只显示两项 + 退出镜像源）：
+ * 左键打开控制台、右键菜单 = 按窗口状态显示「打开/隐藏控制台」+「打开管理界面」+「退出镜像源」）：
  *
  *   一、tools/tray.ps1：是否注册 NotifyIcon、用项目图标、左键/右键行为、菜单文案、
  *       隐藏/显示用 Win32、退出走管理接口、服务被外部停止时自动退出
@@ -86,10 +86,14 @@ function readIco(buf) {
       /add_MouseClick/.test(tray) && /MouseButtons\]::Left/.test(tray) && /Set-ConsoleVisible \$true/.test(tray));
     check('右键菜单每次弹出都按窗口当前状态重建（ContextMenuStrip + Opening + Rebuild-Menu）',
       /ContextMenuStrip/.test(tray) && /add_Opening\(\{\s*Rebuild-Menu\s*\}\)/.test(tray));
-    check('菜单文案：窗口显示中只给「隐藏控制台 + 退出镜像源」，隐藏中只给「打开控制台 + 退出镜像源」',
+    check('菜单文案：窗口显示中给「隐藏控制台」，隐藏中给「打开控制台」；「打开管理界面」「退出镜像源」始终在',
       /function Get-MenuLabels/.test(tray) &&
-      /if \(\$ConsoleVisible\) \{ return @\('隐藏控制台', '退出镜像源'\) \}/.test(tray) &&
-      /return @\('打开控制台', '退出镜像源'\)/.test(tray));
+      /\$toggle = if \(\$ConsoleVisible\) \{ '隐藏控制台' \} else \{ '打开控制台' \}/.test(tray) &&
+      /return @\(\$toggle, '打开管理界面', '退出镜像源'\)/.test(tray));
+    check('右键菜单有「打开管理界面」，点击时用默认浏览器打开网页端管理页面（Start-Process + 服务地址）',
+      /function Open-ManagementUi/.test(tray) && /'打开管理界面'/.test(tray) &&
+      /Start-Process -FilePath \$url/.test(tray) && /Get-ServiceUrl '\/'/.test(tray) &&
+      /openUi\.add_Click\(\{\s*\[void\]\(Open-ManagementUi\)\s*\}\)/.test(tray));
     check('显示/隐藏窗口走 Win32（GetConsoleWindow / ShowWindow / IsWindowVisible）',
       /GetConsoleWindow/.test(tray) && /ShowWindow/.test(tray) && /IsWindowVisible/.test(tray));
     check('「退出镜像源」= 调管理接口优雅停服务（/__admin/api/service/shutdown + token）后再关窗口',
@@ -211,14 +215,17 @@ function readIco(buf) {
         // 沙箱/无控制台环境里 GetConsoleWindow() 返回 0 属正常；这里只要求字段是数字且非负
         check('自检能拿到命令行窗口句柄（GetConsoleWindow，无控制台环境为 0 也算正常）',
           typeof data.consoleHwnd === 'number' && data.consoleHwnd >= 0, `hwnd=${data.consoleHwnd}`);
-        check('自检菜单文案：显示中=隐藏控制台+退出镜像源',
-          Array.isArray(data.visibleMenu) && data.visibleMenu.length === 2 &&
-          data.visibleMenu[0] === '隐藏控制台' && data.visibleMenu[1] === '退出镜像源',
+        check('自检菜单文案：显示中=隐藏控制台+打开管理界面+退出镜像源',
+          Array.isArray(data.visibleMenu) && data.visibleMenu.length === 3 &&
+          data.visibleMenu[0] === '隐藏控制台' && data.visibleMenu[1] === '打开管理界面' && data.visibleMenu[2] === '退出镜像源',
           JSON.stringify(data.visibleMenu));
-        check('自检菜单文案：隐藏中=打开控制台+退出镜像源',
-          Array.isArray(data.hiddenMenu) && data.hiddenMenu.length === 2 &&
-          data.hiddenMenu[0] === '打开控制台' && data.hiddenMenu[1] === '退出镜像源',
+        check('自检菜单文案：隐藏中=打开控制台+打开管理界面+退出镜像源',
+          Array.isArray(data.hiddenMenu) && data.hiddenMenu.length === 3 &&
+          data.hiddenMenu[0] === '打开控制台' && data.hiddenMenu[1] === '打开管理界面' && data.hiddenMenu[2] === '退出镜像源',
           JSON.stringify(data.hiddenMenu));
+        check('自检给出管理界面地址（与当前端口一致）',
+          typeof data.managementUrl === 'string' && data.managementUrl === `http://127.0.0.1:${data.servicePort}/`,
+          String(data.managementUrl));
       }
     }
   }
