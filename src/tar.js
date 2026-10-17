@@ -272,8 +272,9 @@ async function concatFiles(parts, outFile) {
  * shouldAbort()：返回 true 时抛 code=ECANCELED（条目开始前与读大文件期间都会检查）。
  * onEntryDone({ index, name, bytes })：每个条目写完回调一次；并行模式下顺序不固定，
  *   上层用 index（0 起）把条目映射回所属的包，别依赖回调顺序。
- * concurrency：>1 时把条目按体积切成若干段并行压缩（每段一个独立 gzip 成员，最后按序拼接；
- *   标准 gzip 允许成员首尾相接，本工具读取器 / 7-Zip / gzip 命令都能正常解压）。
+ * concurrency：>1 时起若干段并行压缩，所有段共享一个条目游标动态领取（谁写完谁接着拿，
+ *   收尾阶段也不会塌成单线程；清单 manifest.json 固定由第一段先写）。每段一个独立 gzip 成员，
+ *   最后按序拼接；标准 gzip 允许成员首尾相接，本工具读取器 / 7-Zip / gzip 命令都能正常解压。
  *   打包结果与单流完全等价，只是把 gzip 的 CPU 摊到多个线程上。
  */
 async function packTarGz(outFile, entries, { gzip = true, onProgress, shouldAbort, onEntryDone, concurrency = 1 } = {}) {
@@ -316,40 +317,28 @@ async function packTarGz(outFile, entries, { gzip = true, onProgress, shouldAbor
     }
   }
 
-  /* 并行：按体积把条目切成 parts 段（每段至少 1 个条目，切点保证后面还够分），
-   * 每段独立 createWriter（独立 gzip 流）写自己的分片文件；最后一段负责写归档结束的两个零块。 */
-  const sizes = entries.map(entryBytes);
-  const totalBytes = sizes.reduce((a, b) => a + b, 0);
-  const target = totalBytes / parts;
-  const chunks = [];
-  let start = 0;
-  let acc = 0;
-  for (let i = 0; i < entriesTotal; i++) {
-    acc += sizes[i] || 0;
-    const remainingEntries = entriesTotal - i - 1;
-    const remainingParts = parts - chunks.length - 1;
-    if (remainingParts > 0 && acc >= target * (chunks.length + 1) && i > start && remainingEntries >= remainingParts) {
-      chunks.push({ start, end: i + 1 });
-      start = i + 1;
-    }
-  }
-  chunks.push({ start, end: entriesTotal });
-
-  const partFiles = chunks.map((c, idx) => `${outFile}.p${idx}.tar.gz`);
+  /* 并行：条目不预先切段，而是所有段共享一个游标动态领取（见下方 jobs），
+   * 谁写完谁接着拿；每段一个独立 gzip 流，最后按序拼接成一个归档。 */
+  const partFiles = Array.from({ length: parts }, (_, idx) => `${outFile}.p${idx}.tar.gz`);
   const writers = partFiles.map(f => createWriter(f, true));
   let aborted = false;
   const abortAll = () => {
     aborted = true;
     for (const w of writers) { try { w.abort(); } catch { /* 忽略 */ } }
   };
-  const jobs = chunks.map((c, idx) => (async () => {
-    const w = writers[idx];
-    for (let i = c.start; i < c.end; i++) {
+  let next = entriesTotal > 0 ? 1 : 0;   // 第 0 个条目（清单）由第一段先写，其余从这里开始抢
+  const jobs = writers.map((w, idx) => (async () => {
+    if (idx === 0 && entriesTotal > 0) await writeEntry(w, entries, 0, ctx);
+    for (;;) {
       if (aborted) throw canceledError();
       if (shouldAbort && shouldAbort()) throw canceledError();
+      const i = next;
+      if (i >= entriesTotal) break;
+      next = i + 1;
       await writeEntry(w, entries, i, ctx);
     }
-    if (idx === chunks.length - 1) await w.write(Buffer.alloc(BLOCK * 2));
+    // 归档结束的两个零块必须落在最后一段的结尾（拼接后才是整个归档的结尾）
+    if (idx === parts - 1) await w.write(Buffer.alloc(BLOCK * 2));
     await w.end();
   })());
   try {

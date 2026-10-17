@@ -275,10 +275,10 @@ async function autoFillDeps({ ctx, store, roots, logger, emit = () => {}, isCanc
  *   { phase:'deps-fetch', status, total, done, message }   正在自动补齐缺失依赖（status=resolve/download/skipped）
  *   { phase:'collect-done', packages, entries, totalBytes } 统计/文件清单准备完成
  *   { phase:'pack', entriesDone, entriesTotal, bytes, totalBytes, pkg, pkgDone, pkgTotal,
- *     inFlight:[{name,done,total,tarballs,versions}] }  打包进度；inFlight 是并行时同时在写的包（多个）
+ *     inFlight:[{name,file,size}] }  打包进度；inFlight 是并行时正在压缩的条目（并行文件，一行一个）
  *   { phase:'package', name, status:'packed', tarballs, versions, sizeBytes }  某个包的全部条目已写入
  * @param {function} [o.isCanceled] 返回 true 时尽快中止（抛 code=ECANCELED）
- * @param {number} [o.concurrency=1] 打包并发：>1 时按体积切成多段并行 gzip 压缩（产物仍是标准 tar.gz）
+ * @param {number} [o.concurrency=1] 打包并发：>1 时起多段 gzip 流共享条目游标并行压缩（产物仍是标准 tar.gz）
  */
 async function exportBundle({
   store, ctx = null, scope = 'all', names = [], fileName, withDeps = false,
@@ -336,18 +336,21 @@ async function exportBundle({
   }
 
   emit({ phase: 'collect-start', total: targets.length });
-  const entries = [];
+  /* 先把每个包的条目收进各自的列表，最后再「跨包轮流交织」展开成 entries。
+   * 原因：并行打包是共享一个条目游标领取任务，如果同一包的条目连在一起，几路压缩会同时落在
+   * 同一个包上，进度弹窗右栏就只剩 1~2 个包（用户反馈收尾只剩 1 个）。交织后并发的几路分属
+   * 不同包，右栏才有多行；条目在归档里的顺序对导入无影响（按路径解包），但 manifest 必须排第一。 */
+  const pkgEntryLists = [];   // 与 pkgPlan 一一对应，每个包自己的条目列表
   const manifestPackages = [];
   /* 逐包统计：每个包在 entries 里占几条、几个 tarball、多少字节，
-   * 供打包阶段的「逐包打包详情」与「当前包」进度条使用（必须在 unshift manifest 之前记下终点）。 */
+   * 供打包阶段的「逐包打包详情」与「当前包」进度条使用。 */
   const pkgPlan = [];
   let versions = 0, tarballs = 0, bytes = 0;
   for (const name of targets) {
     checkCancel();
     const rec = store.get(name);
     if (!rec) continue;
-    const startAt = entries.length;
-    let entryCount = 0;
+    const list = [];
     let dir;
     try { dir = safePkgDir(name); }
     catch (e) {
@@ -363,7 +366,7 @@ async function exportBundle({
       const entryName = `storage/${dir}/tarballs/${file}`;
       if (abs) {
         const st = fs.statSync(abs);
-        entries.push({ name: entryName, source: abs, size: st.size, mtime: st.mtimeMs / 1000 });
+        list.push({ name: entryName, source: abs, size: st.size, mtime: st.mtimeMs / 1000 });
         bytes += st.size;
         tarballs++;
         pkgVersions.push({ version: v, file, sizeBytes: st.size, cached: true });
@@ -372,12 +375,12 @@ async function exportBundle({
       }
       versions++;
     }
-    entries.push({ name: `storage/${dir}/packument.json`, source: store.packumentPath(name) });
-    if (fs.existsSync(store.metaPath(name))) entries.push({ name: `storage/${dir}/meta.json`, source: store.metaPath(name) });
-    entryCount = entries.length - startAt;
+    list.push({ name: `storage/${dir}/packument.json`, source: store.packumentPath(name) });
+    if (fs.existsSync(store.metaPath(name))) list.push({ name: `storage/${dir}/meta.json`, source: store.metaPath(name) });
+    pkgEntryLists.push(list);
     pkgPlan.push({
       name,
-      entries: entryCount,
+      entries: list.length,
       tarballs: pkgVersions.filter(v => v.cached).length,
       versions: pkgVersions.length,
       sizeBytes: pkgVersions.reduce((a, v) => a + (v.sizeBytes || 0), 0),
@@ -392,6 +395,19 @@ async function exportBundle({
     });
     // 统计阶段对大镜像也要有反馈（每个包都要 stat 一遍 tarball）
     if (manifestPackages.length % 100 === 0) emit({ phase: 'collect', packages: manifestPackages.length, total: targets.length });
+  }
+
+  /* 跨包轮流交织展开（round-robin）：第 1 轮每个包的 1 条，第 2 轮每个包的第 2 条……
+   * 这样并行压缩的 N 路分别落在不同包上，进度弹窗右栏才能同时显示多个包（而不是几路挤在一个包）。 */
+  const entries = [];
+  const entryPkgInfo = [];
+  for (let round = 0; ; round++) {
+    let any = false;
+    for (let pi = 0; pi < pkgEntryLists.length; pi++) {
+      const list = pkgEntryLists[pi];
+      if (round < list.length) { entries.push(list[round]); entryPkgInfo.push(pkgPlan[pi]); any = true; }
+    }
+    if (!any) break;
   }
 
   const manifest = {
@@ -440,13 +456,9 @@ async function exportBundle({
     if (logger) logger.warn(`离线包同名已存在，改名保存为 ${finalName}`);
   }
   const tmpPath = path.join(bundleDir(), `.${finalName}.part`);
-  /* 条目下标 → 所属包的映射：并行打包时条目完成顺序不固定，不能再靠「已完成条目数」猜当前是哪个包，
-   * 必须用 packTarGz 的 onEntryDone(index) 按条目下标定位。entries[0] 是 manifest.json，所以包从下标 1 开始。 */
-  const entryPkg = new Array(entries.length).fill(null);
-  for (let pi = 0, at = 1; pi < pkgPlan.length; pi++) {
-    for (let k = 0; k < pkgPlan[pi].entries; k++) entryPkg[at + k] = pkgPlan[pi];
-    at += pkgPlan[pi].entries;
-  }
+  /* 条目下标 → 所属包的映射：entries 已按包轮流交织，下标不再按连续区间对应包，
+   * 映射在展开时逐条记进 entryPkgInfo；entries[0] 是 manifest.json，所以包从下标 1 开始。 */
+  const entryPkg = [null].concat(entryPkgInfo);
   const pkgSeen = new Map();   // 包名 -> 已写完的条目数（并行模式下条目完成顺序不固定）
   const res = await tar.packTarGz(tmpPath, entries, {
     gzip: true,
@@ -464,25 +476,22 @@ async function exportBundle({
     },
     onProgress: (info) => {
       const cur = info.entry > 0 ? entryPkg[info.entry - 1] : null;
-      /* 并行打包时同时有多个包在写：把「正在写的条目」映射成包交给界面显示。
-       * 注意按包聚合后行数会比并发路数少：一个包可能被多个压缩分片同时写（如 typescript 有 3857 个文件），
-       * 所以给每行带上 workers（有几路正在写这个包），界面用「共 N 路」把真实并发数说清楚。 */
-      const byName = new Map();
+      /* 并行打包时同时有多个条目在写：右栏按「正在压缩的文件」一行一个（条目级），
+       * 行数就是真正在干活的路数，收尾时也不会因为只剩一个包而塌成 1 行。
+       * 条目名形如 storage/<包目录>/tarballs/<文件> 或 storage/<包目录>/packument.json，
+       * 展示时去掉 storage/<包目录>/ 前缀，只留 tarballs/xxx.tgz 这样的短名。 */
+      const inFlight = [];
       for (const idx of Array.isArray(info.active) ? info.active : []) {
+        const e = entries[idx];
+        if (!e) continue;
         const p = entryPkg[idx];
-        if (!p) continue;
-        const it = byName.get(p.name);
-        if (it) { it.workers += 1; continue; }
-        byName.set(p.name, {
-          name: p.name,
-          done: Math.min(pkgSeen.get(p.name) || 0, p.entries),
-          total: p.entries,
-          tarballs: p.tarballs,
-          versions: p.versions,
-          workers: 1,
+        inFlight.push({
+          name: p ? p.name : '',
+          file: String(e.name || '').replace(/^storage\/[^/]+\//, ''),
+          size: Number(e.size) || (e.data ? e.data.length : 0),
         });
+        if (inFlight.length >= 64) break;   // 快照不做无限长（并发本来也有上限）
       }
-      const inFlight = Array.from(byName.values());
       emit({
         phase: 'pack',
         entriesDone: info.count,
@@ -563,9 +572,8 @@ async function importBundle({
   /* 并行导入时同时有多个包在处理：维护「正在导入的包」集合，随每个事件带给界面，
    * 右栏才能像补 tarball 那样一条包一行（原来只留单个 current，并行 4 路也只显示 1 条）。 */
   const running = new Map();          // name -> {name, done, total}
-  /* 导入是「一个 worker 独占一个包」，所以每个在跑的包就是一路；workers 固定 1，
-   * 界面统一用「共 N 路」汇总显示（导出侧一个包可能被多路分片同时写，workers 会 >1）。 */
-  const flight = () => Array.from(running.values()).map(x => ({ name: x.name, done: x.done, total: x.total, workers: 1 }));
+  /* 导入是「一个 worker 独占一个包」，所以每个在跑的包就是一路，右栏一行一个包（行数＝路数）。 */
+  const flight = () => Array.from(running.values()).map(x => ({ name: x.name, done: x.done, total: x.total }));
   const emit = (ev) => {
     if (!onProgress) return;
     if (ev && ev.phase === 'package-start') {

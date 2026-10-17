@@ -495,20 +495,20 @@ async function get(p, { json = false } = {}) {
       /active: Array\.from\(active\)/.test(tarSrc) && /inFlight/.test(bundleSrc)
         && /const flight = \(\) =>/.test(bundleSrc) && /inFlight: Array\.isArray\(ev\.inFlight\)/.test(apiSrc)
         && /inFlight: t\.inFlight \|\| \[\]/.test(tasksSrc));
-    check('右栏按 inFlight 渲染多行，标题改成「并行包」，并发上限来自任务快照',
+    check('右栏按 inFlight 渲染多行，标题改成「并行文件/并行包」，并发上限来自任务快照',
       /Array\.isArray\(d\.inFlight\) && d\.inFlight\.length/.test(js.text)
         && /runPane\.setMax\(d\.concurrency \|\| 1\)/.test(js.text)
         && /setMax: function \(n\)/.test(js.text)
-        && /正在打包 · 并行包/.test(js.text) && /正在导入 · 并行包/.test(js.text));
+        && /正在打包 · 并行文件/.test(js.text) && /正在导入 · 并行包/.test(js.text));
     check('任务收尾清空 inFlight（导出/导入结束后右栏不留残行）',
       /update\(\{ inFlight: \[\] \}\)/.test(apiSrc) && /o\.update\(\{ inFlight: \[\] \}\)/.test(apiSrc));
-    /* 按包聚合后行数可能少于并发路数（一个包可被多个压缩分片同时写），
-     * 所以每行带 workers、标题汇总「共 N 路」，导入侧每包一路 workers:1。 */
-    check('并行包带 workers：导出按包聚合多路、导入一包一路，界面显示「共 N 路」与 ×N',
-      /const byName = new Map\(\)/.test(bundleSrc) && /it\.workers \+= 1/.test(bundleSrc)
-        && /workers: 1 \}/.test(bundleSrc)
-        && /（共 ' \+ totalWorkers \+ ' 路）/.test(js.text) && /' ×' \+ w/.test(js.text)
-        && /workers: Number\(p\.workers\) \|\| 1/.test(js.text));
+    /* 导出右栏改成条目级「并行文件」：一个正在压缩的文件一行（带文件名/大小），
+     * 行数就是真正在干活的路数，收尾只剩一个包时也不会塌成 1 行；导入仍是一包一路。 */
+    check('导出右栏是条目级「并行文件」：inFlight 带 file/size，界面一行一个文件显示「压缩中…」',
+      bundleSrc.includes("file: String(e.name || '').replace(/^storage\\/[^/]+\\//, '')")
+        && js.text.includes("if (p.file) {") && js.text.includes("target: 0, spin: true, size: Number(p.size) || 0")
+        && js.text.includes("'压缩中…'") && js.text.includes('正在打包 · 并行文件')
+        && js.text.includes('paneCountUnit'));
   }
 
   console.log('\x1b[1m九、离线包并行导出 / 导入 + 「根目录名不是 package」兼容\x1b[0m');

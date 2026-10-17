@@ -1663,7 +1663,8 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
     const os5 = require('os');
     const tmp5 = fs.mkdtempSync(path.join(os5.tmpdir(), 'mirror-inflight-'));
     try {
-      // 1) tar 层：并发 2 打包 4 个条目（按体积至少能切成 2 段）时，进度里的 active 能同时包含多个条目，收尾清空
+      // 1) tar 层：并发打包时进度里的 active 能同时包含多个条目、收尾清空
+      //    （条目是「共享游标动态领取」的，不再按体积预切成固定段）
       const files5 = ['a.bin', 'b.bin', 'c.bin', 'd.bin'];
       for (const name of files5) fs.writeFileSync(path.join(tmp5, name), Buffer.alloc(768 * 1024, 7));
       const entries5 = files5.map((name) => ({
@@ -1680,6 +1681,32 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
       check('tar 打包进度 active 收尾清空（最后一个事件里没有在写的条目）',
         !!lastEv5 && Array.isArray(lastEv5.active) && lastEv5.active.length === 0,
         JSON.stringify(lastEv5));
+
+      /* 收尾不塌陷（用户反馈：91% 时右栏只剩 1 个并行包）：
+       * 动态领取下，任务过半之后仍应有多路同时写；旧实现按体积切固定段，收尾只剩最慢那段。 */
+      const tailFiles5 = Array.from({ length: 12 }, (_, i) => `t${i}.bin`);
+      for (const name of tailFiles5) fs.writeFileSync(path.join(tmp5, name), Buffer.alloc(1024 * 1024, 5));
+      const tailEntries5 = tailFiles5.map((name) => ({
+        name, source: path.join(tmp5, name), mode: 0o644, mtime: Date.now() / 1000,
+      }));
+      const evTail5 = [];
+      await tarMod5.packTarGz(path.join(tmp5, 'tail.tgz'), tailEntries5, {
+        concurrency: 3, onProgress: (e) => evTail5.push(e),
+      });
+      const maxActiveTail5 = evTail5.reduce((a, e) => Math.max(a, (e.active || []).length), 0);
+      const lateEvTail5 = evTail5.filter((e) => e.count >= Math.floor(tailEntries5.length * 0.5));
+      check('tar 并行打包收尾阶段仍保持多路（任务过半后仍有 ≥2 个条目同时在写）',
+        maxActiveTail5 >= 3 && lateEvTail5.some((e) => (e.active || []).length >= 2),
+        `events=${evTail5.length} maxActive=${maxActiveTail5} 过半事件=${JSON.stringify(lateEvTail5.map((e) => ({ count: e.count, active: e.active.length })).slice(0, 8))}`);
+      // 动态分配会打乱条目顺序，归档必须仍能被完整读出（每个条目都在，顺序无关）
+      let tailRead5 = 0;
+      for (const name of tailFiles5) {
+        // eslint-disable-next-line no-await-in-loop
+        const b = await tarMod5.readTarEntry(path.join(tmp5, 'tail.tgz'), name);
+        if (b && b.length === 1024 * 1024) tailRead5++;
+      }
+      check('动态分配后归档仍可完整读取（12 个条目按名取回、字节数一致）', tailRead5 === tailFiles5.length,
+        `read=${tailRead5}/${tailFiles5.length}`);
     } finally {
       try { fs.rmSync(tmp5, { recursive: true, force: true }); } catch { /* 忽略 */ }
     }
@@ -1731,16 +1758,16 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
         check('导出进度快照带 inFlight，并行打包时同时出现多个包（不再只剩 1 个「当前包」）',
           maxLen5 >= Math.min(2, exConc5),
           `并发=${exConc5} 采样=${snaps.length} 最大并行包=${maxLen5}`);
-        check('导出 inFlight 每项都是 {name,done,total}（右栏画进度条要的数值）',
-          packs5.every((d) => d.inFlight.every(validFlight5)),
+        /* 导出右栏改成「条目级并行文件」：一项 = 一个正在压缩的文件，带 file（短文件名）与 size，
+         * 行数就是真正在干活的路数，不再按包聚合（否则收尾只剩一个包时会塌成 1 行）。 */
+        const validFile5 = (x) => !!x && typeof x.name === 'string' && typeof x.file === 'string' && x.file.length > 0
+          && Number.isFinite(Number(x.size));
+        check('导出 inFlight 每项都是并行文件 {name,file,size}（右栏一行一个文件）',
+          packs5.every((d) => d.inFlight.every(validFile5)),
           JSON.stringify(packs5.map((d) => d.inFlight).slice(0, 3)));
-        /* 一个包可能被多个压缩分片同时写：每项带 workers（几路在写这个包），
-         * 「workers 之和」才是真正在并发写条目的路数，不能超过配置的并发数。 */
-        const maxWorkers5 = packs5.reduce((a, d) => Math.max(a, d.inFlight.reduce((s, x) => s + (Number(x.workers) || 1), 0)), 0);
-        check('导出 inFlight 带 workers，且并行写条目的路数不超过配置并发数',
-          packs5.every((d) => d.inFlight.every((x) => x.workers === undefined || (Number.isFinite(Number(x.workers)) && Number(x.workers) >= 1)))
-            && maxWorkers5 >= 1 && maxWorkers5 <= exConc5,
-          `maxWorkers=${maxWorkers5} 配置并发=${exConc5} 示例=${JSON.stringify((packs5.find((d) => d.inFlight.some((x) => Number(x.workers) > 1)) || {}).inFlight || [])}`);
+        check('导出并行文件行数不超过配置并发数，且至少出现过 2 行以上',
+          packs5.every((d) => d.inFlight.length <= exConc5) && maxLen5 >= Math.min(2, exConc5),
+          `并发=${exConc5} 最大并行文件=${maxLen5} 示例=${JSON.stringify((packs5.find((d) => d.inFlight.length > 1) || {}).inFlight || [])}`);
         const rf5 = (fin && fin.result) || {};
         if (rf5.file) bundle5 = rf5.file;
         check('导出任务结束后 inFlight 清空（右栏不留残留行）',
@@ -1762,11 +1789,11 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
           `采样=${snaps.length} 有并行包快照=${ims5.length} 示例=${JSON.stringify((ims5[0] || {}).inFlight || [])}`);
         check('导入任务结束后 inFlight 清空', !!fin && Array.isArray(fin.inFlight) && fin.inFlight.length === 0,
           `status=${fin && fin.status} inFlight=${JSON.stringify(fin && fin.inFlight)}`);
-        /* 导入是「一个 worker 独占一个包」，每个在跑的包就是一路：workers 恒为 1，
-         * 行数 == 路数；这里顺带确认它不会超过配置的导入并发数。 */
+        /* 导入是「一个 worker 独占一个包」，每个在跑的包就是一路：行数 == 路数，
+         * 这里顺带确认它不会超过配置的导入并发数。 */
         const imMax5 = ims5.reduce((a, d) => Math.max(a, d.inFlight.length), 0);
-        check('导入 inFlight 每项 workers=1（一包一路），行数不超过配置并发数',
-          ims5.every((d) => d.inFlight.every((x) => Number(x.workers) === 1)) && imMax5 >= 1 && imMax5 <= imConc5,
+        check('导入 inFlight 一行一个包（一包一路），行数不超过配置并发数',
+          imMax5 >= 1 && imMax5 <= imConc5,
           `maxRows=${imMax5} 配置并发=${imConc5}`);
         check('导入任务的并发数来自配置（bundleImportConcurrency）', fin && Number(fin.concurrency) === imConc5,
           `concurrency=${fin && fin.concurrency} 期望=${imConc5}`);

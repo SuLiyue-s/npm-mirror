@@ -1422,12 +1422,13 @@
    * 每个正在进行的包一条大进度条（样式与单包下载行一致：tr-fillrow 背景填充条），
    * 与左侧任务列表等高、各自滚动。返回 { el, paint(pkgs, ended) }。
    * @param {number} conc 并发数：同时在下的包最多就这么多个，栏里最多展示这么多条
-   * @param {object} [opts] 文案微调：head/unit/bytes(是否显示体积)/countPrefix/endedText/emptyText
+   * @param {object} [opts] 文案微调：head/unit/countUnit/bytes(是否显示体积)/countPrefix/endedText/emptyText
    */
   function runningPane(conc, opts) {
     opts = opts || {};
     var headText = opts.head || '正在下载 · 单包进度';
     var unit = opts.unit || '个';
+    var countUnit = opts.countUnit || '个';
     var showBytes = opts.bytes !== false;
     var countPrefix = opts.countPrefix || '同时';
     var endedText = opts.endedText || '下载已结束';
@@ -1446,18 +1447,17 @@
       var running = [];
       (pkgs || []).forEach(function (p) {
         if (!p || p.status !== 'running') return;
-        if (!(Number(p.target) > 0)) return;
+        /* spin 行是「并行打包」的条目级行（一个正在压缩的文件一行）：大小已知、进度未知，target 为 0 */
+        if (!(Number(p.target) > 0) && !p.spin) return;
         /* keepDone：导入的包通常只有 1 个版本、几毫秒就处理完，若严格只显示"还没下完"的包，
          * 右栏会一直闪空。导入弹窗保留当前包的最终态（100%），直到下一个包开始。 */
-        if (!opts.keepDone && Number(p.done) >= Number(p.target)) return;
+        if (!opts.keepDone && !p.spin && Number(p.done) >= Number(p.target)) return;
         running.push(p);
       });
       running = running.slice(0, max);
       var seen = {};
-      var totalWorkers = 0;
       running.forEach(function (p) {
         seen[p.name] = true;
-        totalWorkers += Math.max(1, Number(p.workers) || 1);
         var it = map[p.name];
         if (!it) {
           var fill = el('i', { class: 'tr-fill', style: 'width:0' });
@@ -1470,9 +1470,13 @@
           it = map[p.name] = { row: row, fill: fill, tv: tv, nameEl: nameEl };
           box.appendChild(row);
         }
-        /* 一个包可能被多个压缩分片同时写：包名后标 ×N，别让人误以为只有 1 路在干活 */
-        var w = Math.max(1, Number(p.workers) || 1);
-        it.nameEl.textContent = w > 1 ? (p.name + ' ×' + w) : p.name;
+        if (p.spin) {
+          /* 并行打包：一个正在压缩的文件一行，显示文件大小 + 「压缩中…」（完成后由左栏逐包列表接管） */
+          it.nameEl.textContent = p.name;
+          it.fill.style.width = '0';
+          it.tv.textContent = (p.size ? fmtBytes(p.size) + ' · ' : '') + '压缩中…';
+          return;
+        }
         var pct = Math.round(Number(p.done) / Number(p.target) * 100);
         it.fill.style.width = Math.max(0, Math.min(100, pct)) + '%';
         it.tv.textContent = p.done + ' / ' + p.target + ' ' + unit + '（' + pct + '%）' + (showBytes ? ' · ' + fmtBytes(p.bytes || 0) : '');
@@ -1485,8 +1489,7 @@
       });
       empty.hidden = running.length > 0;
       if (!running.length) empty.textContent = ended ? endedText : emptyText;
-      cnt.textContent = running.length ? (countPrefix + ' ' + running.length + ' 个' +
-        (totalWorkers > running.length ? '（共 ' + totalWorkers + ' 路）' : '')) : '';
+      cnt.textContent = running.length ? (countPrefix + ' ' + running.length + ' ' + countUnit) : '';
     }
 
     return {
@@ -2871,7 +2874,7 @@
 
   /**
    * 离线包导出/导入的通用进度弹窗。
-   * opts: title/sub/intro/busyText/sideHint/waitText/paneHead/paneUnit/cancelLabel/btn
+   * opts: title/sub/intro/busyText/sideHint/waitText/paneHead/paneUnit/paneCountUnit/cancelLabel/btn
    *       extractBar   导入解包阶段用「字节」画整体条
    *       statText(d,pct)  统计行文案
    *       start(onProgress) -> Promise<{taskId}>；上传阶段可用 onProgress({kind:'upload',...}) 回传字节进度
@@ -2880,7 +2883,8 @@
   function bundleProgressModal(opts) {
     var rowMap = {}, list = el('div', { class: 'tasklist' });
     var runPane = runningPane(1, {
-      head: opts.paneHead || '当前包', unit: opts.paneUnit || '个版本', bytes: false,
+      head: opts.paneHead || '当前包', unit: opts.paneUnit || '个版本', countUnit: opts.paneCountUnit || '个',
+      bytes: false,
       countPrefix: '当前', endedText: '已结束', emptyText: '等待开始…', keepDone: true
     });
     var leftCol = el('div', { class: 'fill-col' }, [list]);
@@ -2928,12 +2932,18 @@
         list.appendChild(opts.rowEl(p));
       });
       var feed = [];
-      /* 并行打包/导入：任务快照里 inFlight 是「同时在处理的包」列表（导出=文件数，导入=版本数），
-       * 一条包一行；旧字段 current（单个包）保留给缓存导入等串行任务做兜底。 */
+      /* 并行打包/导入：任务快照里 inFlight 是「同时在处理的项」列表。
+       * 导出是条目级（一个正在压缩的文件一行，带 name=包名 / file=短文件名 / size）；
+       * 导入是包级（一个 worker 一个包，带 done/total 版本数）。
+       * 旧字段 current（单个包）保留给缓存导入等串行任务做兜底。 */
       if (Array.isArray(d.inFlight) && d.inFlight.length) {
         d.inFlight.forEach(function (p) {
           if (!p || !p.name) return;
-          feed.push({ name: p.name, status: 'running', target: Number(p.total) || 0, done: Number(p.done) || 0, workers: Number(p.workers) || 1 });
+          if (p.file) {
+            feed.push({ name: p.name + ' · ' + p.file, status: 'running', target: 0, spin: true, size: Number(p.size) || 0 });
+            return;
+          }
+          feed.push({ name: p.name, status: 'running', target: Number(p.total) || 0, done: Number(p.done) || 0 });
         });
         lastCur = null;
       } else if (d.current) {
@@ -3041,7 +3051,7 @@
       title: '导出离线包', sub: 'EXPORT BUNDLE',
       intro: '正在统计要导出的包…',
       busyText: '导出中…', sideHint: 'EXPORTING…', waitText: '正在打包…',
-      paneHead: '正在打包 · 并行包', paneUnit: '个文件',
+      paneHead: '正在打包 · 并行文件', paneUnit: '个文件', paneCountUnit: '个文件',
       cancelLabel: '取消导出', btn: btn,
       extractBar: false,
       statText: statText,
@@ -3184,7 +3194,7 @@
         ? '正在上传 ' + opts.file.name + '（' + fmtBytes(opts.file.size) + '）…'
         : '正在读取 ' + opts.name + ' …',
       busyText: '导入中…', sideHint: 'IMPORTING…', waitText: '正在解包…',
-      paneHead: '正在导入 · 并行包', paneUnit: '个版本',
+      paneHead: '正在导入 · 并行包', paneUnit: '个版本', paneCountUnit: '个包',
       cancelLabel: '取消导入', btn: opts.btn || null,
       extractBar: true,
       statText: statText,
