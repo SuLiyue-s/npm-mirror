@@ -619,6 +619,208 @@
     return input.__dtPicker;
   }
 
+  /* ================= 自绘下拉（原生 select 的替代） =================
+   * 原生 <select> 展开后的系统列表是黑底 + 白色选中块，和项目风格不一致，
+   * 而它由浏览器内部绘制、CSS 改不了。这里把每个 <select> 包成
+   * 「.csel 容器 + .csel-btn 按钮 + .csel-menu 深色菜单」：
+   * 原生 select 仍留在 DOM 里（display:none），value / change 语义完全不变，
+   * 业务代码照常读写；动态创建或重建 option 的 select 由 MutationObserver 自动接管。 */
+  var cselOpen = null;   // 当前打开的下拉
+
+  function cselRefresh(sel) {
+    var c = sel.__csel;
+    if (!c) return;
+    var opt = sel.options[sel.selectedIndex];
+    var txt = opt ? (opt.textContent || '') : '';
+    if (c.label.textContent !== txt) c.label.textContent = txt;
+    c.btn.disabled = !!sel.disabled;
+    c.btn.classList.toggle('is-empty', !sel.value && !!sel.getAttribute('data-placeholder'));
+    c.btn.setAttribute('aria-label', txt || sel.getAttribute('aria-label') || '下拉选择');
+  }
+
+  function cselClose() {
+    var c = cselOpen;
+    if (!c) return;
+    cselOpen = null;
+    c.menu.hidden = true;
+    c.btn.setAttribute('aria-expanded', 'false');
+    c.items.forEach(function (it) { it.classList.remove('is-active'); });
+    c.active = -1;
+    document.removeEventListener('mousedown', cselOnDown, true);
+    document.removeEventListener('keydown', cselOnKey, true);
+    window.removeEventListener('resize', cselClose);
+    document.removeEventListener('scroll', cselOnScroll, true);
+  }
+
+  function cselHighlight() {
+    var c = cselOpen;
+    if (!c) return;
+    for (var i = 0; i < c.items.length; i++) {
+      var it = c.items[i];
+      it.classList.toggle('is-active', it.__idx === c.active);
+      it.classList.toggle('is-sel', it.__idx === c.sel.selectedIndex);
+    }
+    var cur = c.items.filter(function (it) { return it.__idx === c.active; })[0];
+    if (cur && cur.scrollIntoView) cur.scrollIntoView({ block: 'nearest' });
+  }
+
+  function cselMove(delta) {
+    var c = cselOpen;
+    if (!c || !c.items.length) return;
+    var pos = -1, i;
+    for (i = 0; i < c.items.length; i++) if (c.items[i].__idx === c.active) { pos = i; break; }
+    if (pos < 0) pos = delta > 0 ? -1 : c.items.length;
+    var next = Math.max(0, Math.min(c.items.length - 1, pos + delta));
+    c.active = c.items[next].__idx;
+    cselHighlight();
+  }
+
+  function cselPick(sel, idx) {
+    sel.selectedIndex = idx;
+    cselRefresh(sel);
+    cselClose();
+    /* 和原生 select 一致：既派发 input 也派发 change（冒泡），业务监听无需改动 */
+    sel.dispatchEvent(new Event('input', { bubbles: true }));
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  function cselBuild(c) {
+    clear(c.menu);
+    c.items = [];
+    var opts = c.sel.options, i;
+    for (i = 0; i < opts.length; i++) {
+      if (opts[i].disabled) continue;
+      (function (idx) {
+        var it = el('button', {
+          class: 'csel-opt', type: 'button', role: 'option',
+          text: opts[idx].textContent || opts[idx].value || '',
+          onclick: function (ev) { ev.stopPropagation(); cselPick(c.sel, idx); }
+        });
+        it.__idx = idx;
+        c.menu.appendChild(it);
+        c.items.push(it);
+      })(i);
+    }
+  }
+
+  function cselPlace(c) {
+    var r = c.btn.getBoundingClientRect();
+    var vw = window.innerWidth, vh = window.innerHeight;
+    var w = Math.min(Math.max(r.width, 120), vw - 16);
+    c.menu.style.width = w + 'px';
+    var h = c.menu.offsetHeight;
+    var left = Math.min(Math.max(8, r.left), vw - w - 8);
+    var top = r.bottom + 5;
+    if (top + h > vh - 8 && r.top - h - 5 >= 8) top = r.top - h - 5;
+    c.menu.style.left = Math.round(left) + 'px';
+    c.menu.style.top = Math.round(top) + 'px';
+  }
+
+  function cselShow(sel) {
+    var c = sel.__csel;
+    if (!c) return;
+    if (cselOpen && cselOpen.sel === sel) { cselClose(); return; }
+    cselClose();
+    cselBuild(c);
+    c.menu.hidden = false;
+    cselOpen = c;          // 先登记，highlight/place 都依赖当前打开的菜单
+    c.active = sel.selectedIndex;
+    cselHighlight();
+    cselPlace(c);
+    c.btn.setAttribute('aria-expanded', 'true');
+    document.addEventListener('mousedown', cselOnDown, true);
+    document.addEventListener('keydown', cselOnKey, true);
+    window.addEventListener('resize', cselClose);
+    document.addEventListener('scroll', cselOnScroll, true);
+  }
+
+  function cselOnDown(ev) {
+    var c = cselOpen;
+    if (!c) return;
+    if (c.wrap.contains(ev.target) || c.menu.contains(ev.target)) return;
+    cselClose();
+  }
+  function cselOnKey(ev) {
+    var c = cselOpen;
+    if (!c) return;
+    if (ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); cselClose(); c.btn.focus(); return; }
+    if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') { ev.preventDefault(); cselMove(ev.key === 'ArrowDown' ? 1 : -1); return; }
+    if (ev.key === 'Enter' || ev.key === ' ') {
+      ev.preventDefault();
+      if (c.active >= 0) cselPick(c.sel, c.active);
+      return;
+    }
+    if (ev.key === 'Tab') cselClose();
+  }
+  function cselOnScroll(ev) {
+    var c = cselOpen;
+    if (!c) return;
+    if (c.menu.contains(ev.target)) return;
+    cselClose();
+  }
+
+  function cselEnhance(sel) {
+    if (!sel || sel.tagName !== 'SELECT' || sel.__csel) return;
+    var wrap = el('span', { class: 'csel' });
+    var label = el('span', { class: 'csel-label' });
+    var btn = el('button', {
+      class: 'csel-btn', type: 'button',
+      'aria-haspopup': 'listbox', 'aria-expanded': 'false'
+    }, [label]);
+    var menu = el('div', { class: 'csel-menu', role: 'listbox', hidden: true });
+    var tip = sel.getAttribute('data-tip');
+    if (tip) { btn.setAttribute('data-tip', tip); sel.removeAttribute('data-tip'); }
+    if (sel.id) btn.setAttribute('data-for', sel.id);
+    /* 先挂标记再搬 DOM，避免 MutationObserver 重复接管 */
+    var c = { sel: sel, wrap: wrap, btn: btn, label: label, menu: menu, items: [], active: -1 };
+    sel.__csel = c;
+    sel.parentNode.insertBefore(wrap, sel);
+    wrap.appendChild(sel);
+    wrap.appendChild(btn);
+    document.body.appendChild(menu);
+    btn.addEventListener('click', function () { cselShow(sel); });
+    btn.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter' || ev.key === ' ' || ev.key === 'ArrowDown' || ev.key === 'ArrowUp') {
+        if (cselOpen && cselOpen.sel === sel) return;   // 已打开时交给 document 上的键盘处理
+        ev.preventDefault();
+        cselShow(sel);
+      }
+    });
+    sel.addEventListener('change', function () { cselRefresh(sel); });
+    cselRefresh(sel);
+    return c;
+  }
+
+  function cselRefreshAll() {
+    $$('select').forEach(function (sel) { if (sel.__csel) cselRefresh(sel); });
+  }
+
+  function initCustomSelects() {
+    if (window.__cselInit) return;
+    window.__cselInit = true;
+    $$('select').forEach(cselEnhance);
+    var mo = new MutationObserver(function (muts) {
+      for (var i = 0; i < muts.length; i++) {
+        var m = muts[i];
+        if (m.type === 'childList') {
+          for (var j = 0; j < m.addedNodes.length; j++) {
+            var n = m.addedNodes[j];
+            if (n.nodeType !== 1) continue;
+            if (n.tagName === 'SELECT') cselEnhance(n);
+            else if (n.querySelectorAll) $$('select', n).forEach(cselEnhance);
+          }
+          if (m.target.tagName === 'SELECT' && m.target.__csel) cselRefresh(m.target);
+        } else if (m.type === 'attributes' && m.target.tagName === 'SELECT' && m.target.__csel) {
+          cselRefresh(m.target);
+        }
+      }
+    });
+    mo.observe(document.body, {
+      childList: true, subtree: true,
+      attributes: true, attributeFilter: ['disabled', 'hidden']
+    });
+  }
+
   /* ================= 弹窗 ================= */
   function modal(cfg) {
     var root = $('#modal-root');
@@ -2636,11 +2838,15 @@
         send(false).then(function (r) {
           if (r.res.status !== 409) return r;
           var why = (r.json && r.json.error) || ('同名版本已存在：' + f.name);
-          if (!window.confirm(why + '\n\n覆盖会重新计算 integrity 并替换已发布版本，确定覆盖？')) {
-            r.declined = true;
-            return r;
-          }
-          return send(true);   // 用户确认后才带 overwrite=1 重试
+          /* 原生 window.confirm 是系统弹窗，样式和项目风格不一致，改用自绘确认框 */
+          return confirmBox({
+            title: '覆盖已发布版本', sub: 'OVERWRITE', danger: true, confirmText: '覆盖',
+            message: why,
+            detail: '覆盖会重新计算 integrity 并替换已发布版本，确定覆盖？'
+          }).then(function (ok) {
+            if (!ok) { r.declined = true; return r; }
+            return send(true);   // 用户确认后才带 overwrite=1 重试
+          });
         }).then(function (r) {
           if (r.declined) {
             bad++; row.className = 'filerow err';
@@ -4341,6 +4547,9 @@
     /* 静态的容器框（面板 / 统计卡）在页面加载后统一铺上背景动效；
      * 弹窗与抽屉在创建时由 modal()/openDetail() 自己插。 */
     $$('.panel,.stat').forEach(decorateFx);
+
+    /* 原生下拉全部换成项目风格自绘按钮 + 深色菜单（含之后动态创建的） */
+    initCustomSelects();
 
     /* 恢复最后一次筛选状态 */
     if ($('#pkg-size')) state.pkg.size = Number($('#pkg-size').value) || 20;

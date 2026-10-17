@@ -488,6 +488,19 @@ select{cursor:pointer;appearance:none;padding-right:26px;
   background-size:5px 5px,5px 5px;background-repeat:no-repeat;}
 textarea{resize:vertical;min-height:66px;line-height:1.6}
 
+/* 去掉浏览器原生小部件（搜索框的清除叉、数字框的上下箭头），统一成项目风格 */
+input[type=search]::-webkit-search-decoration,
+input[type=search]::-webkit-search-cancel-button,
+input[type=search]::-webkit-search-results-button,
+input[type=search]::-webkit-search-results-decoration{display:none;-webkit-appearance:none}
+input[type=number]::-webkit-inner-spin-button,
+input[type=number]::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}
+input[type=number]{-moz-appearance:textfield;appearance:textfield}
+/* 键盘聚焦（Tab）时不要浏览器系统描边，统一成项目青色细框 */
+button:focus-visible,.seg:focus-visible,.pg:focus-visible,.link:focus-visible,
+input[type=checkbox]:focus-visible,label.checkline:focus-visible,
+.dt-nav:focus-visible,.dt-day:focus-visible,.dt-sel:focus-visible{outline:2px solid rgba(46,230,196,.5);outline-offset:2px}
+
 input[type=checkbox]{
   appearance:none;width:14px;height:14px;flex:none;cursor:pointer;
   background:#080d12;border:1px solid var(--line-2);border-radius:1px;
@@ -504,6 +517,51 @@ input[type=checkbox]:disabled{opacity:.4;cursor:not-allowed}
 .row-inline{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .row-inline>input{flex:1;min-width:0}
 .grow{flex:1}
+
+/* ---------- 12.1 自绘下拉（替代原生 select 的系统列表） ----------
+   原生 <select> 展开的列表由浏览器/系统绘制（黑底白块），无法用 CSS 改成项目风格，
+   所以包成「.csel 容器 + .csel-btn 按钮 + .csel-menu 深色菜单」，原生 select 隐藏但保留语义。 */
+.csel{position:relative;display:inline-flex;min-width:0;max-width:100%}
+.csel>select{display:none}
+.csel-btn{
+  position:relative;display:inline-flex;align-items:center;justify-content:space-between;gap:8px;
+  width:100%;min-width:0;padding:6px 26px 6px 9px;cursor:pointer;text-align:left;
+  background:#080d12;border:1px solid var(--line);border-radius:var(--r);
+  color:var(--txt-hi);font-size:12.5px;font-family:var(--body);
+  transition:border-color .15s,box-shadow .15s,background .15s;
+  background-image:linear-gradient(45deg,transparent 50%,var(--txt-dim) 50%),linear-gradient(135deg,var(--txt-dim) 50%,transparent 50%);
+  background-position:calc(100% - 14px) 51%,calc(100% - 9px) 51%;
+  background-size:5px 5px,5px 5px;background-repeat:no-repeat;
+}
+.csel-btn:hover{border-color:var(--line-3)}
+.csel-btn:focus-visible{outline:0;border-color:rgba(46,230,196,.6);box-shadow:0 0 0 2px var(--cy-glow);background-color:#0a1117}
+.csel-btn[aria-expanded=true]{border-color:rgba(46,230,196,.6);box-shadow:0 0 0 2px var(--cy-glow)}
+.csel-btn[disabled]{opacity:.5;cursor:not-allowed}
+.csel-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.field .csel{display:flex;width:100%}
+.row-inline .csel{flex:1;min-width:0;display:flex}
+.selbar .csel{flex:none;display:inline-flex}
+.pager .csel{flex:none;display:inline-flex}
+.cfg-item .csel{display:flex;width:100%}
+.csel-menu{
+  position:fixed;z-index:8700;min-width:62px;max-width:calc(100vw - 16px);max-height:240px;overflow:auto;
+  padding:3px;background:linear-gradient(180deg,#111a23,#0b1016);
+  border:1px solid var(--line-2);border-radius:var(--r);
+  box-shadow:0 12px 32px rgba(0,0,0,.55),0 0 0 1px rgba(0,0,0,.35);
+}
+.csel-menu[hidden]{display:none!important}
+.csel-opt{
+  display:block;width:100%;min-height:24px;padding:4px 9px;text-align:left;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  font-family:var(--body);font-size:12.5px;color:var(--txt-dim);
+  background:transparent;border:1px solid transparent;border-radius:1px;cursor:pointer;
+  transition:background .1s,color .1s,border-color .1s;
+}
+.csel-opt:hover,.csel-opt.is-active{background:rgba(46,230,196,.12);color:var(--txt-hi)}
+.csel-opt.is-sel{background:rgba(46,230,196,.16);border-color:rgba(46,230,196,.45);color:#c9fff4}
+.csel-opt.is-sel:hover,.csel-opt.is-sel.is-active{background:rgba(46,230,196,.22)}
+.selbar .csel-btn{padding:4px 24px 4px 8px;font-size:12px}
+.pager .csel-btn{padding:3px 24px 3px 8px;font-size:11.5px;font-family:var(--mono);color:var(--txt-dim)}
 
 /* 分段控件 */
 .segbar{display:inline-flex;border:1px solid var(--line);border-radius:var(--r);overflow:hidden;background:#080d12;flex-wrap:wrap}

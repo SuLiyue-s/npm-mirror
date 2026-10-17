@@ -711,6 +711,47 @@ async function get(p, { json = false } = {}) {
       cancelCalls >= 5, `出现 ${cancelCalls} 次`);
   }
 
+  console.log('\x1b[1m十之四、原生下拉改自绘 + 全站原生小部件清理\x1b[0m');
+  {
+    const htmlCsel = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
+    const jsCsel = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
+    const cssCsel = fs.readFileSync(path.join(__dirname, '..', 'public', 'style.css'), 'utf8');
+
+    const selectCount = (jsCsel.match(/el\('select'/g) || []).length;
+    check('原生 <select> 全部接管为项目风格自绘下拉（保留原生 select 语义，业务读写零改动）',
+      (htmlCsel.match(/<select/g) || []).length >= 7
+        && /function cselEnhance\(sel\)/.test(jsCsel)
+        && /if \(!sel \|\| sel\.tagName !== 'SELECT' \|\| sel\.__csel\) return;/.test(jsCsel)
+        && /class: 'csel-menu', role: 'listbox', hidden: true/.test(jsCsel)
+        && /sel\.__csel = c;/.test(jsCsel)
+        && /function cselShow\(sel\)/.test(jsCsel)
+        && /function initCustomSelects\(\)/.test(jsCsel)
+        && /new MutationObserver\(/.test(jsCsel)
+        && /initCustomSelects\(\);/.test(jsCsel)
+        && selectCount >= 2,
+      `index.html 原生 select ${(htmlCsel.match(/<select/g) || []).length} 个 / app.js 动态 select ${selectCount} 个`);
+
+    check('自绘下拉样式对齐项目：按钮替身 + 深色菜单 + 悬浮/选中青色，键盘与点外关闭并触发原生 change',
+      /\.csel>select\{display:none\}/.test(cssCsel)
+        && /\.csel-btn\{[\s\S]*?padding:6px 26px 6px 9px;/.test(cssCsel)
+        && /\.csel-menu\{[\s\S]*?position:fixed;z-index:8700/.test(cssCsel)
+        && /\.csel-opt\.is-sel\{background:rgba\(46,230,196,\.16\)/.test(cssCsel)
+        && /\.csel-opt:hover,\.csel-opt\.is-active\{background:rgba\(46,230,196,\.12\)/.test(cssCsel)
+        && /function cselOnKey\(ev\)/.test(jsCsel)
+        && /ev\.key === 'ArrowDown' \|\| ev\.key === 'ArrowUp'/.test(jsCsel)
+        && /sel\.dispatchEvent\(new Event\('change', \{ bubbles: true \}\)\)/.test(jsCsel)
+        && /function cselOnDown\(ev\)/.test(jsCsel)
+        && /function cselPlace\(c\)/.test(jsCsel));
+
+    check('原生小部件（搜索框清除叉、数字框上下箭头）已收掉，原生 confirm 换成项目风格确认框',
+      /input\[type=search\]::-webkit-search-cancel-button/.test(cssCsel)
+        && /input\[type=number\]::-webkit-inner-spin-button/.test(cssCsel)
+        && /-moz-appearance:textfield/.test(cssCsel)
+        && /:focus-visible\{outline:2px solid rgba\(46,230,196,\.5\);outline-offset:2px\}/.test(cssCsel)
+        && !/window\.confirm\(/.test(jsCsel)
+        && /title: '覆盖已发布版本', sub: 'OVERWRITE', danger: true, confirmText: '覆盖'/.test(jsCsel));
+  }
+
   console.log(`\n\x1b[1m结果：${pass}/${pass + fail} 通过\x1b[0m\n`);
   finish(fail === 0 ? 0 : 1);
 })().catch((e) => { console.error('自检异常：', e); finish(1); });
