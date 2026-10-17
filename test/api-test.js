@@ -122,7 +122,7 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
   // 清理上一轮遗留的「自检专用」数据（mirror-selftest-* 只可能由本脚本创建，删掉是安全的）。
   // 注意：不在开头删 ms / lodash 等真实公共包——它们是用户镜像里的真实数据，
   // 旧版本这里会误删用户缓存的 tarball。需要临时造前置条件的用例改为「先快照、收尾恢复」。
-  for (const n of [PRIVATE, PRIVATE2, 'mirror-selftest-upload', 'mirror-selftest-json']) {
+  for (const n of [PRIVATE, PRIVATE2, 'mirror-selftest-upload', 'mirror-selftest-json', 'mirror-selftest-autodeps-fail', 'mirror-selftest-autodeps-ok']) {
     try { await api(`/__admin/api/packages/${encodeURIComponent(n)}`, { method: 'DELETE' }); } catch { /* 忽略 */ }
   }
   // ms 是本脚本要用到的真实公共包：记录测试前是否已存在，收尾时只在「原本不存在」时才删掉自己加的。
@@ -1204,7 +1204,7 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
     const bundleFiles = [];
     if (cand) {
       const ex1 = await api('/__admin/api/bundles/export', {
-        method: 'POST', body: { scope: 'selected', names: [cand], withDeps: true }, timeoutMs: 300000,
+        method: 'POST', body: { scope: 'selected', names: [cand], withDeps: true, autoFetchDeps: false }, timeoutMs: 300000,
       });
       const d1 = (ex1.json && ex1.json.data) || {};
       if (d1.file) bundleFiles.push(d1.file);
@@ -1240,6 +1240,144 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
     await st2.close();
   }
 
+  // ------------------------------------------------ 导出时自动下载缺失依赖
+  section('六之三之二、导出时自动下载镜像里没有的依赖（autoFetchDeps）');
+  {
+    const bundleModF = require('../src/bundle');
+    const FAIL_ROOT = 'mirror-selftest-autodeps-fail';
+    const OK_ROOT = 'mirror-selftest-autodeps-ok';
+    const MISSING_DEP = 'mirror-selftest-missing-dep-zzz';
+    const madeBundlesF = [];
+
+    async function uploadTgz(pkg, file, version) {
+      return api('/__admin/api/upload?overwrite=1', {
+        method: 'POST', raw: file.buffer, timeoutMs: 60000,
+        headers: { 'X-Filename': encodeURIComponent(`${pkg}-${version}.tgz`), 'Content-Type': 'application/octet-stream' },
+      });
+    }
+    async function waitTaskF(id, timeoutMs = 180000) {
+      const t0 = Date.now();
+      while (Date.now() - t0 < timeoutMs) {
+        const r = await api('/__admin/api/tasks/' + id);
+        const d = r.json && r.json.data;
+        if (d && d.status !== 'running') return d;
+        await util.sleep(200);
+      }
+      return null;
+    }
+
+    // 1) 前置：造一个「依赖在上游一定不存在」的包。下载必定失败，但导出必须照常成功并说明原因
+    const failTgz = await makeTarball(tmpDir, { name: FAIL_ROOT, version: '1.0.0', description: '自检：依赖缺失', dependencies: { [MISSING_DEP]: '^1.0.0' } });
+    const upF = await uploadTgz(FAIL_ROOT, failTgz, '1.0.0');
+    check('造前置条件：上传「依赖不存在」的自检包', upF.status === 200, `status=${upF.status} ${upF.text.slice(0, 120)}`);
+
+    const exF = await api('/__admin/api/bundles/export', {
+      method: 'POST', body: { scope: 'selected', names: [FAIL_ROOT], withDeps: true }, timeoutMs: 180000,
+    });
+    const dF = (exF.json && exF.json.data) || {};
+    if (dF.file) madeBundlesF.push(dF.file);
+    check('依赖下载失败不会让导出失败：离线包照常生成',
+      exF.status === 200 && !!dF.file && Number(dF.packages) >= 1,
+      `status=${exF.status} file=${dF.file} packages=${dF.packages} ${exF.text.slice(0, 140)}`);
+    check('下载失败的依赖留在 missingDeps 里，并附上具体原因（不再只说「不在镜像里」）',
+      Array.isArray(dF.missingDeps) && dF.missingDeps.some((m) => m.name === MISSING_DEP && String(m.reason || '').length > 0),
+      `missingDeps=${JSON.stringify((dF.missingDeps || []).slice(0, 2))}`);
+    check('导出结果带 autoFetch 明细（未联网时是 skippedReason）',
+      dF.autoFetch === null || (dF.autoFetch && 'mode' in dF.autoFetch),
+      `autoFetch=${JSON.stringify(dF.autoFetch)}`);
+    if (dF.file) {
+      let manF = null;
+      try { manF = await bundleModF.readBundleManifest(path.join(bundleModF.bundleDir(), dF.file)); } catch { manF = null; }
+      check('离线包 manifest 记录 autoFetch 摘要（拿到别的机器也能看清哪些依赖没导出）',
+        !!manF && !!manF.stats && Number(manF.stats.depsMissing) >= 1 && 'autoFetch' in manF,
+        `stats=${JSON.stringify(manF && manF.stats)}`);
+    }
+
+    // 2) 显式 autoFetchDeps:false：不联网、保持老行为
+    const exN = await api('/__admin/api/bundles/export', {
+      method: 'POST', body: { scope: 'selected', names: [FAIL_ROOT], withDeps: true, autoFetchDeps: false }, timeoutMs: 180000,
+    });
+    const dN = (exN.json && exN.json.data) || {};
+    if (dN.file) madeBundlesF.push(dN.file);
+    check('autoFetchDeps:false 时完全不尝试下载（结果无 autoFetch 明细，缺的依赖照旧列在 missingDeps）',
+      exN.status === 200 && dN.autoFetch === null && (dN.missingDeps || []).some((m) => m.name === MISSING_DEP),
+      `status=${exN.status} autoFetch=${JSON.stringify(dN.autoFetch)}`);
+
+    // 3) 进度任务模式（界面用的路径）同样支持自动补依赖
+    const tq = await api('/__admin/api/bundles/export', {
+      method: 'POST', body: { scope: 'selected', names: [FAIL_ROOT], withDeps: true, progress: true }, timeoutMs: 30000,
+    });
+    const tqd = (tq.json && tq.json.data) || {};
+    check('progress:true 模式下自动补依赖走同一套逻辑（任务能正常收尾）',
+      tq.status === 200 && !!tqd.taskId, `status=${tq.status} ${tq.text.slice(0, 120)}`);
+    if (tqd.taskId) {
+      const task = await waitTaskF(tqd.taskId);
+      const tr = (task && task.result) || {};
+      if (tr.file) madeBundlesF.push(tr.file);
+      check('导出进度任务 status=done，且结果里同样有 missingDeps 原因',
+        !!task && task.status === 'done' && (tr.missingDeps || []).some((m) => m.name === MISSING_DEP),
+        `status=${task && task.status} missing=${JSON.stringify((tr.missingDeps || []).slice(0, 2))}`);
+    }
+
+    // 4) cache/proxy 模式 + 上游可达：缺失依赖自动下载入库，再一起打包导出
+    let upstreamOk = false;
+    if (cfg.mode !== 'offline') {
+      try {
+        const reg = String((cfg.upstream && cfg.upstream.registry) || '').replace(/\/+$/, '');
+        const probe = await fetch(`${reg}/left-pad`, { headers: { Accept: 'application/vnd.npm.install-v1+json' }, signal: AbortSignal.timeout(8000) });
+        upstreamOk = probe.ok;
+      } catch { upstreamOk = false; }
+    }
+    if (!upstreamOk) {
+      skip('自动下载缺失依赖并入库后再导出（cache 模式）', cfg.mode === 'offline' ? '当前是离线模式' : '上游源不可达');
+    } else {
+      let candF = '';
+      for (const c of ['left-pad', 'is-odd', 'is-even', 'is-buffer', 'kind-of']) {
+        const rc = await api('/__admin/api/packages/' + encodeURIComponent(c));
+        if (rc.status === 404) { candF = c; break; }
+      }
+      check('能找到「镜像里没有、但上游有」的依赖包作为测试对象', !!candF, `dep=${candF}`);
+      if (candF) {
+        const okTgz = await makeTarball(tmpDir, { name: OK_ROOT, version: '1.0.0', description: '自检：自动补依赖', dependencies: { [candF]: 'latest' } });
+        const upO = await uploadTgz(OK_ROOT, okTgz, '1.0.0');
+        check('造前置条件：上传依赖缺失但上游存在的自检包', upO.status === 200, `status=${upO.status} ${upO.text.slice(0, 120)}`);
+        const exO = await api('/__admin/api/bundles/export', {
+          method: 'POST', body: { scope: 'selected', names: [OK_ROOT], withDeps: true }, timeoutMs: 300000,
+        });
+        const dO = (exO.json && exO.json.data) || {};
+        if (dO.file) madeBundlesF.push(dO.file);
+        check(`导出时自动下载缺失依赖并入库（${candF}，depsFetched=${dO.depsFetched}）`,
+          exO.status === 200 && Number(dO.depsFetched) >= 1 && Number(dO.packages) >= 2,
+          `status=${exO.status} depsFetched=${dO.depsFetched} packages=${dO.packages} `
+          + `downloaded=${JSON.stringify(((dO.autoFetch && dO.autoFetch.downloaded) || []).map((x) => x.name + '@' + x.version))} `
+          + `missing=${JSON.stringify((dO.missingDeps || []).slice(0, 2))}`);
+        const rc2 = await api('/__admin/api/packages/' + encodeURIComponent(candF));
+        check(`自动下载的依赖真的写进了镜像存储（GET /packages/${candF} → 200）`, rc2.status === 200, `status=${rc2.status}`);
+        if (dO.file) {
+          let manO = null;
+          try { manO = await bundleModF.readBundleManifest(path.join(bundleModF.bundleDir(), dO.file)); } catch { manO = null; }
+          const innerO = manO && manO.packages ? manO.packages.map((p) => p.name) : [];
+          check(`离线包里真的含自动下载的依赖 ${candF}`,
+            innerO.includes(candF) && innerO.includes(OK_ROOT),
+            `packages=${innerO.slice(0, 8).join('、')}`);
+        }
+        // 收尾：把自动下载进来的依赖（可能包含传递依赖）全删掉，恢复到导出前的状态
+        const fetchedNames = Array.from(new Set(((dO.autoFetch && dO.autoFetch.downloaded) || []).map((x) => x.name)));
+        if (!fetchedNames.length) fetchedNames.push(candF);
+        for (const n of fetchedNames) await api('/__admin/api/packages/' + encodeURIComponent(n), { method: 'DELETE' });
+        const leftovers = [];
+        for (const n of fetchedNames) {
+          const rr = await api('/__admin/api/packages/' + encodeURIComponent(n));
+          if (rr.status !== 404) leftovers.push(n);
+        }
+        check('收尾：自动下载的依赖（含传递依赖）都清理干净了，不会污染镜像',
+          leftovers.length === 0, `fetched=${fetchedNames.join('、')} leftovers=${leftovers.join('、')}`);
+      }
+    }
+
+    for (const f of madeBundlesF) await api(`/__admin/api/bundles?file=${encodeURIComponent(f)}`, { method: 'DELETE' });
+    for (const n of [FAIL_ROOT, OK_ROOT]) await api(`/__admin/api/packages/${encodeURIComponent(n)}`, { method: 'DELETE' });
+  }
   // ---------------------------------------------------------------- 导出 / 导入的详细进度任务
   section('六之四、导出 / 导入备份的详细进度任务（progress:true → taskId）');
   {
@@ -1822,7 +1960,7 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
   section('十一、收尾：清除本次自检产生的数据');
   {
     // mirror-selftest-* 是本脚本自建包，收尾删掉，避免长期占用存储空间
-    for (const n of [PRIVATE, PRIVATE2, 'mirror-selftest-upload', 'mirror-selftest-json']) {
+    for (const n of [PRIVATE, PRIVATE2, 'mirror-selftest-upload', 'mirror-selftest-json', 'mirror-selftest-autodeps-fail', 'mirror-selftest-autodeps-ok']) {
       try { await api(`/__admin/api/packages/${encodeURIComponent(n)}`, { method: 'DELETE' }); } catch { /* 忽略 */ }
     }
     const gone = await api(`/__admin/api/packages/${encodeURIComponent(PRIVATE)}`);

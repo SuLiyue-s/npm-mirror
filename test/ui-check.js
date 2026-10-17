@@ -192,6 +192,18 @@ async function get(p, { json = false } = {}) {
     check('导出结果会提示连带依赖数量、缺的依赖会提醒先补进镜像',
       /含连带依赖/.test(js.text) && /missingDeps/.test(js.text));
 
+    // ①-b 镜像里没有的依赖：cache 模式下自动下载入库后再导出
+    const autoHtml = /id="exp-auto-fetch"/.test(home.text) && /自动从上游下载并入库/.test(home.text);
+    check('导出区有「镜像里没有的依赖自动从上游下载并入库」勾选框', autoHtml);
+    const autoJs = /payload\.autoFetchDeps/.test(js.text) && /depsFetched/.test(js.text);
+    check('前端把 autoFetchDeps 透传给后端，并在结果里展示自动下载数量', autoJs);
+    const bundleSrcAuto = fs.readFileSync(path.join(__dirname, '..', 'src', 'bundle.js'), 'utf8');
+    const autoBack = /autoFetchDeps/.test(apiSrc) && /function autoFillDeps\s*\(/.test(bundleSrcAuto)
+      && /pullTarballs/.test(bundleSrcAuto) && /resolveClosure/.test(bundleSrcAuto);
+    check('后端 cache/proxy 模式下自动补依赖（autoFillDeps → resolveClosure + pullTarballs），接口透传 autoFetchDeps', autoBack);
+    check('自动补依赖失败不会中断导出：失败原因写进 missingDeps.reason，离线/未联网时给 skippedReason',
+      /自动下载失败/.test(bundleSrcAuto) && /纯离线模式/.test(bundleSrcAuto) && /skippedReason/.test(bundleSrcAuto));
+
     // ② 本机 npm 缓存导入：分页 + 全部导入 + 仅导入不存在的包 + 提示 bug 修复
     const scanBtns = ['scan-import-new', 'scan-import-all', 'scan-pager'].every((id) => new RegExp(`id="${id}"`).test(home.text));
     check('缓存导入区有「仅导入不存在的包」「全部导入」与分页容器', scanBtns

@@ -13,7 +13,7 @@
 
 - **公共包缓存**：`npm install` 走本镜像时自动回源上游（默认 `https://registry.npmmirror.com`）并缓存元数据与 tarball；支持 `cache`（本地优先）/ `proxy`（过期即回源）/ `offline`（纯离线）三种模式
 - **私有包仓库**：支持 `npm publish`、`npm unpublish`、`npm deprecate`、`npm dist-tag`，私有包与上游同名包隔离，不会混淆
-- **离线迁移**：导出整个镜像为单个 `.tgz` bundle，拷贝到无网络电脑后导入；也支持直接导入本机 `~/.npm/_cacache` 已有缓存。**导出和导入都有详细进度弹窗**：一条总进度（导出按字节/文件数，导入按解包字节与包数）+ 逐包明细（已打包 / 新增 / 失败 / 跳过）+ 当前包的大进度条，长任务可取消。**导出/导入都支持多包并行**（默认 4 路，可配置），备份再导入不会因为 tarball 根目录名不叫 `package/` 而误判成坏包（`@types/*` 这类历史包也能正常导入）。**导入结束后弹窗底部会整理出一块「导入结果详情」**：失败逐条列出（`包名@版本：原因`）、跳过按原因归类计数，右上角一键复制清单，不用再去左栏一条条翻。
+- **离线迁移**：导出整个镜像为单个 `.tgz` bundle，拷贝到无网络电脑后导入；也支持直接导入本机 `~/.npm/_cacache` 已有缓存。**导出选中包时默认连带递归依赖，镜像里没有的依赖会在联网模式下自动从上游下载并入库再一起打包**；下载失败不会中断导出，失败依赖会连原因一起记进 bundle 清单并在界面/命令行提示。**导出和导入都有详细进度弹窗**：一条总进度（导出按字节/文件数，导入按解包字节与包数）+ 逐包明细（已打包 / 新增 / 失败 / 跳过）+ 当前包的大进度条，长任务可取消。**导出/导入都支持多包并行**（默认 4 路，可配置），备份再导入不会因为 tarball 根目录名不叫 `package/` 而误判成坏包（`@types/*` 这类历史包也能正常导入）。**导入结束后弹窗底部会整理出一块「导入结果详情」**：失败逐条列出（`包名@版本：原因`）、跳过按原因归类计数，右上角一键复制清单，不用再去左栏一条条翻。
 - **可视化管理界面**：概览、包管理、迁移备份（含本机缓存导入）、配置、日志、服务控制共 6 个页面，中文界面，全按钮操作；包详情、依赖解析、任务进度以抽屉/弹窗呈现
 - **补齐工具链**：按版本 / 只补最新 / 全部包批量补 tarball，递归添加依赖（含 `npm:` 别名），后台任务可看进度、可取消
 - **零依赖实现**：HTTP 服务、tar.gz 打包解包、semver 比较、npm 协议、断点与完整性校验全部手写，无任何第三方包
@@ -82,7 +82,7 @@ registry=http://127.0.0.1:4873/
 | `node cli.js add <包名[@版本]> [--with-deps] [--depth 8] [--limit 300]` | 添加公共包（可递归依赖） |
 | `node cli.js remove <包名> [--version 1.2.3] [--yes]` | 删除包或单个版本 |
 | `node cli.js stats` | 统计包 / 版本 / 占用空间 |
-| `node cli.js export [--scope all\|private\|upstream] [--out 文件名] [包名...]` | 导出离线 bundle |
+| `node cli.js export [--scope all\|private\|upstream\|selected] [--out 文件名] [--no-deps] [--no-fetch-deps] [包名...]` | 导出离线 bundle（选中包默认连带依赖并自动补齐缺失依赖） |
 | `node cli.js import <文件.tgz\|文件.json> [--overwrite]` | 导入离线 bundle |
 | `node cli.js scan-cache [--cache 目录] [--any-registry] [--refresh]` | 扫描本机 npm 缓存 |
 | `node cli.js import-cache [--all] [--overwrite] [包名...]` | 从本机 npm 缓存导入 |
@@ -97,12 +97,17 @@ registry=http://127.0.0.1:4873/
 # 有网电脑：导出整个镜像（单个 .tgz，含全部包与元数据）
 node cli.js export --scope all --out npm-mirror-all.tgz
 
+# 只带走项目用到的包：选中包 + 递归依赖（镜像里没有的依赖会自动下载入库）
+node cli.js export --scope selected --out npm-mirror-used.tgz lodash express
+
 # 拷贝 npm-mirror-all.tgz 到无网络电脑后：
 node cli.js init          # 首次使用先初始化
 node cli.js start         # 启动服务
 # 然后打开管理界面「迁移备份」页导入，或执行：
 node cli.js import npm-mirror-all.tgz
 ```
+
+> 导出选中包（`--scope selected` + 包名，或界面里勾选包后点「导出选中」）默认连带递归依赖。`cache`/`proxy` 模式下，镜像里没有的依赖会自动从上游下载并入库后再一起打包；下载失败不会中断导出，失败项会写进 bundle 清单的 `missingDeps`（带原因）和 `autoFetch` 摘要，界面与命令行都会提示。`--no-deps` 关闭连带依赖，`--no-fetch-deps` 只连带已经在本地的依赖、不自动下载。纯 `offline` 模式不会联网，只会在结果里提示缺哪些依赖。
 
 > 导入/导出不依赖服务运行；离线机器建议把 `mode` 设为 `offline`，或把 `upstream.registry` 指向内网可达的源。
 
@@ -182,8 +187,8 @@ pwsh -File test/acceptance-npm.ps1   # 真实 npm 客户端验收（Windows / Po
 
 | 脚本 | 内容 | 最近结果（2026-10-17，本机） |
 | --- | --- | --- |
-| `test/api-test.js` | npm 协议、管理接口、发布/删除、离线导入导出、进度任务、并行导出导入与根目录/版本写法兼容、安全回归等 187 项 | **183 通过 + 4 跳过，0 失败** |
-| `test/ui-check.js` | 前端与后端接口/页面元素契约（含导入结果的失败/跳过详情面板、favicon 声明） | **93/93 通过** |
+| `test/api-test.js` | npm 协议、管理接口、发布/删除、离线导入导出、进度任务、并行导出导入与根目录/版本写法兼容、导出时自动补齐缺失依赖、安全回归等 201 项 | **197 通过 + 4 跳过，0 失败** |
+| `test/ui-check.js` | 前端与后端接口/页面元素契约（含导入结果的失败/跳过详情面板、导出自动补依赖勾选项、favicon 声明） | **97/97 通过** |
 | `test/tray-check.js` | 托盘脚本/项目图标/启动脚本/favicon 路由契约，并真跑一次托盘自检（Windows） | **33/33 通过** |
 | `test/tray-e2e.ps1` | 托盘端到端：隔离副本启动 → 窗口隐藏 → 可重新显示 → 停服务后托盘退出并关窗 | **8/8 通过（手工）** |
 | `test/acceptance-npm.ps1` | 真实 `npm install / publish / dist-tag / deprecate / unpublish` | **16/16 通过** |

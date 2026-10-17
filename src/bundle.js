@@ -9,6 +9,7 @@ const {
 } = require('./util');
 const tar = require('./tar');
 const deps = require('./deps');
+const pull = require('./pull');
 
 const FORMAT = 'npm-private-mirror-bundle';
 const FORMAT_VERSION = 1;
@@ -131,12 +132,147 @@ function collectDepClosure(store, roots, { max = DEPS_MAX_PACKAGES } = {}) {
   return { names: out, added, missing: Array.from(missing.values()) };
 }
 
+/** 导出时自动补依赖的默认预算（可在请求里用 autoDeps 覆盖；limit 同时受 DEPS_MAX_PACKAGES 约束） */
+const AUTO_DEPS = { limit: 300, concurrency: 6, maxRounds: 3 };
+
+/** 把 missing 里的「包 + 版本范围」还原成 resolveClosure 认得的 spec；没有范围就取 latest */
+function depSpecOf(m) {
+  const range = String(m.range || '').trim();
+  if (!range || range === '*' || range === 'latest') return m.name;
+  return `${m.name}@${range}`;
+}
+
+/**
+ * 导出 scope=selected + withDeps 时，把「镜像里还没有的依赖」自动从上游补齐（元数据 + tarball）。
+ * 逐轮：求依赖闭包 → 解析还缺的包的版本（落 packument）→ 下载 tarball → 再求闭包，直到补齐或达上限。
+ * 原则：导出本体优先 —— 任何下载/解析失败都只记进返回值，不向外抛（导出照常继续，失败项在 missingDeps.reason 里说明）。
+ */
+async function autoFillDeps({ ctx, store, roots, logger, emit = () => {}, isCanceled, opts = {} }) {
+  const stop = () => !!(isCanceled && isCanceled());
+  const mode = (ctx && typeof ctx.cfg === 'function' && (ctx.cfg() || {}).mode) || 'cache';
+  const limit = Math.max(1, Math.min(DEPS_MAX_PACKAGES, Math.round(Number(opts.limit) || AUTO_DEPS.limit)));
+  const concurrency = Math.max(1, Math.min(32, Math.round(Number(opts.concurrency) || AUTO_DEPS.concurrency)));
+  const maxRounds = Math.max(1, Math.min(10, Math.round(Number(opts.maxRounds) || AUTO_DEPS.maxRounds)));
+  const res = { enabled: true, mode, limit, attempted: 0, downloaded: [], failed: [], canceled: false, skippedReason: '' };
+  if (!ctx || !ctx.registry || !ctx.upstream) {
+    res.skippedReason = '当前调用没有联网上下文，未自动下载缺失依赖';
+    emit({ phase: 'deps-fetch', status: 'skipped', total: 0, downloaded: 0, failed: 0, message: res.skippedReason });
+    return res;
+  }
+  if (mode === 'offline') {
+    res.skippedReason = '当前是纯离线模式（offline），不会自动下载缺失依赖';
+    emit({ phase: 'deps-fetch', status: 'skipped', total: 0, downloaded: 0, failed: 0, message: res.skippedReason });
+    return res;
+  }
+  const tried = new Set();     // 已经尝试过的包名：每轮只处理新出现的缺失包，避免重复撞同一个失败
+  const seen = new Set();      // 已下载成功的 name@version
+  let remaining = limit;
+  for (let round = 0; round < maxRounds; round++) {
+    if (stop()) { res.canceled = true; break; }
+    const missing = collectDepClosure(store, roots).missing.filter(m => !m.reason && !tried.has(m.name));
+    const todo = [];
+    for (const m of missing) {
+      if (remaining <= 0) break;
+      tried.add(m.name);
+      remaining--;
+      res.attempted++;
+      todo.push(m);
+    }
+    if (!todo.length) break;
+    emit({
+      phase: 'deps-fetch', status: 'resolve', total: todo.length, done: 0,
+      downloaded: res.downloaded.length, failed: res.failed.length,
+      message: `正在解析缺失依赖（${todo.length} 个，第 ${round + 1} 轮）…`,
+    });
+    const parentOf = (name) => { const t = todo.find(x => x.name === name); return t ? t.parent : ''; };
+    let resolved = null;
+    try {
+      resolved = await deps.resolveClosure(ctx, todo.map(depSpecOf), {
+        depth: 0, limit: Math.max(1, todo.length), persist: true, publishTime: false, shouldStop: stop,
+      });
+    } catch (e) {
+      for (const m of todo) res.failed.push({ name: m.name, range: m.range, parent: m.parent, error: `解析依赖失败：${(e && e.message) || e}` });
+      if (stop()) res.canceled = true;
+      break;
+    }
+    if (stop()) res.canceled = true;
+    for (const u of (resolved && resolved.unresolved) || []) {
+      if (res.failed.length >= 200) break;
+      res.failed.push({ name: u.name, range: u.range || '', parent: u.parent || '', error: u.error || '无法解析出版本' });
+    }
+    for (const e of (resolved && resolved.errors) || []) {
+      if (res.failed.length >= 200) break;
+      res.failed.push({ name: e.name, range: e.range || '', parent: e.parent || '', error: e.error || '获取包元数据失败' });
+    }
+    const picks = ((resolved && resolved.picks) || []).filter(p => p && p.name && p.version);
+    if (!picks.length) { if (res.canceled) break; continue; }
+    emit({
+      phase: 'deps-fetch', status: 'download', total: picks.length, done: 0,
+      downloaded: res.downloaded.length, failed: res.failed.length,
+      message: `正在下载缺失依赖 0 / ${picks.length} 个…`,
+    });
+    let dl = null;
+    try {
+      dl = await pull.pullTarballs(ctx, {
+        names: Array.from(new Set(picks.map(p => p.name))),
+        mode: 'selected',
+        selected: picks.map(p => ({ name: p.name, version: p.version })),
+        concurrency,
+        shouldStop: stop,
+        onProgress: (info) => {
+          const doneN = (info && info.done) || 0;
+          emit({
+            phase: 'deps-fetch', status: 'download', total: picks.length, done: doneN,
+            bytes: (info && info.bytes) || 0,
+            downloaded: res.downloaded.length, failed: res.failed.length,
+            message: `正在下载缺失依赖 ${doneN} / ${picks.length} 个…`,
+          });
+        },
+      });
+    } catch (e) {
+      for (const p of picks) {
+        if (res.failed.length >= 200) break;
+        res.failed.push({ name: p.name, range: p.range || '', parent: parentOf(p.name), error: `下载依赖失败：${(e && e.message) || e}` });
+      }
+      if (stop()) res.canceled = true;
+      if (res.canceled) break;
+      continue;
+    }
+    const dlErr = (name, version) => {
+      const hit = ((dl && dl.errors) || []).find(x => x.name === name && x.version === version);
+      return hit ? hit.error : '';
+    };
+    for (const p of picks) {
+      const key = `${p.name}@${p.version}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (store.hasTarball(p.name, p.version)) {
+        res.downloaded.push({ name: p.name, version: p.version, range: p.range || '', parent: parentOf(p.name) });
+        if (logger && logger.info) logger.info(`导出时自动下载依赖 ${key}`);
+      } else if (res.failed.length < 200) {
+        res.failed.push({
+          name: p.name, version: p.version, range: p.range || '', parent: parentOf(p.name),
+          error: dlErr(p.name, p.version) || '未能下载 tarball（上游可能没有这个版本的包文件）',
+        });
+      }
+    }
+    if (dl && dl.canceled) { res.canceled = true; break; }
+    if (stop()) { res.canceled = true; break; }
+  }
+  return res;
+}
+
 /**
  * 导出 bundle
  * @param {object} o
+ * @param {object} [o.ctx] 服务上下文（需要 { cfg, store, registry, upstream, log }）；
+ *   给了 ctx 且当前不是纯离线模式时，withDeps 缺的依赖会被自动下载并写进镜像，再一起导出
  * @param {boolean} [o.withDeps] scope='selected' 时把被选包的（递归）依赖也一起导出
+ * @param {boolean} [o.autoFetchDeps=true] 是否自动下载镜像里缺失的依赖（仅 withDeps 生效）
+ * @param {object} [o.autoDeps] 自动补依赖的预算 { limit=300, concurrency=6, maxRounds=3 }
  * @param {function} [o.onProgress] 进度回调：
  *   { phase:'collect-start', total }                      开始统计要导出的包
+ *   { phase:'deps-fetch', status, total, done, message }   正在自动补齐缺失依赖（status=resolve/download/skipped）
  *   { phase:'collect-done', packages, entries, totalBytes } 统计/文件清单准备完成
  *   { phase:'pack', entriesDone, entriesTotal, bytes, totalBytes, pkg, pkgDone, pkgTotal }
  *   { phase:'package', name, status:'packed', tarballs, versions, sizeBytes }  某个包的全部条目已写入
@@ -144,7 +280,8 @@ function collectDepClosure(store, roots, { max = DEPS_MAX_PACKAGES } = {}) {
  * @param {number} [o.concurrency=1] 打包并发：>1 时按体积切成多段并行 gzip 压缩（产物仍是标准 tar.gz）
  */
 async function exportBundle({
-  store, scope = 'all', names = [], fileName, withDeps = false, logger, onProgress, isCanceled, concurrency = 1,
+  store, ctx = null, scope = 'all', names = [], fileName, withDeps = false,
+  autoFetchDeps = true, autoDeps = null, logger, onProgress, isCanceled, concurrency = 1,
 }) {
   const emit = (ev) => {
     if (!onProgress) return;
@@ -167,10 +304,27 @@ async function exportBundle({
   const roots = targets.slice();
   let depsAdded = 0;
   let missingDeps = [];
+  let autoFetch = null;
   if (withDeps && scope === 'selected' && roots.length) {
-    const closure = collectDepClosure(store, roots);
+    let closure = collectDepClosure(store, roots);
+    // 镜像里没有的依赖：cache/proxy 模式自动从上游下载并入库；离线模式只提示、不下载
+    if (autoFetchDeps && closure.missing.length) {
+      autoFetch = await autoFillDeps({ ctx, store, roots, logger, emit, isCanceled, opts: autoDeps || {} });
+      if (!autoFetch.skippedReason) closure = collectDepClosure(store, roots);
+    }
     depsAdded = closure.added;
-    missingDeps = closure.missing;
+    // 给仍然缺的依赖补一句人话原因，前端/CLI/告警文案直接展示
+    missingDeps = closure.missing.map((m) => {
+      if (m.reason) return m;
+      if (autoFetch) {
+        const f = autoFetch.failed.find(x => x.name === m.name);
+        if (f) return { ...m, reason: `自动下载失败：${f.error}` };
+        if (autoFetch.canceled) return { ...m, reason: '导出被取消，依赖没有下载完' };
+        if (autoFetch.skippedReason) return { ...m, reason: autoFetch.skippedReason };
+        if (autoFetch.attempted >= autoFetch.limit) return { ...m, reason: `超过自动下载上限（${autoFetch.limit} 个包），未自动下载` };
+      }
+      return m;
+    });
     targets = Array.from(new Set([...roots, ...closure.names])).sort();
   }
 
@@ -247,7 +401,14 @@ async function exportBundle({
     scope,
     withDeps: !!withDeps,
     roots,
-    stats: { packages: manifestPackages.length, versions, tarballs, tarballBytes: bytes, depsAdded, depsMissing: missingDeps.length },
+    stats: { packages: manifestPackages.length, versions, tarballs, tarballBytes: bytes, depsAdded, depsFetched: autoFetch ? autoFetch.downloaded.length : 0, depsMissing: missingDeps.length },
+    // 自动补依赖的结果摘要（失败明细放顶层，限制条数，避免 manifest 过大）
+    autoFetch: autoFetch ? {
+      mode: autoFetch.mode, attempted: autoFetch.attempted, downloaded: autoFetch.downloaded.length,
+      failed: autoFetch.failed.length, canceled: autoFetch.canceled, skippedReason: autoFetch.skippedReason,
+      downloadedPackages: autoFetch.downloaded.slice(0, 200).map(d => `${d.name}@${d.version}`),
+      failedPackages: autoFetch.failed.slice(0, 200),
+    } : null,
     missingDeps: missingDeps.slice(0, 200),
     packages: manifestPackages,
   };
@@ -315,7 +476,12 @@ async function exportBundle({
     },
   });
   fs.renameSync(tmpPath, finalPath);
-  if (logger) logger.info(`导出离线包完成: ${finalName} (${manifestPackages.length} 个包 / ${tarballs} 个 tarball${depsAdded ? ` / 含依赖 ${depsAdded} 个` : ''})`);
+  const fetchedN = autoFetch ? autoFetch.downloaded.length : 0;
+  if (logger) {
+    logger.info(`导出离线包完成: ${finalName} (${manifestPackages.length} 个包 / ${tarballs} 个 tarball${depsAdded ? ` / 含依赖 ${depsAdded} 个` : ''}${fetchedN ? ` / 自动下载依赖 ${fetchedN} 个` : ''})`);
+    if (autoFetch && autoFetch.failed.length) logger.warn(`导出时有 ${autoFetch.failed.length} 个依赖没能自动下载：${autoFetch.failed.slice(0, 8).map(f => `${f.name}${f.version ? `@${f.version}` : ''}（${f.error}）`).join('、')}${autoFetch.failed.length > 8 ? ' …' : ''}`);
+    if (autoFetch && autoFetch.skippedReason) logger.warn(`导出时未自动下载缺失依赖：${autoFetch.skippedReason}`);
+  }
   return {
     file: finalName,
     path: finalPath,
@@ -327,7 +493,9 @@ async function exportBundle({
     withDeps: !!withDeps,
     roots: roots.length,
     depsAdded,
+    depsFetched: fetchedN,
     missingDeps,
+    autoFetch,
   };
 }
 
@@ -700,5 +868,5 @@ function listBundles() {
 module.exports = {
   FORMAT, FORMAT_VERSION, bundleDir, exportBundle, importBundle, importTarballFile,
   importPackumentJson, readBundleManifest, listBundles, safeFileName,
-  depTargetName, collectDepClosure, DEPS_MAX_PACKAGES,
+  depTargetName, collectDepClosure, autoFillDeps, AUTO_DEPS, DEPS_MAX_PACKAGES,
 };

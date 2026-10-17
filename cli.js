@@ -148,7 +148,8 @@ commands.help = function () {
     '                                递归添加：连它的依赖、依赖的依赖一起加进来（npm: 别名会解析到真实包）',
     '  node cli.js remove <包名> [--version 1.2.3] [--yes]   删除包或单个版本',
     '  node cli.js stats             统计包/版本/占用空间',
-    '  node cli.js export [--scope all|private|upstream] [--out 文件名] [包名...]',
+    '  node cli.js export [--scope all|private|upstream] [--out 文件名] [--no-deps] [--no-fetch-deps] [包名...]',
+    '                                导出选中包时默认连带递归依赖；镜像里没有的依赖在 cache/proxy 模式下自动下载入库再打包',
     '  node cli.js import <文件.tgz|文件.json> [--overwrite]',
     '  node cli.js scan-cache [--cache 目录] [--any-registry] [--refresh]',
     '                                默认只扫描当前上游源的缓存条目；--any-registry 扫描所有源；--refresh 先清空上次结果再全量重扫',
@@ -485,23 +486,44 @@ commands.stats = function () {
 commands.export = async function () {
   const { store, lg } = makeStore(false);
   const scope = flags.scope || (positional.length ? 'selected' : 'all');
+  // 导出选中包时默认连带依赖；镜像里没有的依赖在 cache/proxy 模式下自动下载入库再打包
+  const withDeps = scope === 'selected' && !flags['no-deps'];
+  const autoFetchDeps = !flags['no-fetch-deps'];
+  const { Upstream } = require('./src/upstream');
+  const registry = require('./src/registry');
+  const upstream = new Upstream(() => config.get(), lg);
+  const ctx = { store, upstream, log: lg, cfg: () => config.get(), registry };
   const t0 = Date.now();
   try {
+    if (withDeps) log(`${C.dim}导出选中包时会连带依赖；镜像里没有的依赖会在联网模式下自动下载（--no-deps / --no-fetch-deps 可关闭）。${C.reset}`);
     const r = await bundle.exportBundle({
       store,
+      ctx,
       scope,
       names: positional,
       fileName: flags.out,
+      withDeps,
+      autoFetchDeps,
       logger: lg,
       concurrency: Math.max(1, Number(config.get().storage.bundleExportConcurrency) || 4),
       onProgress: (p) => {
         if (!flags.verbose) return;
-        if (p.phase === 'collect') log(`  …已统计 ${p.packages}/${p.total} 个包`);
+        if (p.phase === 'deps-fetch') log(`  …${p.message || '正在自动补齐缺失依赖…'}`);
+        else if (p.phase === 'collect') log(`  …已统计 ${p.packages}/${p.total} 个包`);
         else if (p.phase === 'pack') log(`  …已打包 ${p.entriesDone}/${p.entriesTotal} 个文件（${human(p.bytes)} / ${human(p.totalBytes)}）`);
       },
     });
     log(`${C.green}导出完成${C.reset} ${r.path}`);
     log(`  包含 ${r.packages} 个包 / ${r.versions} 个版本 / ${r.tarballs} 个 tarball，共 ${human(r.sizeBytes)}，耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+    if (r.withDeps) {
+      log(`  连带依赖 ${r.depsAdded} 个${r.depsFetched ? `，其中自动从上游下载 ${r.depsFetched} 个` : ''}`);
+      if (r.autoFetch && r.autoFetch.skippedReason) log(`${C.yellow}  提示：${r.autoFetch.skippedReason}${C.reset}`);
+      if (r.missingDeps && r.missingDeps.length) {
+        log(`${C.yellow}  注意：有 ${r.missingDeps.length} 个依赖没能导出（离线安装时可能失败）：${C.reset}`);
+        for (const m of r.missingDeps.slice(0, 10)) log(`${C.yellow}    - ${m.name}@${m.range || '*'}${m.reason ? `：${m.reason}` : ''}${m.parent ? `（被 ${m.parent} 依赖）` : ''}${C.reset}`);
+        if (r.missingDeps.length > 10) log(`${C.dim}    …其余 ${r.missingDeps.length - 10} 个见返回的 missingDeps${C.reset}`);
+      }
+    }
     log(`${C.dim}把这个 .tgz 拷到离线机器，用「node cli.js import <文件>」或管理界面「迁移备份」页导入。${C.reset}`);
   } catch (e) {
     log(`${C.red}导出失败：${e.message}${C.reset}`);

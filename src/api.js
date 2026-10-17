@@ -804,6 +804,8 @@ async function handleAdmin(ctx) {
     const scope = rawScope || (Array.isArray(body.names) && body.names.length ? 'selected' : 'all');
     // 指定导出选中的包时，默认把它们的（递归）依赖也一起导出；显式传 withDeps:false 可关闭
     const withDeps = scope === 'selected' && (body.withDeps === undefined ? true : !!body.withDeps);
+    // 镜像里没有的依赖：默认在 cache/proxy 模式下自动下载并入库（离线模式只会提示）；显式 autoFetchDeps:false 可关闭
+    const autoFetchDeps = body.autoFetchDeps === undefined ? true : !!body.autoFetchDeps;
     const names = Array.isArray(body.names) ? body.names.filter(n => typeof n === 'string') : [];
     /* progress:true —— 长任务模式：立即返回 taskId，界面用 /tasks/<id> 轮询
      * 「统计 → 打包」两阶段进度、逐包打包详情与「当前包」进度条；可取消。 */
@@ -819,14 +821,27 @@ async function handleAdmin(ctx) {
         log,
         run: ({ update, isCanceled }) => ctx.bundle.exportBundle({
           store,
+          ctx,
           scope,
           names,
           fileName: body.name || body.fileName,
           withDeps,
+          autoFetchDeps,
           logger: log,
           isCanceled,
           concurrency: conc,
           onProgress: (ev) => {
+            if (ev.phase === 'deps-fetch') {
+              // 自动补依赖阶段：沿用 collect 阶段显示，只换文案（进度按「已处理 N 个依赖」算）
+              const doneN = (Number(ev.downloaded) || 0) + (Number(ev.failed) || 0);
+              update({
+                phase: 'collect',
+                message: ev.message || '正在自动补齐缺失依赖…',
+                done: doneN,
+                total: Math.max(doneN, Number(ev.total) || 0),
+              });
+              return;
+            }
             if (ev.phase === 'collect-start') {
               update({ phase: 'collect', total: Number(ev.total) || 0, message: '正在统计要导出的包…' });
               return;
@@ -878,10 +893,12 @@ async function handleAdmin(ctx) {
     try {
       const r = await ctx.bundle.exportBundle({
         store,
+        ctx,
         scope,
         names,
         fileName: body.name || body.fileName,
         withDeps,
+        autoFetchDeps,
         logger: log,
         concurrency: Math.max(1, Number(cfg.storage.bundleExportConcurrency) || 4),
       });

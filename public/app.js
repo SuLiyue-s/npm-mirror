@@ -1813,10 +1813,12 @@
     if (!names.length) { toast('请先勾选要导出的包', 'warn'); return; }
     setSideHint('EXPORTING…');
     api('/bundles/export', { method: 'POST', body: { scope: 'selected', names: names, withDeps: true }, timeout: 300000 }).then(function (d) {
-      var msg = '已导出 ' + d.file + '（' + fmtNum(d.packages) + ' 包 / ' + fmtBytes(d.sizeBytes) + (d.depsAdded ? '，含连带依赖 ' + fmtNum(d.depsAdded) + ' 个' : '') + '）';
+      var msg = '已导出 ' + d.file + '（' + fmtNum(d.packages) + ' 包 / ' + fmtBytes(d.sizeBytes) + (d.depsAdded ? '，含连带依赖 ' + fmtNum(d.depsAdded) + ' 个' : '') + (d.depsFetched ? '，其中自动下载 ' + fmtNum(d.depsFetched) + ' 个' : '') + '）';
       toast(msg, 'ok', 9000);
+      if (d.autoFetch && d.autoFetch.skippedReason) toast('未自动下载缺失依赖：' + d.autoFetch.skippedReason, 'warn', 12000);
       if (d.missingDeps && d.missingDeps.length) {
-        toast('有 ' + d.missingDeps.length + ' 个依赖不在镜像里，未导出：' + d.missingDeps.slice(0, 6).map(function (x) { return x.name; }).join('、') + (d.missingDeps.length > 6 ? ' 等' : '') + '。如需离线安装，请先把它们加入镜像。', 'warn', 14000);
+        var lst = d.missingDeps.slice(0, 6).map(function (x) { return x.name + (x.reason ? '（' + x.reason + '）' : ''); }).join('、');
+        toast('有 ' + d.missingDeps.length + ' 个依赖没能导出：' + lst + (d.missingDeps.length > 6 ? ' 等' : '') + '。离线安装时这些依赖会缺失，建议先在「添加公共包」里补上。', 'warn', 14000);
       }
       setSideHint('READY');
       downloadBundle(d.file);
@@ -2772,7 +2774,9 @@
     function statText(d, pct) {
       var secs = Math.round((d.elapsedMs || 0) / 1000);
       if (d.phase === 'collect') {
-        return '正在统计要导出的包…' + (d.done || d.total ? '（已扫描 ' + fmtNum(d.done || 0) + ' / ' + fmtNum(d.total || 0) + ' 个包）' : '') + ' · 已用时 ' + fmtDur(secs);
+        var head = d.message || '正在统计要导出的包…';
+        var cnt = (d.done || d.total) ? '（' + fmtNum(d.done || 0) + ' / ' + fmtNum(d.total || 0) + '）' : '';
+        return head + cnt + ' · 已用时 ' + fmtDur(secs);
       }
       var txt = '已打包 ' + fmtNum(d.done || 0) + ' / ' + fmtNum(d.total || 0) + ' 个文件（' + pct + '%）';
       if (d.bytes || d.bytesTotal) txt += ' · ' + fmtBytes(d.bytes || 0) + (d.bytesTotal ? ' / ' + fmtBytes(d.bytesTotal) : '');
@@ -2795,7 +2799,7 @@
       statText: statText,
       rowEl: bundlePkgRow,
       phaseNote: function (d) {
-        if (d.phase === 'collect') return '正在统计要导出的包…（这一步只读元数据，可以取消）';
+        if (d.phase === 'collect') return (d.message || '正在统计要导出的包…') + '（这一步只读镜像里的元数据，可以取消）';
         return '正在打包并压缩（gzip），可以点「取消导出」随时停下。';
       },
       start: function () {
@@ -2817,12 +2821,15 @@
           return;
         }
         var msg = '已导出 ' + r.file + '：' + fmtNum(r.packages) + ' 包 / ' + fmtNum(r.versions) + ' 版本 / ' + fmtNum(r.tarballs) + ' tarball / ' + fmtBytes(r.sizeBytes);
-        if (r.depsAdded) msg += '（其中连带依赖 ' + fmtNum(r.depsAdded) + ' 个）';
+        if (r.depsAdded) msg += '（其中连带依赖 ' + fmtNum(r.depsAdded) + ' 个' + (r.depsFetched ? '，自动下载 ' + fmtNum(r.depsFetched) + ' 个' : '') + '）';
         setText('exp-status', msg);
         toast(msg, 'ok', 9000);
+        if (r.autoFetch && r.autoFetch.skippedReason) toast('未自动下载缺失依赖：' + r.autoFetch.skippedReason, 'warn', 12000);
         if (r.missingDeps && r.missingDeps.length) {
-          var lst = r.missingDeps.slice(0, 8).map(function (x) { return x.name + (x.parent ? '（' + x.parent + ' 依赖）' : ''); }).join('、');
-          toast('有 ' + r.missingDeps.length + ' 个依赖不在镜像里，未导出：' + lst + (r.missingDeps.length > 8 ? ' 等' : '') + '。如需离线安装，请先把它们加入镜像。', 'warn', 14000);
+          var lst = r.missingDeps.slice(0, 8).map(function (x) {
+            return x.name + (x.parent ? '（' + x.parent + ' 依赖）' : '') + (x.reason ? '：' + x.reason : '');
+          }).join('、');
+          toast('有 ' + r.missingDeps.length + ' 个依赖没能导出：' + lst + (r.missingDeps.length > 8 ? ' 等' : '') + '。离线安装时这些依赖会缺失，建议先在「添加公共包」里补上。', 'warn', 14000);
         }
         setSideHint('READY');
         loadBundles();
@@ -3494,6 +3501,8 @@
         payload.names = names;
         var wd = $('#exp-with-deps');
         payload.withDeps = !(wd && wd.checked === false);
+        var af = $('#exp-auto-fetch');
+        payload.autoFetchDeps = !(af && af.checked === false);
       }
       var btn = $('#exp-run');
       setText('exp-status', payload.withDeps ? '正在打包（含递归依赖），包较多时可能耗时较久…' : '正在打包，包较多时可能耗时较久…');
