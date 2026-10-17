@@ -3,12 +3,16 @@
 /*
  * 一键跑完所有自检：
  *   1. 先确认镜像源在运行（不在运行会给出提示）
- *   2. 执行 test/api-test.js（注册表协议 + 管理 API + 发布/删除 + 离线包导入导出 + 安全回归 共 153 项，默认执行 150 项 + 3 项显式跳过；环境不足 / 破坏性用例会显式 SKIP）
+ *   2. Windows 下先跑 test/tray-check.js（托盘项目图标 / 启动脚本 / 左键右键行为 / favicon，
+ *      非 Windows 或沙箱禁止子进程时其中需真跑 PowerShell 的几项会自动跳过）
+ *   3. 再跑 test/api-test.js（注册表协议 + 管理 API + 发布/删除 + 离线包导入导出 + 安全回归；
+ *      环境不足 / 破坏性用例会显式 SKIP）
  * 用法：node test/run-all.js [--base http://127.0.0.1:4873]
  * 说明：真实 npm 客户端的验收（install/publish/dist-tag/deprecate/unpublish）由
  *       test/acceptance-npm.ps1 负责，需要本机有 npm。
  */
 const path = require('node:path');
+const fs = require('node:fs');
 const { spawn } = require('node:child_process');
 const config = require('../src/config');
 
@@ -19,6 +23,13 @@ const BASE = (() => {
   if (i > 0 && process.argv[i + 1]) return process.argv[i + 1].replace(/\/+$/, '');
   return `http://127.0.0.1:${cfg.server.port}`;
 })();
+
+function runNode(script, args) {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [path.join(__dirname, script), ...args], { stdio: 'inherit' });
+    child.on('exit', (code) => resolve(code === null ? 1 : code));
+  });
+}
 
 (async () => {
   process.stdout.write(`检查镜像源是否在运行：${BASE}\n`);
@@ -33,6 +44,12 @@ const BASE = (() => {
   }
   process.stdout.write('镜像源在线，开始自检。\n');
 
-  const child = spawn(process.execPath, [path.join(__dirname, 'api-test.js'), '--base', BASE], { stdio: 'inherit' });
-  child.on('exit', (code) => process.exit(code === null ? 1 : code));
+  if (process.platform === 'win32' && fs.existsSync(path.join(__dirname, 'tray-check.js'))) {
+    process.stdout.write('\n===== 托盘 / 图标 / 启动脚本自检（test/tray-check.js）=====\n');
+    const trayCode = await runNode('tray-check.js', ['--base', BASE]);
+    if (trayCode !== 0) process.exit(trayCode);
+  }
+
+  process.stdout.write('\n===== 接口与功能自检（test/api-test.js）=====\n');
+  process.exit(await runNode('api-test.js', ['--base', BASE]));
 })();

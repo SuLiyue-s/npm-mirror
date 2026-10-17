@@ -79,7 +79,12 @@ function createServer({ cliOpts = {} } = {}) {
   // ---------------- 请求分发 ----------------
   const STATIC_EXT = new Set(['.html', '.js', '.mjs', '.css', '.map', '.json', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.ico', '.woff', '.woff2', '.ttf']);
   function serveStatic(req, res, pathname) {
-    if (pathname === '/favicon.ico') { res.writeHead(204); return res.end(); }
+    // 项目图标（public/favicon.ico，网页标签页与 Windows 托盘共用）：有就正常返回，没有才回 204
+    if (pathname === '/favicon.ico') {
+      let hasIcon = false;
+      try { hasIcon = fs.statSync(path.join(PUBLIC_DIR, 'favicon.ico')).isFile(); } catch { hasIcon = false; }
+      if (!hasIcon) { res.writeHead(204); return res.end(); }
+    }
     let rel = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
     try { rel = decodeURIComponent(rel); } catch { /* 保持原样 */ }
     // 去掉盘符/前导分隔符，再用 path.relative 做真正的包含校验（前缀 startsWith 在兄弟目录名同前缀时会被绕过）

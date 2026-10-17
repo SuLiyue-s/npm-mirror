@@ -49,7 +49,9 @@ async function get(p, { json = false } = {}) {
   const css = await get('/style.css');
   check('GET /style.css 返回 200 且为 CSS', css.status === 200 && /css/.test(css.type), `${css.status} ${css.type}`);
   const icon = await fetch(BASE + '/favicon.ico', { signal: AbortSignal.timeout(10000) });
-  check('GET /favicon.ico 不报错（204/200）', icon.status === 200 || icon.status === 204, `status=${icon.status}`);
+  const iconType = icon.headers.get('content-type') || '';
+  check('GET /favicon.ico 返回项目图标（200 且 image/x-icon）', icon.status === 200 && /^image\/x-icon/i.test(iconType), `status=${icon.status} type=${iconType}`);
+  check('首页声明了 favicon（<link rel="icon" href="favicon.ico">）', /<link[^>]+rel=["']icon["'][^>]*favicon\.ico/i.test(home.text));
 
   console.log('\x1b[1m二、离线性：前端不得引用外网资源\x1b[0m');
   const externals = (home.text + js.text + css.text).match(/https?:\/\/(?!127\.0\.0\.1|localhost)[a-z0-9.-]+/gi) || [];

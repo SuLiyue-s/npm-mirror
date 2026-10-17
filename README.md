@@ -36,6 +36,22 @@ node cli.js start
 
 > 首次启动后，管理界面的「配置」页与 `data/config.json` 里都能看到访问令牌（`security.token`）。
 
+### Windows：托盘图标
+
+双击 `启动镜像源.cmd` 后，命令行窗口会在服务就绪后自动隐藏，右下角通知区域出现**项目图标**（薄荷绿圆角方块，与网页 favicon 同一套自绘图标）：
+
+| 操作 | 效果 |
+| --- | --- |
+| 左键单击托盘图标 | 打开（显示）命令行窗口，可看日志、按 `Ctrl+C` 停止 |
+| 右键 → 「打开控制台」 | 同上；窗口已显示时这一项换成「隐藏控制台」 |
+| 右键 → 「隐藏控制台」 | 重新把命令行窗口收到后台，服务继续运行 |
+| 右键 → 「退出镜像源」 | 停止镜像服务并关闭托盘（命令行窗口一并关闭） |
+
+- 托盘图标可能被 Windows 收进通知区域的 **「^」溢出区**：点「^」拖到任务栏即可固定显示。
+- 用的是系统自带的 Windows PowerShell，不需要额外安装任何东西；脚本在 `tools/tray.ps1`，图标由 `tools/make-icon.ps1` 自绘生成（`public/favicon.ico`）。
+- 停止服务也可以双击 `停止镜像源.cmd`，托盘会在几秒内检测到服务已停止并自动退出。
+- 在 Windows Terminal 里手动输入命令启动时托盘不参与（直接把窗口留着即可）；需要托盘就双击 `.cmd`。若托盘没有出现，命令行窗口会保持显示并给出提示，服务本身不受影响。
+
 ## 让项目用上这个镜像源
 
 全局切换（会自动备份原 `~/.npmrc`，可随时还原）：
@@ -142,7 +158,8 @@ npm私人镜像源-离线版/
 │  ├─ http-util.js        HTTP 工具（body/Range/静态文件/安全头）
 │  ├─ logger.js           日志
 │  └─ util.js             工具函数（semver、原子写、包名/版本校验等）
-├─ public/                原生前端（app.js / index.html / style.css）
+├─ public/                原生前端（app.js / index.html / style.css / favicon.ico）
+├─ tools/                 启动器辅助脚本（tray.ps1 托盘宿主、make-icon.ps1 自绘图标）
 ├─ test/                  自动化测试与验收脚本
 ├─ data/                  运行时数据（包存储/日志/配置/离线包，已 gitignore）
 ├─ 使用说明.md            详细操作手册
@@ -156,15 +173,19 @@ npm私人镜像源-离线版/
 先启动服务，然后：
 
 ```bash
-node test/run-all.js                 # 一键自检（等价于 node test/api-test.js）
+node test/run-all.js                 # 一键自检（先探活，再跑托盘自检 + api-test）
 node test/ui-check.js                # 前端静态契约检查
+node test/tray-check.js              # 只跑托盘/图标/启动脚本自检（Windows）
+powershell -NoProfile -ExecutionPolicy Bypass -File test/tray-e2e.ps1   # 托盘端到端（手工，需真实桌面）
 pwsh -File test/acceptance-npm.ps1   # 真实 npm 客户端验收（Windows / PowerShell 7）
 ```
 
 | 脚本 | 内容 | 最近结果（2026-10-17，本机） |
 | --- | --- | --- |
 | `test/api-test.js` | npm 协议、管理接口、发布/删除、离线导入导出、进度任务、并行导出导入与根目录/版本写法兼容、安全回归等 187 项 | **183 通过 + 4 跳过，0 失败** |
-| `test/ui-check.js` | 前端与后端接口/页面元素契约（含导入结果的失败/跳过详情面板） | **92/92 通过** |
+| `test/ui-check.js` | 前端与后端接口/页面元素契约（含导入结果的失败/跳过详情面板、favicon 声明） | **93/93 通过** |
+| `test/tray-check.js` | 托盘脚本/项目图标/启动脚本/favicon 路由契约，并真跑一次托盘自检（Windows） | **33/33 通过** |
+| `test/tray-e2e.ps1` | 托盘端到端：隔离副本启动 → 窗口隐藏 → 可重新显示 → 停服务后托盘退出并关窗 | **8/8 通过（手工）** |
 | `test/acceptance-npm.ps1` | 真实 `npm install / publish / dist-tag / deprecate / unpublish` | **16/16 通过** |
 | `test/ui-e2e-*.js` | 浏览器端端到端（需要 Chrome 调试端口，可选） | 需本机 Chrome CDP 环境 |
 

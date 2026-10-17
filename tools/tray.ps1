@@ -1,0 +1,374 @@
+﻿# ============================================================
+#  私人 npm 镜像源 · Windows 托盘宿主（零依赖，只用系统自带的 PowerShell）
+#
+#  由「启动镜像源.cmd」在后台拉起，负责：
+#    · 等服务就绪后，把命令行窗口隐藏到右下角托盘，并注册项目图标（public\favicon.ico）
+#    · 左键单击图标 = 打开命令行窗口（把窗口显示出来并置前）
+#    · 右键菜单根据命令行窗口当前是显示还是隐藏，动态只给两项：
+#        显示中：【隐藏控制台】【退出镜像源】
+#        隐藏中：【打开控制台】【退出镜像源】
+#    · 退出镜像源 = 调管理接口优雅停止服务 → 关闭命令行窗口 → 托盘图标消失
+#    · 服务被外部停止（比如双击「停止镜像源.cmd」）时，图标自动退出
+#
+#  用法（一般不用手动执行）：
+#    powershell -NoProfile -ExecutionPolicy Bypass -File tools\tray.ps1
+#  自检（不注册托盘，只校验图标、菜单文案与 Win32 调用是否正常，输出 JSON）：
+#    powershell -NoProfile -ExecutionPolicy Bypass -File tools\tray.ps1 -SelfTest
+#
+#  注意：本文件必须保存为「UTF-8 带 BOM」，否则 Windows PowerShell 5.1
+#        会把中文菜单文案读成乱码。
+# ============================================================
+[CmdletBinding()]
+param(
+  # 项目根目录。默认留空，由下面的脚本体用 $PSScriptRoot 推算——
+  # Windows PowerShell 5.1 在 param() 默认值里还拿不到 $PSScriptRoot（会是空串），
+  # 所以不能写成 [string]$Root = (Split-Path -Parent $PSScriptRoot)。
+  [string]$Root = '',
+  [int]$WaitSeconds = 60,
+  [switch]$SelfTest,
+  # 自检结果写到这个文件（沙箱/无管道环境下抓不到子进程 stdout，用写文件代替）
+  [string]$SelfTestOut = ''
+)
+
+$ErrorActionPreference = 'Stop'
+if (-not $Root) {
+  if (-not $PSScriptRoot) {
+    [Console]::Error.WriteLine('无法确定项目根目录：请用 -File 方式运行 tray.ps1，或显式传 -Root <项目目录>')
+    exit 2
+  }
+  $Root = Split-Path -Parent $PSScriptRoot
+}
+$Root = [System.IO.Path]::GetFullPath($Root)
+
+# ---------- 小工具：写诊断日志（托盘是后台进程，出问题时便于排查） ----------
+$script:LogFile = Join-Path $Root 'data\logs\tray.log'
+function Write-TrayLog([string]$Text) {
+  try {
+    $dir = Split-Path -Parent $script:LogFile
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $line = ('[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-ddTHH:mm:sszzz'), $Text)
+    [System.IO.File]::AppendAllText($script:LogFile, $line + "`r`n", (New-Object System.Text.UTF8Encoding($false)))
+  } catch { /* 日志写不进去不影响主流程 */ }
+}
+
+# ---------- Win32 ----------
+if (-not ('MirrorTrayNative' -as [type])) {
+  Add-Type -TypeDefinition @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+public static class MirrorTrayNative {
+  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+  [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
+  [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+  [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern uint GetConsoleTitle(StringBuilder lpConsoleTitle, uint nSize);
+
+  // 按窗口标题找顶层窗口：优先返回可见的，找不到再退回任意匹配。
+  // （实测 FindWindow(null, 标题) 在提权控制台窗口上返回 0，所以用 EnumWindows 自己找。）
+  public static IntPtr FindByTitle(string title) {
+    IntPtr firstMatch = IntPtr.Zero;
+    EnumWindows(delegate(IntPtr h, IntPtr l) {
+      var sb = new StringBuilder(1024);
+      GetWindowText(h, sb, 1024);
+      if (sb.ToString() == title) {
+        if (IsWindowVisible(h)) { firstMatch = h; return false; }
+        if (firstMatch == IntPtr.Zero) { firstMatch = h; }
+      }
+      return true;
+    }, IntPtr.Zero);
+    return firstMatch;
+  }
+}
+'@
+}
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+$SW_HIDE = 0
+$SW_SHOW = 5
+$WM_CLOSE = 0x0010
+$WM_SETICON = 0x0080
+$ICON_SMALL = [IntPtr]0
+$ICON_BIG = [IntPtr]1
+
+# ---------- 配置 ----------
+function Read-MirrorConfig {
+  $file = Join-Path $Root 'data\config.json'
+  $cfg = [pscustomobject]@{ port = 4873; token = '' }
+  try {
+    if (Test-Path $file) {
+      $j = Get-Content $file -Raw -Encoding UTF8 | ConvertFrom-Json
+      if ($j.server -and $j.server.port) { $cfg.port = [int]$j.server.port }
+      if ($j.security -and $j.security.token) { $cfg.token = [string]$j.security.token }
+    }
+  } catch { /* 配置读不了就用默认端口 */ }
+  return $cfg
+}
+
+$script:Cfg = Read-MirrorConfig
+$script:Port = $script:Cfg.port
+$script:Token = $script:Cfg.token
+
+function Get-ServiceUrl([string]$Path) {
+  return ('http://127.0.0.1:{0}{1}' -f $script:Port, $Path)
+}
+
+function Test-Service {
+  try {
+    $r = Invoke-WebRequest -UseBasicParsing -Uri (Get-ServiceUrl '/__admin/api/session') -TimeoutSec 2
+    return [bool]($r.StatusCode -eq 200)
+  } catch { return $false }
+}
+
+# ---------- 命令行窗口 ----------
+function Get-ConsoleTitleText {
+  try {
+    $sb = New-Object System.Text.StringBuilder 512
+    [void][MirrorTrayNative]::GetConsoleTitle($sb, 512)
+    return $sb.ToString()
+  } catch { return '' }
+}
+
+function Get-WindowClass([IntPtr]$Hwnd) {
+  try {
+    $sb = New-Object System.Text.StringBuilder 256
+    [void][MirrorTrayNative]::GetClassName($Hwnd, $sb, 256)
+    return $sb.ToString()
+  } catch { return '' }
+}
+
+# 取「真正该显示/隐藏的那个窗口」：
+#   · 经典控制台（conhost）：GetConsoleWindow() 返回的就是那个窗口（类名 ConsoleWindowClass）
+#   · Windows Terminal / ConPTY：GetConsoleWindow() 返回的是 PseudoConsoleWindow（隐藏它没有任何效果），
+#     真正承载本控制台的是标题与控制台标题一致的顶层窗口（类名 CASCADIA_HOSTING_WINDOW_CLASS）
+function Resolve-HostWindow {
+  $title = Get-ConsoleTitleText
+  $h = [MirrorTrayNative]::GetConsoleWindow()
+  if ($h -ne [IntPtr]::Zero) {
+    if ((Get-WindowClass $h) -eq 'ConsoleWindowClass') { return $h }
+    if ($title) {
+      $hostWnd = [MirrorTrayNative]::FindByTitle($title)
+      if ($hostWnd -ne [IntPtr]::Zero) { return $hostWnd }
+    }
+    return $h
+  }
+  if ($title) {
+    $hostWnd = [MirrorTrayNative]::FindByTitle($title)
+    if ($hostWnd -ne [IntPtr]::Zero) { return $hostWnd }
+  }
+  return [IntPtr]::Zero
+}
+
+$script:ConsoleHwnd = [IntPtr]::Zero
+
+function Test-ConsoleVisible {
+  if ($script:ConsoleHwnd -eq [IntPtr]::Zero) { return $false }
+  return [bool][MirrorTrayNative]::IsWindowVisible($script:ConsoleHwnd)
+}
+
+function Set-ConsoleVisible([bool]$Visible) {
+  if ($script:ConsoleHwnd -eq [IntPtr]::Zero) { return $false }
+  $cmd = if ($Visible) { $SW_SHOW } else { $SW_HIDE }
+  [void][MirrorTrayNative]::ShowWindow($script:ConsoleHwnd, $cmd)
+  [void][MirrorTrayNative]::ShowWindowAsync($script:ConsoleHwnd, $cmd)
+  Start-Sleep -Milliseconds 120
+  if ($Visible) {
+    try { [void][MirrorTrayNative]::SetForegroundWindow($script:ConsoleHwnd) } catch { /* 忽略 */ }
+  }
+  return [bool](([MirrorTrayNative]::IsWindowVisible($script:ConsoleHwnd)) -eq $Visible)
+}
+
+# 右键菜单文案（按当前命令行窗口显示状态决定；自检也用同一个函数）
+function Get-MenuLabels([bool]$ConsoleVisible) {
+  if ($ConsoleVisible) { return @('隐藏控制台', '退出镜像源') }
+  return @('打开控制台', '退出镜像源')
+}
+
+# ---------- 自检模式（不注册托盘、不改变窗口状态） ----------
+if ($SelfTest) {
+  $script:ConsoleHwnd = Resolve-HostWindow
+  $iconPath = Join-Path $Root 'public\favicon.ico'
+  $iconOk = $false
+  $iconSize = 0
+  try {
+    $ico = New-Object System.Drawing.Icon($iconPath)
+    $iconOk = $true
+    $iconSize = $ico.Width
+    $ico.Dispose()
+  } catch { $iconOk = $false }
+  $result = [ordered]@{
+    ok = $true
+    root = $Root
+    iconPath = $iconPath
+    iconOk = $iconOk
+    iconSize = $iconSize
+    consoleHwnd = [int64]$script:ConsoleHwnd.ToInt64()
+    consoleVisible = (Test-ConsoleVisible)
+    visibleMenu = @(Get-MenuLabels $true)
+    hiddenMenu = @(Get-MenuLabels $false)
+    servicePort = $script:Port
+  }
+  $json = ($result | ConvertTo-Json -Compress)
+  if ($SelfTestOut) {
+    [System.IO.File]::WriteAllText($SelfTestOut, $json, (New-Object System.Text.UTF8Encoding($false)))
+  } else {
+    [Console]::Out.WriteLine($json)
+  }
+  exit 0
+}
+
+# ---------- 等镜像源就绪（就绪前保持命令行窗口可见，启动失败的报错不会被吞掉） ----------
+Write-TrayLog ('托盘宿主启动：root={0} port={1} wait={2}s' -f $Root, $script:Port, $WaitSeconds)
+$deadline = (Get-Date).AddSeconds([Math]::Max(5, $WaitSeconds))
+$ready = $false
+while ((Get-Date) -lt $deadline) {
+  if (Test-Service) { $ready = $true; break }
+  Start-Sleep -Milliseconds 400
+}
+if (-not $ready) {
+  Write-TrayLog '等待服务就绪超时，退出托盘（命令行窗口保持显示，方便看启动报错）'
+  exit 1
+}
+
+$script:ConsoleHwnd = Resolve-HostWindow
+if ($script:ConsoleHwnd -ne [IntPtr]::Zero) {
+  Write-TrayLog ('命令行窗口：hwnd={0} class={1}' -f $script:ConsoleHwnd.ToInt64(), (Get-WindowClass $script:ConsoleHwnd))
+} else {
+  Write-TrayLog '没找到命令行窗口（无法隐藏/显示，托盘图标仍可用）'
+}
+$script:Closing = $false
+$script:HealthFail = 0
+$script:Context = New-Object System.Windows.Forms.ApplicationContext
+$script:Notify = $null
+$script:Timer = $null
+$script:Icon = $null
+
+function Stop-Tray([bool]$CloseConsole) {
+  if ($script:Closing) { return }
+  $script:Closing = $true
+  try { if ($script:Timer) { $script:Timer.Stop(); $script:Timer.Dispose() } } catch { /* 忽略 */ }
+  try { if ($script:Notify) { $script:Notify.Visible = $false; $script:Notify.Dispose() } } catch { /* 忽略 */ }
+  try { if ($script:Icon) { $script:Icon.Dispose() } } catch { /* 忽略 */ }
+  Write-TrayLog ('托盘退出（关闭命令行窗口={0}）' -f $CloseConsole)
+  if ($CloseConsole -and $script:ConsoleHwnd -ne [IntPtr]::Zero) {
+    # 先隐藏再关：避免用户看到窗口闪一下
+    try { [void][MirrorTrayNative]::ShowWindow($script:ConsoleHwnd, $SW_HIDE) } catch { /* 忽略 */ }
+    try { [void][MirrorTrayNative]::PostMessage($script:ConsoleHwnd, $WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero) } catch { /* 忽略 */ }
+  }
+  try { $script:Context.ExitThread() } catch { /* 忽略 */ }
+  [System.Environment]::Exit(0)
+}
+
+# ---------- 退出镜像源：先优雅停服务，再关窗口、退托盘 ----------
+function Stop-MirrorAndExit {
+  if ($script:Closing) { return }
+  Write-TrayLog '用户选择「退出镜像源」：请求停止服务'
+  try {
+    if (Test-Service) {
+      $headers = @{ 'X-Mirror-Token' = $script:Token }
+      Invoke-WebRequest -UseBasicParsing -Method Post -Uri (Get-ServiceUrl '/__admin/api/service/shutdown') -Headers $headers -TimeoutSec 8 | Out-Null
+    }
+  } catch { Write-TrayLog ('停止接口调用失败：{0}' -f $_.Exception.Message) }
+  # 最多等 10 秒让服务自己退干净
+  for ($i = 0; $i -lt 40; $i++) {
+    if (-not (Test-Service)) { break }
+    Start-Sleep -Milliseconds 250
+  }
+  if (Test-Service) {
+    # 接口停不掉时按 pid 文件兜底
+    try {
+      $pidFile = Join-Path $Root 'data\mirror.pid'
+      if (Test-Path $pidFile) {
+        $p = Get-Content $pidFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($p -and $p.pid) { Stop-Process -Id ([int]$p.pid) -Force -ErrorAction SilentlyContinue }
+      }
+    } catch { /* 忽略 */ }
+    Start-Sleep -Milliseconds 500
+  }
+  Stop-Tray -CloseConsole $true
+}
+
+# ---------- 托盘图标 ----------
+$iconPath = Join-Path $Root 'public\favicon.ico'
+if (-not (Test-Path $iconPath)) {
+  Write-TrayLog ('缺少项目图标：{0}（可先执行 tools\make-icon.ps1 生成）' -f $iconPath)
+  exit 1
+}
+$script:Icon = New-Object System.Drawing.Icon($iconPath)
+$notify = New-Object System.Windows.Forms.NotifyIcon
+$notify.Icon = $script:Icon
+$notify.Text = ('私人 npm 镜像源 · 运行中（{0}）' -f (Get-ServiceUrl '/'))
+$notify.Visible = $true
+$script:Notify = $notify
+
+# 顺便把命令行窗口的标题栏/任务栏图标也换成项目图标（不换 Windows Terminal 的标签页图标）
+try {
+  if ($script:ConsoleHwnd -ne [IntPtr]::Zero) {
+    $big = New-Object System.Drawing.Icon($iconPath, 32, 32)
+    $small = New-Object System.Drawing.Icon($iconPath, 16, 16)
+    $script:IconBig = $big
+    $script:IconSmall = $small
+    [void][MirrorTrayNative]::SendMessage($script:ConsoleHwnd, $WM_SETICON, $ICON_BIG, $big.Handle)
+    [void][MirrorTrayNative]::SendMessage($script:ConsoleHwnd, $WM_SETICON, $ICON_SMALL, $small.Handle)
+  }
+} catch { Write-TrayLog ('设置命令行窗口图标失败：{0}' -f $_.Exception.Message) }
+
+# ---------- 右键菜单（每次弹出时按当前窗口状态重建，保证只显示该显示的两项） ----------
+$menu = New-Object System.Windows.Forms.ContextMenuStrip
+function Rebuild-Menu {
+  $menu.Items.Clear()
+  $labels = Get-MenuLabels (Test-ConsoleVisible)
+  $toggle = $menu.Items.Add($labels[0])
+  $toggle.add_Click({
+    if (Test-ConsoleVisible) { [void](Set-ConsoleVisible $false) } else { [void](Set-ConsoleVisible $true) }
+  })
+  [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+  $exit = $menu.Items.Add($labels[1])
+  $exit.add_Click({ Stop-MirrorAndExit })
+}
+$menu.add_Opening({ Rebuild-Menu })
+$notify.ContextMenuStrip = $menu
+# 左键单击：打开（显示并置前）命令行窗口
+$notify.add_MouseClick({
+  param($sender, $e)
+  if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) { [void](Set-ConsoleVisible $true) }
+})
+
+# ---------- 服务健康检查：被外部停止（比如双击「停止镜像源.cmd」）时自动退出 ----------
+$timer = New-Object System.Windows.Forms.Timer
+$timer.Interval = 4000
+$timer.add_Tick({
+  if ($script:Closing) { return }
+  if (Test-Service) {
+    $script:HealthFail = 0
+    if (-not $script:Closing -and $script:Notify) { $script:Notify.Text = ('私人 npm 镜像源 · 运行中（{0}）' -f (Get-ServiceUrl '/')) }
+    return
+  }
+  $script:HealthFail++
+  if ($script:HealthFail -ge 3) {
+    Write-TrayLog '检测到服务已停止，托盘自动退出'
+    Stop-Tray -CloseConsole $true
+  }
+})
+$script:Timer = $timer
+$timer.Start()
+
+# ---------- 隐藏命令行窗口，进入托盘常驻 ----------
+$hidden = Set-ConsoleVisible $false
+Write-TrayLog ('服务已就绪，命令行窗口已隐藏={0}' -f $hidden)
+if (-not $hidden) {
+  # 隐藏失败（极少见：例如宿主是 Windows Terminal）时不至于让用户没法操作
+  Write-TrayLog '未能隐藏命令行窗口：托盘仍可用，右键菜单会显示「隐藏控制台」'
+}
+
+[System.Windows.Forms.Application]::Run($script:Context)
