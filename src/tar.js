@@ -465,7 +465,18 @@ function openTarStream(file) {
   try { fs.readSync(fd, head, 0, 2, 0); } finally { fs.closeSync(fd); }
   const gz = head[0] === 0x1f && head[1] === 0x8b;
   const rs = fs.createReadStream(file, { highWaterMark: 1 << 20 });
-  return gz ? rs.pipe(zlib.createGunzip()) : rs;
+  if (!gz) return rs;
+  const gunzip = zlib.createGunzip();
+  /* 关键：调用方常常「只读到目标条目就返回」（批量导入时每个 tarball 都要读里面的
+   * package.json，读完第一条就 close），这时若只销毁 gunzip，源文件流 rs 会停在半路、
+   * fd 一直被占着不释放；连续导入上万 tarball 会把进程可用的 fd 耗尽，
+   * 表现为 EMFILE: too many open files（读写都开始失败）。
+   * 因此把「gunzip 关闭」关联到「销毁源文件流」，任何提前退出都能立刻释放 fd。 */
+  const destroySource = () => { try { rs.destroy(); } catch { /* 忽略 */ } };
+  rs.on('error', (e) => { try { gunzip.destroy(e); } catch { /* 忽略 */ } });
+  gunzip.on('close', destroySource);
+  rs.pipe(gunzip);
+  return gunzip;
 }
 
 /** Windows 保留设备名（CON、PRN、AUX、NUL、COM1-9、LPT1-9…）：带扩展名同样被系统保留 */

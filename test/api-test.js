@@ -1829,6 +1829,115 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
     }
   }
 
+  // ---------------------------------------------------------------- 批量导入不漏 fd（EMFILE 回归）
+  section('六之四之三、批量导入不漏文件句柄（EMFILE 回归）');
+  {
+    /* 用户反馈：一次导入 10,172 个 tarball 时有 841 个失败，报 EMFILE: too many open files。
+     * 根因是 tar.openTarStream 返回 rs.pipe(gunzip) 后，调用方「只读到 package.json 就提前 close」
+     * 只销毁了 gunzip，源文件流 rs 停在半路、fd 一直不释放，每个 tarball 泄漏 1 个；
+     * 本机实测单进程句柄上限约 8189 个，导 1 万多个 tarball 必然用光（读写都开始失败）。
+     * 这里用独立临时 Store 造 60 个包的离线包做真实导入：全部成功，且导入期间创建的文件读流
+     * 结束时都已销毁（残活 0 个），保证不会再泄漏 fd。 */
+    const bundleModFd = require('../src/bundle');
+    const { Store: StoreFd } = require('../src/store');
+    const cryptoFd = require('node:crypto');
+    const quietLogFd = { info() {}, warn() {}, error() {}, debug() {} };
+    const N_FD = 60;
+    const workFd = fs.mkdtempSync(path.join(os.tmpdir(), 'mirror-fd-import-'));
+    try {
+      const stFd = new StoreFd({ dir: path.join(workFd, 'storage'), logger: quietLogFd });
+      await stFd.init();
+      const entriesFd = [];
+      const statsFd = { packages: N_FD, versions: N_FD, tarballs: N_FD, tarballBytes: 0, depsAdded: 0, depsMissing: [] };
+      for (let i = 0; i < N_FD; i++) {
+        const nameFd = `mirror-selftest-fd-${i}`;
+        const versionFd = '1.0.0';
+        const fileFd = `${nameFd}-${versionFd}.tgz`;
+        const pkgDirFd = path.join(workFd, 'pkg', nameFd);
+        util.ensureDir(path.join(pkgDirFd, 'package'));
+        fs.writeFileSync(path.join(pkgDirFd, 'package', 'package.json'),
+          JSON.stringify({ name: nameFd, version: versionFd }));
+        const tgzFd = path.join(pkgDirFd, fileFd);
+        // eslint-disable-next-line no-await-in-loop
+        await tar.packTarGz(tgzFd, [
+          { name: 'package/package.json', source: path.join(pkgDirFd, 'package', 'package.json') },
+          { name: 'package/index.js', data: Buffer.from(`module.exports=${i};\n`) },
+        ], { gzip: true });
+        const bufFd = fs.readFileSync(tgzFd);
+        statsFd.tarballBytes += bufFd.length;
+        entriesFd.push({
+          name: `storage/${nameFd}/packument.json`,
+          data: Buffer.from(JSON.stringify({
+            name: nameFd,
+            'dist-tags': { latest: versionFd },
+            versions: {
+              [versionFd]: {
+                name: nameFd, version: versionFd,
+                dist: {
+                  tarball: `${BASE}/${nameFd}/-/${fileFd}`,
+                  integrity: `sha512-${cryptoFd.createHash('sha512').update(bufFd).digest('base64')}`,
+                  shasum: cryptoFd.createHash('sha1').update(bufFd).digest('hex'),
+                },
+              },
+            },
+          })),
+        });
+        entriesFd.push({
+          name: `storage/${nameFd}/meta.json`,
+          data: Buffer.from(JSON.stringify({ files: { [versionFd]: fileFd }, sizes: { [versionFd]: bufFd.length }, deprecated: {} })),
+        });
+        entriesFd.push({ name: `storage/${nameFd}/tarballs/${fileFd}`, source: tgzFd });
+      }
+      const bundleFd = path.join(workFd, `fd-bundle-${util.stamp()}.tgz`);
+      await tar.packTarGz(bundleFd, [
+        {
+          name: 'manifest.json',
+          data: Buffer.from(JSON.stringify({
+            format: bundleModFd.FORMAT, formatVersion: bundleModFd.FORMAT_VERSION,
+            createdAt: new Date().toISOString(), tool: 'api-test', scope: 'selected', stats: statsFd,
+          })),
+        },
+        ...entriesFd,
+      ], {});
+
+      // 统计导入期间创建的所有文件读流：导入结束后还存活的，就是泄漏的 fd
+      const createdFd = [];
+      const realCreateRSFd = fs.createReadStream.bind(fs);
+      fs.createReadStream = function patchedFd(...args) {
+        const s = realCreateRSFd(...args);
+        createdFd.push(s);
+        return s;
+      };
+      let impFd = null;
+      try {
+        impFd = await bundleModFd.importBundle({
+          store: stFd, file: bundleFd, overwrite: true, concurrency: 4,
+          logger: quietLogFd, onProgress: () => {},
+        });
+      } finally {
+        fs.createReadStream = realCreateRSFd;
+      }
+      await util.sleep(200);
+      const aliveFd = createdFd.filter((s) => !s.destroyed);
+      const failedFd = (impFd && impFd.failed) || [];
+      check(`批量导入 ${N_FD} 个包 / ${N_FD} 个 tarball 全部成功（不再因句柄耗尽而 EMFILE）`,
+        !!impFd && failedFd.length === 0 && Number(impFd.packages) === N_FD && Number(impFd.tarballs) === N_FD,
+        `packages=${impFd && impFd.packages} tarballs=${impFd && impFd.tarballs} failed=${JSON.stringify(failedFd).slice(0, 300)}`);
+      check('导入读取每个 tarball 后都释放了源文件流（残活读流 0 个，批量导入不会泄漏 fd）',
+        createdFd.length >= N_FD && aliveFd.length === 0,
+        `created=${createdFd.length} alive=${aliveFd.length}`);
+      let tgzFdCount = 0;
+      for (let i = 0; i < N_FD; i++) {
+        const pFd = path.join(workFd, 'storage', `mirror-selftest-fd-${i}`, 'tarballs', `mirror-selftest-fd-${i}-1.0.0.tgz`);
+        if (fs.existsSync(pFd)) tgzFdCount++;
+      }
+      check('批量导入的 tarball 都真的写进了存储目录', tgzFdCount === N_FD, `found=${tgzFdCount}/${N_FD}`);
+      await stFd.close();
+    } finally {
+      try { fs.rmSync(workFd, { recursive: true, force: true }); } catch { /* 忽略 */ }
+    }
+  }
+
   section('六之五、导出/导入并行与「根目录名不是 package」的 tarball');
   {
     const crypto = require('node:crypto');
