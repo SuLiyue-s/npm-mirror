@@ -504,7 +504,19 @@ async function exportBundle({
         inFlight,
       });
     },
+    onStage: (s) => {
+      /* 并行压缩写完后还有一步「把 N 个分片按序拼成最终 .tgz」：几十 GB 的镜像要读写十几秒到几分钟，
+       * 没有这个阶段上报，界面会停在「100% 却不结束」，看起来像卡死。 */
+      if (!s || s.stage !== 'concat') return;
+      emit({
+        phase: 'concat',
+        concatDone: Number(s.copied) || 0,
+        concatTotal: Number(s.total) || 0,
+        concatParts: Number(s.parts) || 0,
+      });
+    },
   });
+  emit({ phase: 'finalize', sizeBytes: Number(res.sizeBytes) || 0 });
   fs.renameSync(tmpPath, finalPath);
   const fetchedN = autoFetch ? autoFetch.downloaded.length : 0;
   if (logger) {

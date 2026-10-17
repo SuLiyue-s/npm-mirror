@@ -1437,8 +1437,9 @@
     var empty = el('div', { class: 'fill-run-empty', text: emptyText });
     box.appendChild(empty);
     var cnt = el('span', { class: 'fill-run-cnt', text: '' });
+    var headEl = el('span', { text: headText });
     var col = el('div', { class: 'fill-col fill-col-right' }, [
-      el('div', { class: 'fill-col-head' }, [el('span', { text: headText }), cnt]),
+      el('div', { class: 'fill-col-head' }, [headEl, cnt]),
       box
     ]);
     var map = {}, max = Math.max(1, Math.min(32, conc || 6));
@@ -1447,11 +1448,12 @@
       var running = [];
       (pkgs || []).forEach(function (p) {
         if (!p || p.status !== 'running') return;
-        /* spin 行是「并行打包」的条目级行（一个正在压缩的文件一行）：大小已知、进度未知，target 为 0 */
-        if (!(Number(p.target) > 0) && !p.spin) return;
+        /* spin 行是「并行打包」的条目级行（一个正在压缩的文件一行）：大小已知、进度未知，target 为 0；
+         * text 行是「收尾写盘」这类没有条目数、只有字节进度的阶段行，同样允许 target 为 0。 */
+        if (!(Number(p.target) > 0) && !p.spin && !p.text) return;
         /* keepDone：导入的包通常只有 1 个版本、几毫秒就处理完，若严格只显示"还没下完"的包，
          * 右栏会一直闪空。导入弹窗保留当前包的最终态（100%），直到下一个包开始。 */
-        if (!opts.keepDone && !p.spin && Number(p.done) >= Number(p.target)) return;
+        if (!opts.keepDone && !p.spin && !p.text && Number(p.done) >= Number(p.target)) return;
         running.push(p);
       });
       running = running.slice(0, max);
@@ -1477,6 +1479,13 @@
           it.tv.textContent = (p.size ? fmtBytes(p.size) + ' · ' : '') + '压缩中…';
           return;
         }
+        if (p.text) {
+          /* 任意文本行：导出收尾「拼接分片写入最终文件」等没有「条目数」概念的阶段用它显示字节进度 */
+          it.nameEl.textContent = p.name;
+          it.fill.style.width = Math.max(0, Math.min(100, Number(p.pct) || 0)) + '%';
+          it.tv.textContent = p.text;
+          return;
+        }
         var pct = Math.round(Number(p.done) / Number(p.target) * 100);
         it.fill.style.width = Math.max(0, Math.min(100, pct)) + '%';
         it.tv.textContent = p.done + ' / ' + p.target + ' ' + unit + '（' + pct + '%）' + (showBytes ? ' · ' + fmtBytes(p.bytes || 0) : '');
@@ -1495,6 +1504,8 @@
     return {
       el: col,
       paint: paint,
+      /* 标题随阶段变化：打包时「正在打包 · 并行文件」，收尾写盘时「正在写入最终文件」 */
+      setHead: function (t) { if (t) headEl.textContent = t; },
       /* 并发数在任务快照里（导出/导入可能 4~10 路），弹窗建栏时还不知道，拿到快照后再放宽行数上限 */
       setMax: function (n) {
         var v = Math.max(1, Math.min(32, Number(n) || 1));
@@ -1518,8 +1529,9 @@
     var empty = el('div', { class: 'fill-run-empty', text: emptyText });
     box.appendChild(empty);
     var cnt = el('span', { class: 'fill-run-cnt', text: '' });
+    var headEl = el('span', { text: headText });
     var col = el('div', { class: 'fill-col fill-col-right' }, [
-      el('div', { class: 'fill-col-head' }, [el('span', { text: headText }), cnt]),
+      el('div', { class: 'fill-col-head' }, [headEl, cnt]),
       box
     ]);
     var map = {}, max = Math.max(1, Math.min(32, conc || 6));
@@ -2919,8 +2931,11 @@
       if (opts.extractBar && d.phase === 'extract') {
         pct = d.bytesTotal ? Math.min(100, Math.round(((d.bytes || 0) / d.bytesTotal) * 100)) : 0;
       }
+      /* 整体条不要把「压缩完但还在写盘」显示成 100%：打包只映射到 0~95%，拼接分片写最终文件补到 100% */
+      if (opts.barPct) { var bp = Number(opts.barPct(d, pct)); if (isFinite(bp)) pct = bp; }
       setBar(pct);
       stat.textContent = opts.statText(d, pct);
+      if (opts.paneHeadFor) runPane.setHead(opts.paneHeadFor(d));
       if (d.status === 'running' && opts.phaseNote) {
         var pn = opts.phaseNote(d);
         if (pn) note.textContent = pn;
@@ -2936,6 +2951,9 @@
        * 导出是条目级（一个正在压缩的文件一行，带 name=包名 / file=短文件名 / size）；
        * 导入是包级（一个 worker 一个包，带 done/total 版本数）。
        * 旧字段 current（单个包）保留给缓存导入等串行任务做兜底。 */
+      /* 收尾写盘阶段没有「正在压缩的文件」了：不再展示压缩阶段的 current / 刚处理完的包，
+       * 右栏只留下面那一行「拼接分片 → 最终 .tgz」的字节进度。 */
+      var isWritePhase = d.phase === 'concat' || d.phase === 'finalize';
       if (Array.isArray(d.inFlight) && d.inFlight.length) {
         d.inFlight.forEach(function (p) {
           if (!p || !p.name) return;
@@ -2946,12 +2964,23 @@
           feed.push({ name: p.name, status: 'running', target: Number(p.total) || 0, done: Number(p.done) || 0 });
         });
         lastCur = null;
-      } else if (d.current) {
+      } else if (d.current && !isWritePhase) {
         lastCur = { name: d.current, target: Number(d.currentTotal) || 0, done: Number(d.currentDone) || 0, at: Date.now() };
         feed.push({ name: lastCur.name, status: 'running', target: lastCur.target, done: lastCur.done });
-      } else if (lastCur && d.status === 'running' && Date.now() - lastCur.at < 1500) {
+      } else if (lastCur && !isWritePhase && d.status === 'running' && Date.now() - lastCur.at < 1500) {
         // 包与包之间轮询可能正好落在间隙：保留刚处理完的包一小会儿，右栏才不会闪空
         feed.push({ name: lastCur.name, status: 'running', target: lastCur.target, done: lastCur.done });
+      }
+      /* 导出收尾阶段（已经没有「正在压缩的文件」了）：一行显示分片拼接写盘的字节进度 */
+      if (d.phase === 'concat' && Number(d.concatTotal) > 0) {
+        var ct = Number(d.concatTotal) || 0, cd = Math.min(Number(d.concatDone) || 0, ct);
+        feed.push({
+          name: '拼接分片 → 最终 .tgz', status: 'running',
+          text: fmtBytes(cd) + ' / ' + fmtBytes(ct) + '（' + (ct ? Math.round((cd / ct) * 100) : 0) + '%）',
+          pct: ct ? (cd / ct) * 100 : 0
+        });
+      } else if (d.phase === 'finalize') {
+        feed.push({ name: '收尾：重命名最终文件', status: 'running', text: '写盘完成，正在收尾…', pct: 100 });
       }
       runPane.setMax(d.concurrency || 1);
       runPane.paint(feed, d.status !== 'running');
@@ -3036,7 +3065,18 @@
         var cnt = (d.done || d.total) ? '（' + fmtNum(d.done || 0) + ' / ' + fmtNum(d.total || 0) + '）' : '';
         return head + cnt + ' · 已用时 ' + fmtDur(secs);
       }
-      var txt = '已打包 ' + fmtNum(d.done || 0) + ' / ' + fmtNum(d.total || 0) + ' 个文件（' + pct + '%）';
+      if (d.phase === 'concat') {
+        var cTot = Number(d.concatTotal) || 0;
+        var cDone = Math.min(Number(d.concatDone) || 0, cTot);
+        var cW = cTot ? Math.round((cDone / cTot) * 100) : 0;
+        return '压缩完成，正在把' + (d.concatParts > 1 ? ' ' + fmtNum(d.concatParts) + ' 个分片' : '分片') + '拼接写入最终 .tgz：' +
+          fmtBytes(cDone) + ' / ' + fmtBytes(cTot) + '（' + cW + '%） · 只读写磁盘、不重新压缩 · 已用时 ' + fmtDur(secs);
+      }
+      if (d.phase === 'finalize') {
+        return '写盘完成，正在收尾（重命名最终文件）… · 已用时 ' + fmtDur(secs);
+      }
+      var filePct = d.total > 0 ? Math.round((d.done || 0) / d.total * 100) : pct;
+      var txt = '已打包 ' + fmtNum(d.done || 0) + ' / ' + fmtNum(d.total || 0) + ' 个文件（' + filePct + '%）';
       if (d.bytes || d.bytesTotal) txt += ' · ' + fmtBytes(d.bytes || 0) + (d.bytesTotal ? ' / ' + fmtBytes(d.bytesTotal) : '');
       if (d.ok) txt += ' · 已完成 ' + fmtNum(d.ok) + ' 个包';
       if (d.concurrency > 1) txt += ' · 并行 ' + d.concurrency + ' 路压缩';
@@ -3052,12 +3092,31 @@
       intro: '正在统计要导出的包…',
       busyText: '导出中…', sideHint: 'EXPORTING…', waitText: '正在打包…',
       paneHead: '正在打包 · 并行文件', paneUnit: '个文件', paneCountUnit: '个文件',
+      /* 标题随阶段切换：压缩时「正在打包 · 并行文件」，收尾写盘时换成「正在写入 · 拼接分片」 */
+      paneHeadFor: function (d) {
+        if (d.phase === 'concat') return '正在写入 · 拼接分片';
+        if (d.phase === 'finalize') return '正在写入 · 收尾';
+        return '正在打包 · 并行文件';
+      },
+      /* 整体进度条：压缩阶段只走到 95%，剩下 5% 留给「拼接分片写最终文件」，避免 100% 却还在写盘 */
+      barPct: function (d, pct) {
+        if (d.phase === 'concat') {
+          var t = Number(d.concatTotal) || 0;
+          if (!t) return 95;
+          return 95 + Math.min(5, (Math.min(Number(d.concatDone) || 0, t) / t) * 5);
+        }
+        if (d.phase === 'finalize') return 100;
+        if (d.phase === 'collect') return pct;
+        return Math.min(95, pct * 0.95);
+      },
       cancelLabel: '取消导出', btn: btn,
       extractBar: false,
       statText: statText,
       rowEl: bundlePkgRow,
       phaseNote: function (d) {
         if (d.phase === 'collect') return (d.message || '正在统计要导出的包…') + '（这一步只读镜像里的元数据，可以取消）';
+        if (d.phase === 'concat') return '正在把并行压缩的分片按顺序拼成最终 .tgz 写入磁盘（不重新压缩，只读写一遍；大镜像这一步要几十秒到几分钟，可以取消）';
+        if (d.phase === 'finalize') return '正在收尾：重命名最终文件并清理临时分片，马上完成。';
         return '正在打包并压缩（gzip），可以点「取消导出」随时停下。';
       },
       start: function () {

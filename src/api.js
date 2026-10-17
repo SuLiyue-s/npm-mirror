@@ -894,6 +894,27 @@ async function handleAdmin(ctx) {
                     inFlight: Array.isArray(ev.inFlight) ? ev.inFlight.slice(0, 64) : [],
                   });
                 }
+                if (ev.phase === 'concat') {
+                  /* 全部条目压缩完但归档还没写完：正在把分片拼成最终文件（大镜像几十 GB，界面要显示写盘字节进度）。
+                   * current 也一并清掉：压缩阶段最后那个包已经写完了，收尾时右栏不该再挂一行「100%」。 */
+                  update({
+                    phase: 'concat',
+                    message: '正在拼接分片写入最终文件…',
+                    concatDone: Number(ev.concatDone) || 0,
+                    concatTotal: Number(ev.concatTotal) || 0,
+                    concatParts: Number(ev.concatParts) || 0,
+                    current: '', currentDone: 0, currentTotal: 0,
+                    inFlight: [],
+                  });
+                  return;
+                }
+                if (ev.phase === 'finalize') {
+                  update({
+                    phase: 'finalize', message: '正在收尾：重命名最终文件…',
+                    current: '', currentDone: 0, currentTotal: 0, inFlight: [],
+                  });
+                  return;
+                }
               },
             });
           } finally {

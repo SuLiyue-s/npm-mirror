@@ -29,6 +29,8 @@ function brief(t) {
     /* 并行打包/导入时同时在处理的包：{name,done,total}[]（导出 done/total = 已写/总文件数）
      * 注意这是白名单字段：不加进来，/tasks/<id> 快照里就看不到 */
     inFlight: t.inFlight || [],
+    /* 导出收尾阶段：并行压缩写完后「拼接分片 → 最终 .tgz」的字节进度（界面用它显示正在写盘，避免停在 100% 像卡死） */
+    concatDone: t.concatDone || 0, concatTotal: t.concatTotal || 0, concatParts: t.concatParts || 0,
     percent, elapsedMs, ratePerSec: Number(rate.toFixed(2)),
     bytesPerSec: Math.round(t.bytes / sec), etaSec,
     concurrency: t.concurrency,

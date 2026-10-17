@@ -509,6 +509,16 @@ async function get(p, { json = false } = {}) {
         && js.text.includes("if (p.file) {") && js.text.includes("target: 0, spin: true, size: Number(p.size) || 0")
         && js.text.includes("'压缩中…'") && js.text.includes('正在打包 · 并行文件')
         && js.text.includes('paneCountUnit'));
+    /* 收尾写盘阶段也要看得见：用户反馈「显示 100% 却不结束」，其实是压缩完在拼接分片写最终 .tgz。 */
+    check('导出收尾写盘阶段有进度：tar 报 concat 字节进度 → 任务快照 concatDone/concatTotal → 界面显示「正在拼接分片」',
+      /stage: 'concat'/.test(tarSrc) && /concatDone: Number\(s\.copied\)/.test(bundleSrc)
+        && /concatDone: Number\(ev\.concatDone\)/.test(apiSrc) && /concatDone: t\.concatDone \|\| 0/.test(tasksSrc)
+        && js.text.includes('正在把') && js.text.includes('拼接写入最终 .tgz')
+        && js.text.includes('正在写入 · 拼接分片')
+        && js.text.includes('paneHeadFor') && js.text.includes('barPct')
+        /* 右栏的 text 行（只有字节进度、没有 target）必须能过筛选，否则真机上这一行会被过滤掉、界面上看不到 */
+        && js.text.includes('!p.spin && !p.text') && js.text.includes('isWritePhase')
+        && /current: '', currentDone: 0, currentTotal: 0/.test(apiSrc));
   }
 
   console.log('\x1b[1m九、离线包并行导出 / 导入 + 「根目录名不是 package」兼容\x1b[0m');

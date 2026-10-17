@@ -1707,6 +1707,29 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
       }
       check('动态分配后归档仍可完整读取（12 个条目按名取回、字节数一致）', tailRead5 === tailFiles5.length,
         `read=${tailRead5}/${tailFiles5.length}`);
+
+      /* 收尾写盘阶段也要有进度（用户反馈：显示 100% 却不结束，不知道是不是卡在写盘）：
+       * 并行写完后 packTarGz 要把分片拼成最终归档，这一步必须往上报 stage:'concat' 的字节进度。 */
+      const stageEv5 = [];
+      await tarMod5.packTarGz(path.join(tmp5, 'stage.tgz'), entries5, {
+        concurrency: 2, onStage: (s) => stageEv5.push(s),
+      });
+      const concatEv5 = stageEv5.filter((s) => s && s.stage === 'concat');
+      const lastConcat5 = concatEv5[concatEv5.length - 1] || null;
+      check('tar 并行打包收尾阶段上报「拼接分片」字节进度（copied/total/parts，最后一次 copied=total）',
+        concatEv5.length >= 2 && !!lastConcat5 && Number(lastConcat5.total) > 0
+          && Number(lastConcat5.copied) === Number(lastConcat5.total) && Number(lastConcat5.parts) === 2,
+        `events=${concatEv5.length} last=${JSON.stringify(lastConcat5)}`);
+
+      /* 前端要靠任务快照里的字段画「正在写盘 X / Y GB」：brief() 是白名单，漏了字段界面就看不到 */
+      const tasksMod5 = require('../src/tasks');
+      const tsk5 = tasksMod5.create({ type: 'bundle-export', title: '收尾阶段字段测试', total: 2 });
+      tasksMod5.update(tsk5.id, { phase: 'concat', done: 2, concatDone: 5, concatTotal: 10, concatParts: 2, inFlight: [] });
+      const snap5 = tasksMod5.snapshot(tsk5.id);
+      tasksMod5.finish(tsk5.id, { status: 'done', result: null });
+      check('任务快照透传导出收尾写盘阶段的 concatDone/concatTotal/concatParts',
+        !!snap5 && snap5.phase === 'concat' && snap5.concatDone === 5 && snap5.concatTotal === 10 && snap5.concatParts === 2,
+        JSON.stringify({ phase: snap5 && snap5.phase, concatDone: snap5 && snap5.concatDone, concatTotal: snap5 && snap5.concatTotal, concatParts: snap5 && snap5.concatParts }));
     } finally {
       try { fs.rmSync(tmp5, { recursive: true, force: true }); } catch { /* 忽略 */ }
     }
@@ -1773,6 +1796,10 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
         check('导出任务结束后 inFlight 清空（右栏不留残留行）',
           !!fin && fin.status === 'done' && Array.isArray(fin.inFlight) && fin.inFlight.length === 0,
           `status=${fin && fin.status} inFlight=${JSON.stringify(fin && fin.inFlight)}`);
+        /* 收尾写盘阶段字段：即使这次导出太小、没采样到 concat 阶段，快照里也必须带这两个字段（默认 0） */
+        check('导出任务快照带收尾写盘阶段字段 concatDone/concatTotal',
+          !!fin && Number.isFinite(Number(fin.concatDone)) && Number.isFinite(Number(fin.concatTotal)),
+          JSON.stringify({ concatDone: fin && fin.concatDone, concatTotal: fin && fin.concatTotal }));
       }
     }
 

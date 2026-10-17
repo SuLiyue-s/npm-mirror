@@ -237,27 +237,59 @@ async function writeEntry(w, entries, i, ctx) {
   onEntryDone(i, e);
 }
 
-/** 按顺序把一个或多个 gzip 分片文件拼接到 outFile（标准 gzip 允许多个成员首尾相接） */
-async function concatFiles(parts, outFile) {
+/**
+ * 按顺序把一个或多个 gzip 分片文件拼接到 outFile（标准 gzip 允许多个成员首尾相接）
+ * onProgress({ copied, total })：已复制字节 / 分片总字节。
+ *   大镜像导出时这一步要读写几十 GB，界面必须能显示「正在写盘 X / Y GB」，否则进度条会停在 100% 像卡死。
+ * shouldAbort()：返回 true 时中断拼接并抛 ECANCELED（上层会删掉半成品）。
+ */
+async function concatFiles(parts, outFile, { onProgress, shouldAbort } = {}) {
+  let total = 0;
+  for (const p of parts) {
+    try { total += fs.statSync(p).size; } catch { /* 分片缺失时由读取阶段报错 */ }
+  }
+  let copied = 0;
+  let lastEmit = 0;
+  const report = (force) => {
+    if (!onProgress) return;
+    const now = Date.now();
+    if (!force && now - lastEmit < 300) return;
+    lastEmit = now;
+    try { onProgress({ copied, total }); } catch { /* 进度只是旁路信息，不能影响拼接 */ }
+  };
   const out = fs.createWriteStream(outFile);
   const done = new Promise((res, rej) => {
     out.on('finish', res);
     out.on('error', rej);
   });
-  for (const p of parts) {
-    await new Promise((res, rej) => {
-      const rs = fs.createReadStream(p);
-      let settled = false;
-      const fail = (e) => { if (settled) return; settled = true; try { rs.destroy(); } catch { /* 忽略 */ } rej(e); };
-      const ok = () => { if (settled) return; settled = true; res(); };
-      rs.on('error', fail);
-      rs.on('end', ok);
-      rs.on('close', () => { if (!settled) fail(new Error('tar: 读取压缩分片意外中断')); });
-      rs.pipe(out, { end: false });
-    });
+  done.catch(() => { /* 中断时由外层统一处理；这里先标记已处理，避免未捕获的 rejection */ });
+  try {
+    report(true);
+    for (const p of parts) {
+      await new Promise((res, rej) => {
+        const rs = fs.createReadStream(p, { highWaterMark: 4 * 1024 * 1024 });
+        let settled = false;
+        const fail = (e) => { if (settled) return; settled = true; try { rs.destroy(); } catch { /* 忽略 */ } rej(e); };
+        const ok = () => { if (settled) return; settled = true; res(); };
+        rs.on('data', (chunk) => {
+          if (shouldAbort && shouldAbort()) { fail(canceledError()); return; }
+          copied += chunk.length;
+          report(false);
+        });
+        rs.on('error', fail);
+        rs.on('end', ok);
+        rs.on('close', () => { if (!settled) fail(new Error('tar: 读取压缩分片意外中断')); });
+        rs.pipe(out, { end: false });
+      });
+    }
+    out.end();
+    await done;
+    copied = total;
+    report(true);
+  } catch (e) {
+    try { out.destroy(); } catch { /* 忽略 */ }
+    throw e;
   }
-  out.end();
-  await done;
 }
 
 /**
@@ -270,6 +302,8 @@ async function concatFiles(parts, outFile) {
  *   每个条目完成时回调一次，大文件流式读取期间每 250ms 再补一次，
  *   让界面上的体积进度条不会在大 tarball 上卡住不动。
  * shouldAbort()：返回 true 时抛 code=ECANCELED（条目开始前与读大文件期间都会检查）。
+ * onStage({ stage, copied, total, parts })：并行模式下最后一步「拼接 N 个分片写入最终归档」的阶段进度，
+ *   copied/total 是已写 / 待写字节；上层用它把「100% 却不结束」的写盘阶段显示出来（不重新压缩，只读写一遍）。
  * onEntryDone({ index, name, bytes })：每个条目写完回调一次；并行模式下顺序不固定，
  *   上层用 index（0 起）把条目映射回所属的包，别依赖回调顺序。
  * concurrency：>1 时起若干段并行压缩，所有段共享一个条目游标动态领取（谁写完谁接着拿，
@@ -277,12 +311,13 @@ async function concatFiles(parts, outFile) {
  *   最后按序拼接；标准 gzip 允许成员首尾相接，本工具读取器 / 7-Zip / gzip 命令都能正常解压。
  *   打包结果与单流完全等价，只是把 gzip 的 CPU 摊到多个线程上。
  */
-async function packTarGz(outFile, entries, { gzip = true, onProgress, shouldAbort, onEntryDone, concurrency = 1 } = {}) {
+async function packTarGz(outFile, entries, { gzip = true, onProgress, onStage, shouldAbort, onEntryDone, concurrency = 1 } = {}) {
   const entriesTotal = entries.length;
   const parts = gzip ? Math.max(1, Math.min(Number(concurrency) || 1, entriesTotal || 1)) : 1;
   const state = { count: 0, total: 0, entry: 0 };
   const active = new Set();        // 正在写的条目下标（并行打包时可能同时有多个），供上层映射成「并行处理中的包」
   let lastEmit = 0;
+  const stage = (info) => { if (!onStage) return; try { onStage(info); } catch { /* 忽略 */ } };
   const emit = (current, force) => {
     if (!onProgress) return;
     const now = Date.now();
@@ -343,7 +378,11 @@ async function packTarGz(outFile, entries, { gzip = true, onProgress, shouldAbor
   })());
   try {
     await Promise.all(jobs);
-    await concatFiles(partFiles, outFile);
+    // 最后一步：把各分片按序拼成最终归档（不重新压缩，只是读+写一遍字节；大镜像这里是几十 GB，必须报进度）
+    await concatFiles(partFiles, outFile, {
+      shouldAbort,
+      onProgress: (p) => stage({ stage: 'concat', parts: partFiles.length, copied: p.copied, total: p.total }),
+    });
   } catch (e) {
     abortAll();
     await Promise.allSettled(jobs);
