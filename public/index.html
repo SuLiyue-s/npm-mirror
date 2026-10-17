@@ -1,0 +1,501 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="color-scheme" content="dark" />
+<meta name="referrer" content="no-referrer" />
+<!-- 纵深防御：页面只加载自身资源；无内联 <script>、无 onclick 属性、无外链，可直接用严格策略 -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'" />
+<title>npm 私人镜像源 · 离线控制台</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<div class="fx-grid" aria-hidden="true"></div>
+<div class="fx-scan" aria-hidden="true"></div>
+<div class="fx-grain" aria-hidden="true"></div>
+
+<!-- ══════════════ 顶栏 ══════════════ -->
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark">◧</span>
+    <span class="brand-text">
+      <b>NPM&nbsp;MIRROR</b>
+      <i>私人镜像源 · 离线控制台</i>
+    </span>
+  </div>
+  <div class="topbar-chips">
+    <span class="chip" id="chip-mode" title="运行模式"><span class="lamp lamp-idle"></span><b>—</b></span>
+    <span class="chip" id="chip-uptime" title="服务运行时长">运行 —</span>
+    <span class="chip" id="chip-version" title="服务端版本">v—</span>
+    <span class="chip" id="chip-auth" title="鉴权状态"><span class="lamp lamp-idle"></span><span id="chip-auth-text">检测中…</span></span>
+  </div>
+  <div class="topbar-right">
+    <span class="clock" id="clock">--:--:--</span>
+    <button class="btn btn-ghost btn-sm" id="btn-token" title="设置 / 清除访问令牌">令牌</button>
+  </div>
+</header>
+
+<div class="shell">
+  <!-- ══════════════ 侧栏 ══════════════ -->
+  <nav class="sidebar" id="sidebar">
+    <div class="nav-group">
+      <div class="nav-label">MONITOR</div>
+      <button class="nav-item" data-page="overview"><span class="nav-ico">▤</span><span class="nav-txt">概览</span></button>
+      <button class="nav-item" data-page="packages"><span class="nav-ico">▦</span><span class="nav-txt">包管理</span></button>
+    </div>
+    <div class="nav-group">
+      <div class="nav-label">DATA</div>
+      <button class="nav-item" data-page="migrate"><span class="nav-ico">⇄</span><span class="nav-txt">迁移备份</span></button>
+    </div>
+    <div class="nav-group">
+      <div class="nav-label">SYSTEM</div>
+      <button class="nav-item" data-page="config"><span class="nav-ico">⚙</span><span class="nav-txt">配置</span></button>
+      <button class="nav-item" data-page="logs"><span class="nav-ico">≡</span><span class="nav-txt">日志</span></button>
+      <button class="nav-item" data-page="service"><span class="nav-ico">⏻</span><span class="nav-txt">服务</span></button>
+    </div>
+    <div class="sidebar-foot">
+      <div class="loadbar"><i id="side-load"></i></div>
+      <span class="side-hint" id="side-hint">READY</span>
+    </div>
+  </nav>
+
+  <!-- ══════════════ 内容区 ══════════════ -->
+  <main class="content" id="content">
+
+    <!-- ───────── 1. 概览 ───────── -->
+    <section class="view" id="view-overview">
+      <div class="view-head">
+        <div>
+          <h1>概览</h1>
+          <p class="view-sub">SYSTEM / OVERVIEW</p>
+        </div>
+        <div class="head-actions">
+          <span class="muted" id="ov-updated">—</span>
+          <button class="btn btn-sm" id="ov-refresh">刷新</button>
+        </div>
+      </div>
+
+      <div class="stat-grid" id="ov-stats"></div>
+
+      <div class="grid-2">
+        <div class="panel">
+          <h3 class="panel-title">服务状态 <em>SERVICE</em></h3>
+          <div class="kv-list" id="ov-service"></div>
+        </div>
+        <div class="panel">
+          <h3 class="panel-title">接入地址 <em>REGISTRY ENDPOINTS</em></h3>
+          <div id="ov-urls"></div>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="panel">
+          <h3 class="panel-title">上游与来源分布 <em>UPSTREAM / SOURCES</em></h3>
+          <div id="ov-upstream"></div>
+          <div class="bars" id="ov-sources"></div>
+        </div>
+        <div class="panel">
+          <h3 class="panel-title">快捷操作 <em>QUICK ACTIONS</em></h3>
+          <div class="action-grid" id="ov-actions">
+            <button class="act" data-act="add"><b>添加公共包</b><i>从上游拉取并缓存</i></button>
+            <button class="act" data-act="upload"><b>上传包</b><i>本地 .tgz / packument</i></button>
+            <button class="act" data-act="export"><b>导出备份</b><i>生成 bundle</i></button>
+            <button class="act" data-act="scan"><b>扫描本机 npm 缓存</b><i>离线搬运来源</i></button>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h3 class="panel-title">最近日志 <em>RECENT LOG</em></h3>
+        <pre class="log-tail" id="ov-logs">加载中…</pre>
+      </div>
+    </section>
+
+    <!-- ───────── 2. 包管理 ───────── -->
+    <section class="view" id="view-packages">
+      <div class="view-head">
+        <div>
+          <h1>包管理</h1>
+          <p class="view-sub">REGISTRY / PACKAGES</p>
+        </div>
+        <div class="head-actions">
+          <button class="btn btn-sm" id="pkg-add">＋ 添加公共包</button>
+          <button class="btn btn-sm btn-amber" id="pkg-upload">↑ 上传包</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="toolbar">
+          <div class="field grow">
+            <label for="pkg-q">搜索</label>
+            <input id="pkg-q" type="search" placeholder="包名关键词，回车搜索" autocomplete="off" />
+          </div>
+          <div class="field">
+            <label for="pkg-source">来源</label>
+            <select id="pkg-source">
+              <option value="all">全部</option>
+              <option value="upstream">上游 upstream</option>
+              <option value="private">私有 private</option>
+              <option value="upload">上传 upload</option>
+              <option value="cache">缓存 cache</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="pkg-sort">排序</label>
+            <select id="pkg-sort">
+              <option value="-updated">更新时间 ↓</option>
+              <option value="updated">更新时间 ↑</option>
+              <option value="name">包名 A→Z</option>
+              <option value="-name">包名 Z→A</option>
+              <option value="-downloads">下载量 ↓</option>
+              <option value="-size">体积 ↓</option>
+              <option value="-versions">版本数 ↓</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="pkg-size">每页</label>
+            <select id="pkg-size">
+              <option value="20">20</option>
+              <option value="50">50</option>
+              <option value="100">100</option>
+            </select>
+          </div>
+          <button class="btn btn-sm" id="pkg-refresh">刷新</button>
+          <span class="toolbar-sep"></span>
+          <button class="btn btn-sm" id="pkg-fill-tags-all"
+                  title="对镜像里【所有】包补 dist-tags 指向的版本（只下载缺的 tarball）。不用勾选任何包">全部包补 dist-tag 版本</button>
+          <button class="btn btn-sm" id="pkg-fill-latest-all"
+                  title="对镜像里【所有】包只补它们的最新版本（latest）的 tarball。不用勾选任何包">全部包补最新版本</button>
+        </div>
+
+        <div class="selbar" id="pkg-selbar" hidden>
+          <span>已选 <b id="pkg-selnum">0</b> 个包<span class="muted" id="pkg-miss-hint"></span></span>
+          <button class="btn btn-sm btn-amber" id="pkg-fill-tarball" title="把勾选的包缺的 tarball 从上游补下来（离线前必做）">补 tarball</button>
+          <select id="pkg-fill-mode" class="mini-sel" title="补 tarball 的范围">
+            <option value="tags">补 dist-tag 版本</option>
+            <option value="latest">只补最新版本</option>
+            <option value="all">补全部版本</option>
+          </select>
+          <label class="selbar-conc" title="同时下载的 tarball 数量（1~32），留空用配置页里的值">并发
+            <input type="number" id="pkg-fill-conc" class="mini-num" min="1" max="32" step="1" placeholder="6">
+          </label>
+          <button class="btn btn-sm" id="pkg-export-sel">导出选中</button>
+          <button class="btn btn-sm btn-danger" id="pkg-del-sel">批量删除</button>
+          <button class="btn btn-sm btn-ghost" id="pkg-sel-clear">取消选择</button>
+        </div>
+
+        <div class="table-wrap">
+          <table class="tbl" id="pkg-table">
+            <thead>
+              <tr>
+                <th class="col-chk"><input type="checkbox" id="pkg-chk-all" title="选中本页" /></th>
+                <th class="col-name">包名</th>
+                <th class="col-ver">最新版本</th>
+                <th class="num" title="已存 = 本地已有 tarball 的版本数；总 = 元数据里的全部版本数">版本数<small>已存 / 总</small></th>
+                <th class="num">体积</th>
+                <th class="num">下载量</th>
+                <th>来源</th>
+                <th class="col-time" title="本镜像最近一次收录/更新该包元数据的本地时间（不是上游发布时间，上游时间见包详情的「上游创建/上游更新」）">更新时间</th>
+                <th class="col-ops">操作</th>
+              </tr>
+            </thead>
+            <tbody id="pkg-tbody"></tbody>
+          </table>
+        </div>
+
+        <div class="pager" id="pkg-pager"></div>
+      </div>
+    </section>
+
+    <!-- ───────── 3. 迁移备份 ───────── -->
+    <section class="view" id="view-migrate">
+      <div class="view-head">
+        <div>
+          <h1>迁移备份</h1>
+          <p class="view-sub">DATA / MIGRATION</p>
+        </div>
+        <div class="head-actions">
+          <button class="btn btn-sm" id="mig-refresh">刷新列表</button>
+        </div>
+      </div>
+
+      <div class="panel guide">
+        <h3 class="panel-title">迁移到无网络电脑 · 操作指引 <em>HOW TO MOVE OFFLINE</em></h3>
+        <ol class="steps">
+          <li><b>在有网的机器上</b>打开「包管理」，把需要的公共包「添加」进来（tarball 会被缓存到本机）。</li>
+          <li>回到本页，在「导出备份」中选择范围（建议 <code>全部</code> 或 <code>仅公共缓存</code>），点击<b>导出 bundle</b>。</li>
+          <li>在下方「bundle 历史」里点<b>下载</b>，把生成的 <code>.tar</code>/<code>.tgz</code> bundle 拷到 U 盘。</li>
+          <li>把 U 盘插到<b>无网络的电脑</b>，启动本镜像源服务，打开本页，在「导入备份」里<b>拖入 bundle 文件</b>（或选择服务器上已有的 bundle）。</li>
+          <li>若该电脑装过 npm 全局包，可再用「从本机 npm 缓存导入」把 <code>_cacache</code> 里的包直接搬进镜像源，无需联网。</li>
+          <li>导入完成后在「配置」页生成客户端 <code>.npmrc</code>，让其它项目指向本镜像源即可离线安装。</li>
+        </ol>
+      </div>
+
+      <div class="grid-2">
+        <div class="panel">
+          <h3 class="panel-title">导出备份 <em>EXPORT BUNDLE</em></h3>
+          <div class="form-row">
+            <label>导出范围</label>
+            <div class="segbar" id="exp-scope">
+              <button class="seg is-on" data-scope="all">全部</button>
+              <button class="seg" data-scope="private">仅私有</button>
+              <button class="seg" data-scope="upstream">仅公共缓存</button>
+              <button class="seg" data-scope="selected">选中包</button>
+            </div>
+          </div>
+          <div class="form-row" id="exp-selected-row" hidden>
+            <label>选中包</label>
+            <div class="muted" id="exp-selected-info">尚未在「包管理」页勾选任何包</div>
+          </div>
+          <div class="form-row" id="exp-deps-row" hidden>
+            <label>依赖</label>
+            <label class="checkline"><input type="checkbox" id="exp-with-deps" checked /> 同时导出选中包的依赖（递归，自动跳过镜像里没有的包）</label>
+          </div>
+          <div class="form-row">
+            <label for="exp-name">自定义文件名</label>
+            <input id="exp-name" type="text" placeholder="可留空，例如 mirror-offline-2026" autocomplete="off" />
+          </div>
+          <div class="panel-actions">
+            <button class="btn" id="exp-run">导出 bundle</button>
+            <span class="muted" id="exp-status"></span>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h3 class="panel-title">导入备份 <em>IMPORT BUNDLE</em></h3>
+          <div class="form-row">
+            <label>服务器上已有</label>
+            <div class="row-inline">
+              <select id="imp-file"><option value="">（未选择）</option></select>
+              <button class="btn btn-sm" id="imp-run-file">导入</button>
+            </div>
+          </div>
+          <div class="dropzone" id="imp-drop">
+            <b>拖入 bundle 文件</b>
+            <i>或 <span class="link" id="imp-pick">点击选择文件</span>（.tar / .tgz / .tar.gz）</i>
+            <input type="file" id="imp-input" hidden />
+          </div>
+          <label class="checkline"><input type="checkbox" id="imp-overwrite" checked /> 覆盖已存在的同名包/版本</label>
+          <div class="panel-actions"><span class="muted" id="imp-status"></span></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h3 class="panel-title">bundle 历史 <em>BUNDLE ARCHIVE</em></h3>
+        <div class="table-wrap">
+          <table class="tbl">
+            <thead>
+              <tr>
+                <th>文件</th>
+                <th class="num">包数</th>
+                <th class="num">体积</th>
+                <th class="col-time" title="本机创建这个 bundle 的本地时间">创建时间</th>
+                <th>范围</th>
+                <th class="col-ops">操作</th>
+              </tr>
+            </thead>
+            <tbody id="mig-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h3 class="panel-title">从本机 npm 缓存导入 <em>LOCAL NPM CACHE</em></h3>
+        <div class="toolbar">
+          <button class="btn" id="scan-run">扫描缓存目录</button>
+          <label class="checkline"><input type="checkbox" id="scan-overwrite" /> 覆盖已存在</label>
+          <div class="grow"></div>
+          <div class="field grow">
+            <label for="scan-filter">过滤候选包</label>
+            <input id="scan-filter" type="search" placeholder="输入包名过滤" autocomplete="off" disabled />
+          </div>
+        </div>
+        <div class="toolbar">
+          <button class="btn btn-sm btn-amber" id="scan-import" disabled>导入选中</button>
+          <button class="btn btn-sm" id="scan-import-new" disabled title="只导入镜像里还没有的包，已存在的跳过">仅导入不存在的包</button>
+          <button class="btn btn-sm" id="scan-import-all" disabled title="把本机缓存里扫描到的包全部导入（已存在的按「覆盖已存在」决定是否覆盖）">全部导入</button>
+          <div class="grow"></div>
+          <div class="pager" id="scan-pager"></div>
+        </div>
+        <div class="scan-meta muted" id="scan-meta">尚未扫描。<span class="warn-text">扫描可能耗时十几秒。</span></div>
+        <div class="table-wrap scan-table">
+          <table class="tbl">
+            <thead>
+              <tr>
+                <th class="col-chk"><input type="checkbox" id="scan-chk-all" disabled /></th>
+                <th>包名</th>
+                <th>版本</th>
+                <th class="num">体积</th>
+                <th>tarball</th>
+                <th>状态</th>
+              </tr>
+            </thead>
+            <tbody id="scan-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ───────── 4. 配置 ───────── -->
+    <section class="view" id="view-config">
+      <div class="view-head">
+        <div>
+          <h1>配置</h1>
+          <p class="view-sub">SYSTEM / CONFIG</p>
+        </div>
+        <div class="head-actions">
+          <span class="muted" id="cfg-path">—</span>
+          <button class="btn btn-sm" id="cfg-reload">重新载入</button>
+          <button class="btn btn-sm" id="cfg-save">保存配置</button>
+        </div>
+      </div>
+
+      <div class="banner" id="cfg-restart" hidden>
+        <span class="lamp lamp-warn"></span>
+        <span id="cfg-restart-msg">配置已保存，<b>部分改动需要重启服务</b>后生效。</span>
+        <button class="btn btn-sm btn-amber" id="cfg-restart-now">立即重启</button>
+      </div>
+
+      <div class="panel" id="cfg-form-panel">
+        <h3 class="panel-title">服务端参数 <em>SERVER CONFIG</em></h3>
+        <div class="cfg-form" id="cfg-form">加载中…</div>
+        <div class="panel-actions">
+          <button class="btn" id="cfg-save-2">保存配置</button>
+          <span class="muted" id="cfg-status"></span>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h3 class="panel-title">客户端接入配置 <em>CLIENT .NPMRC</em></h3>
+        <div class="toolbar">
+          <div class="field">
+            <label for="npmrc-ip">IP</label>
+            <input id="npmrc-ip" type="text" placeholder="127.0.0.1" autocomplete="off" />
+          </div>
+          <div class="field">
+            <label for="npmrc-port">端口</label>
+            <input id="npmrc-port" type="number" placeholder="4873" autocomplete="off" />
+          </div>
+          <label class="checkline"><input type="checkbox" id="npmrc-token" checked /> 写入 token</label>
+          <button class="btn btn-sm" id="npmrc-run">生成</button>
+        </div>
+        <div class="split-2">
+          <div>
+            <div class="mini-title">项目级 <code>.npmrc</code><button class="btn btn-xs" data-copy-target="npmrc-text">复制</button></div>
+            <pre class="code" id="npmrc-text">点「生成」获取</pre>
+          </div>
+          <div>
+            <div class="mini-title">命令行 <code>npm config set</code><button class="btn btn-xs" data-copy-target="npmrc-cmds">复制</button></div>
+            <pre class="code" id="npmrc-cmds">点「生成」获取</pre>
+          </div>
+        </div>
+        <div class="mini-title">用户级 <code>.npmrc</code>（写入用户目录）<button class="btn btn-xs" data-copy-target="npmrc-proj">复制</button></div>
+        <pre class="code" id="npmrc-proj">—</pre>
+      </div>
+
+      <div class="panel">
+        <h3 class="panel-title">访问令牌 <em>ACCESS TOKEN</em></h3>
+        <div class="row-inline">
+          <input id="token-ro" class="mono" type="text" readonly value="—" />
+          <button class="btn btn-sm" data-copy-target="token-ro">复制</button>
+          <button class="btn btn-sm btn-danger" id="token-regen">重新生成令牌</button>
+        </div>
+        <p class="hint">重新生成后，所有使用旧令牌的客户端需更新 <code>.npmrc</code>；回环地址默认免鉴权。</p>
+      </div>
+    </section>
+
+    <!-- ───────── 5. 日志 ───────── -->
+    <section class="view" id="view-logs">
+      <div class="view-head">
+        <div>
+          <h1>日志</h1>
+          <p class="view-sub">SYSTEM / LOGS</p>
+        </div>
+        <div class="head-actions">
+          <span class="muted" id="log-meta">—</span>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="toolbar">
+          <div class="field">
+            <label for="log-lines">行数</label>
+            <select id="log-lines">
+              <option>100</option>
+              <option selected>200</option>
+              <option>500</option>
+              <option>1000</option>
+              <option>2000</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="log-level">级别</label>
+            <select id="log-level">
+              <option value="">全部</option>
+              <option value="debug">debug</option>
+              <option value="info">info</option>
+              <option value="warn">warn</option>
+              <option value="error">error</option>
+            </select>
+          </div>
+          <label class="checkline"><input type="checkbox" id="log-follow" checked /> 自动滚动 / 5s 轮询</label>
+          <div class="grow"></div>
+          <button class="btn btn-sm" id="log-refresh">刷新</button>
+          <button class="btn btn-sm" id="log-download">下载</button>
+          <button class="btn btn-sm btn-danger" id="log-clear">清空日志</button>
+        </div>
+        <pre class="log-view" id="log-view">加载中…</pre>
+      </div>
+    </section>
+
+    <!-- ───────── 6. 服务 ───────── -->
+    <section class="view" id="view-service">
+      <div class="view-head">
+        <div>
+          <h1>服务</h1>
+          <p class="view-sub">SYSTEM / SERVICE</p>
+        </div>
+        <div class="head-actions">
+          <button class="btn btn-sm" id="svc-refresh">刷新状态</button>
+        </div>
+      </div>
+
+      <div class="stat-grid" id="svc-stats"></div>
+
+      <div class="grid-2">
+        <div class="panel">
+          <h3 class="panel-title">进程信息 <em>PROCESS</em></h3>
+          <div class="kv-list" id="svc-info"></div>
+        </div>
+        <div class="panel">
+          <h3 class="panel-title">服务控制 <em>CONTROL</em></h3>
+          <div class="action-grid">
+            <button class="act" data-act="open"><b>打开本机地址</b><i>在浏览器中访问 registry</i></button>
+            <button class="act" data-act="restart"><b>重启服务</b><i>进程重启，短暂不可用</i></button>
+            <button class="act act-danger" data-act="shutdown"><b>停止服务</b><i>结束进程，需手动重新启动</i></button>
+          </div>
+          <div class="panel-actions"><span class="muted" id="svc-status"></span></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h3 class="panel-title">局域网共享 <em>LAN SHARING</em></h3>
+        <ul class="steps compact">
+          <li>确保「配置 → 服务 IP」为 <code>0.0.0.0</code>，浏览器访问 <code>http://&lt;本机IP&gt;:&lt;端口&gt;/</code>。</li>
+          <li>若其它电脑连不上，在 Windows 防火墙放行该端口：
+            <code>netsh advfirewall firewall add rule name="npm-mirror" dir=in action=allow protocol=TCP localport=4873</code></li>
+          <li>局域网客户端建议<b>关闭免鉴权</b>（<code>security.trustLocalhost=false</code> 或按需开启 <code>requireRead/requirePublish</code>），并分发 token。</li>
+          <li>客户端 <code>.npmrc</code> 用本机 IP（见「配置」页生成的接入配置）。</li>
+        </ul>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<div class="toasts" id="toasts"></div>
+<div id="modal-root"></div>
+<div id="drawer-root"></div>
+<script src="app.js" defer></script>
+</body>
+</html>

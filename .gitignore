@@ -1,0 +1,11 @@
+# 运行时数据：npm 包缓存（约 3GB）、日志、临时文件、本地配置（含访问令牌）、PID、导出 bundle
+data/
+
+# 自检/调试产生的日志与临时脚本
+*.log
+tmp/
+
+# 通用忽略
+node_modules/
+Thumbs.db
+.DS_Store
