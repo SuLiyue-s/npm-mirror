@@ -1582,8 +1582,38 @@
     var note = el('p', { class: 'muted', text: scopeAll ? '正在统计全部包的缺失版本…' : '正在统计缺失版本…' });
     var stat = el('div', { class: 'fill-stat', text: '' });
     /* 行按需创建：勾选模式下一开始就把选中的包建好；全部包模式下几百个包全建太浪费，
-     * 只在「真的有活干 / 出错」时建（paint 里懒建）。 */
+     * 只在「真的有活干 / 出错」时建（paint 里懒建）。
+     * 左栏最多保留 MAX_ROWS 行：超出后把「已完成」的老行收起来，腾位置给还没下完的包。
+     * 否则大任务（如全部包补全部版本）会先塞满 500 个「✓ 新增…」的行，看起来像全部完成，
+     * 实际后面还有大量包在下载 —— 出错的包永远保留，不收起。 */
     var MAX_ROWS = 500;
+    var order = [];                    // 建行顺序（回收时从最老的开始找）
+    var hiddenDone = {};               // 已收起行的包名：不再重建行（失败/未完成的不会被收起）
+    var hiddenNote = null;
+    function hiddenCount() { var n = 0; for (var k in hiddenDone) n++; return n; }
+    function showHiddenNote() {
+      if (!hiddenNote) {
+        hiddenNote = el('div', { class: 'fill-hidden-note', text: '' });
+        list.insertBefore(hiddenNote, list.firstChild);
+      }
+      hiddenNote.textContent = '已收起 ' + fmtNum(hiddenCount()) + ' 个已完成的包（左栏最多保留 '
+        + fmtNum(MAX_ROWS) + ' 行；失败和还没下完的包不会被收起）';
+    }
+    /* 回收一行：只收「已完成」（ok）的行；错误（err）、下载中（busy）、还没开始的行都不动 */
+    function reclaimRow() {
+      for (var i = 0; i < order.length; i++) {
+        var n = order[i], r = rows[n];
+        if (!r) { order.splice(i, 1); i--; continue; }
+        if ((' ' + r.className + ' ').indexOf(' ok ') < 0) continue;
+        if (r.parentNode) r.parentNode.removeChild(r);
+        delete rows[n];
+        order.splice(i, 1);
+        hiddenDone[n] = true;
+        showHiddenNote();
+        return true;
+      }
+      return false;
+    }
     function mkRow(n) {
       var fill = el('i', { class: 'tr-fill', style: 'width:0' });
       var tv = el('span', { class: 'tv', text: '统计中…' });
@@ -1592,7 +1622,7 @@
         el('div', { class: 'tr-in' }, [el('span', { class: 'tr-name', text: n }), tv])
       ]);
       r.__fill = fill; r.__tv = tv;
-      rows[n] = r; list.appendChild(r);
+      rows[n] = r; list.appendChild(r); order.push(n);
       return r;
     }
     if (!scopeAll) names.forEach(mkRow);
@@ -1656,7 +1686,8 @@
         if (!row) {
           if (!scopeAll) return;
           if (!(Number(p.target) > 0) && !p.error) return;      // 全部包模式：没活干的包不建行，避免几百行空壳
-          if (list.children.length >= MAX_ROWS) return;
+          if (hiddenDone[p.name] && !p.error) return;            // 已收起的老行不再重建（真出错了才重建）
+          if (Object.keys(rows).length >= MAX_ROWS && !reclaimRow()) return;
           row = mkRow(p.name);
         }
         var tv = row.__tv, fl = row.__fill;

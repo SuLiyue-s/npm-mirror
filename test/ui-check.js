@@ -237,6 +237,80 @@ async function get(p, { json = false } = {}) {
     }
   }
 
+  console.log('\x1b[1m五之二、补 tarball 进度弹窗左栏：超过行数上限时收起已完成的行\x1b[0m');
+  {
+    // 大任务（全部包补全部版本）会先塞满 500 个「✓」行，后面的包拿不到行，看起来像「全部完成」。
+    // 规则：超上限时从最老的开始收起「已完成」的行；错误 / 下载中 / 未开始的行绝不动（错误行永远保留）。
+    const hasReclaim = /function reclaimRow\s*\(/.test(js.text) && /var MAX_ROWS = 500;/.test(js.text)
+      && /function hiddenCount\s*\(/.test(js.text) && /fill-hidden-note/.test(js.text);
+    check('左栏保留 500 行上限，超上限时收起已完成的行并提示「已收起 N 个」', hasReclaim);
+    const onlyOk = /if \(\(' ' \+ r\.className \+ ' '\)\.indexOf\(' ok '\) < 0\) continue;/.test(js.text);
+    check('回收只挑「已完成」（ok）的行：错误、下载中、还没开始的行都不动', onlyOk);
+    const guard = /if \(hiddenDone\[p\.name\] && !p\.error\) return;/.test(js.text)
+      && /if \(Object\.keys\(rows\)\.length >= MAX_ROWS && !reclaimRow\(\)\) return;/.test(js.text);
+    check('已收起的包不再重复建行（真出错了才重建），建行前先检查行数上限', guard);
+    const noteCssBlock = (css.text.match(/\.fill-hidden-note\{[^}]*\}/) || [''])[0];
+    check('提示条样式 .fill-hidden-note 与项目风格一致（等宽字 + 虚线边框，暗色小字）',
+      /var\(--mono\)/.test(noteCssBlock) && /dashed/.test(noteCssBlock));
+
+    // 从 app.js 里抠出真实实现（hiddenCount / showHiddenNote / reclaimRow），注入假 DOM 跑一遍
+    try {
+      const from = js.text.indexOf('function hiddenCount()');
+      const to = js.text.indexOf('function mkRow(n)');
+      const snippet = from >= 0 && to > from ? js.text.slice(from, to) : '';
+      check('能从 app.js 中提取出回收逻辑（源码结构未被改乱）', snippet.length > 0);
+      const mkList = () => {
+        const kids = [];
+        const l = {
+          children: kids,
+          firstChild: null,
+          appendChild(node) { kids.push(node); l.firstChild = kids[0] || null; return node; },
+          insertBefore(node) { kids.unshift(node); l.firstChild = kids[0] || null; return node; },
+          removeChild(node) { const i = kids.indexOf(node); if (i >= 0) kids.splice(i, 1); l.firstChild = kids[0] || null; return node; }
+        };
+        return l;
+      };
+      const elStub = (tag, attrs) => ({
+        tag,
+        className: (attrs && attrs.class) || '',
+        textContent: (attrs && attrs.text) || '',
+        parentNode: null
+      });
+      const list = mkList();
+      const rows = {};
+      const order = [];
+      const hiddenDone = {};
+      const addRow = (name, cls) => {
+        const r = elStub('div', { class: 'taskrow tr-fillrow ' + cls });
+        r.__tv = { textContent: '' };
+        r.parentNode = list;
+        list.appendChild(r);
+        rows[name] = r;
+        order.push(name);
+      };
+      addRow('a', 'ok');       // 已完成 → 可收起
+      addRow('b', 'err');      // 出错 → 永远保留
+      addRow('c', 'busy');     // 下载中 → 不动
+      addRow('d', 'ok');       // 已完成 → 第二个被收起
+      const factory = new Function('rows', 'order', 'hiddenDone', 'hiddenNote', 'list', 'el', 'fmtNum', 'MAX_ROWS',
+        snippet + '\n; return { reclaimRow: reclaimRow, hiddenCount: hiddenCount, showHiddenNote: showHiddenNote };');
+      const impl = factory(rows, order, hiddenDone, null, list, elStub, (n) => String(n), 500);
+      const first = impl.reclaimRow();
+      const noteNode = list.children.find((x) => x.className === 'fill-hidden-note');
+      check('回收时跳过排在前面的出错行，收起最老的 completed 行并记录到 hiddenDone',
+        first === true && !rows.a && !!rows.b && !!rows.c && hiddenDone.a === true && order.join(',') === 'b,c,d');
+      check('回收后左栏顶部出现提示条，文案写明已收起数量和上限',
+        !!noteNode && /已收起 1 个已完成的包/.test(noteNode.textContent) && /左栏最多保留 500 行/.test(noteNode.textContent)
+        && /不会被收起/.test(noteNode.textContent));
+      const second = impl.reclaimRow();
+      const third = impl.reclaimRow();
+      check('再收一行后没有可收的就返回 false（出错/下载中的行一直保留，不会被清掉）',
+        second === true && !rows.d && !!rows.b && !!rows.c && third === false && impl.hiddenCount() === 2);
+    } catch (e) {
+      check('回收逻辑单测（源码注入假 DOM）', false, e.message);
+    }
+  }
+
   console.log('\x1b[1m六、导出时连带依赖 / 缓存导入分页与批量 / 下载进度双栏\x1b[0m');
   {
     // ① 指定导出库时其依赖也一并导出

@@ -680,6 +680,10 @@ pre.code{
 .taskrow.tr-summary>span{display:block}
 .taskrow.tr-summary .tv{margin-left:0;margin-top:2px;white-space:normal;word-break:break-word;line-height:1.55}
 
+/* 左栏行数上限提示：大任务里已完成的包会自动收起，避免看起来「全部完成」而实际还在下载 */
+.fill-hidden-note{padding:5px 9px;margin-bottom:2px;font-family:var(--mono);font-size:10.5px;line-height:1.5;
+  color:var(--txt-dim);background:rgba(255,255,255,.02);border:1px dashed var(--line-2);border-radius:var(--r)}
+
 /* 「补 tarball」逐包行：整行本身就是该包的下载进度条（包名与进度文字压在条内），左侧不再用色条 */
 .taskrow.tr-fillrow{position:relative;overflow:hidden;padding:0;border-left-width:1px;display:block}
 .taskrow.tr-fillrow .tr-in{position:relative;z-index:1;display:flex;gap:8px;align-items:baseline;justify-content:space-between;padding:6px 9px}
