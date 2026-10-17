@@ -315,7 +315,7 @@ code,kbd,pre{font-family:var(--mono)}
 .bar-row{display:grid;grid-template-columns:80px 1fr 84px;align-items:center;gap:9px;font-size:11.5px}
 .bar-row .nm{font-family:var(--mono);color:var(--txt-dim);letter-spacing:.04em}
 .bar-row .track{height:8px;background:#0a0f14;border:1px solid var(--line);overflow:hidden}
-.bar-row .fill{height:100%;background:linear-gradient(90deg,var(--cy-2),var(--cy));box-shadow:0 0 10px var(--cy-glow);transition:width .5s cubic-bezier(.22,.7,.3,1)}
+.bar-row .fill{display:block;height:100%;background:linear-gradient(90deg,var(--cy-2),var(--cy));box-shadow:0 0 10px var(--cy-glow);transition:width .5s cubic-bezier(.22,.7,.3,1)}
 .bar-row.am .fill{background:linear-gradient(90deg,var(--am-2),var(--am));box-shadow:0 0 10px var(--am-glow)}
 .bar-row.red .fill{background:linear-gradient(90deg,var(--red-2),var(--red))}
 .bar-row.blu .fill{background:linear-gradient(90deg,#2a6fa8,var(--blu))}

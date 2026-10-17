@@ -1172,9 +1172,11 @@
     keys.forEach(function (k) { maxv = Math.max(maxv, Number(by[k]) || 0); });
     keys.forEach(function (k, i) {
       var v = Number(by[k]) || 0;
+      /* 非零值至少给 2% 宽度，否则「上传 1 个」这类小占比会缩成看不见的细线 */
+      var pct = v > 0 ? Math.max(2, Math.round(v / maxv * 100)) : 0;
       bars.appendChild(el('div', { class: 'bar-row ' + (i === 3 ? 'blu' : (i === 1 || i === 2 ? 'am' : '')) }, [
         el('span', { class: 'nm', text: SOURCE_LABEL[k] }),
-        el('span', { class: 'track' }, [el('i', { class: 'fill', style: 'width:' + Math.round(v / maxv * 100) + '%' })]),
+        el('span', { class: 'track' }, [el('i', { class: 'fill', style: 'width:' + pct + '%' })]),
         el('span', { class: 'vl', text: fmtNum(v) })
       ]));
     });

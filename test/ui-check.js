@@ -767,6 +767,23 @@ async function get(p, { json = false } = {}) {
       '对勾两臂 5px/9px，浏览器整数取整后仍是清晰的 ✓；半选态画横杠');
   }
 
+  console.log('\x1b[1m十之五、概览页「上游与来源分布」条形图渲染\x1b[0m');
+  {
+    const jsBars = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
+    const cssBars = fs.readFileSync(path.join(__dirname, '..', 'public', 'style.css'), 'utf8');
+
+    check('来源分布条的填充是块级元素（<i> 默认内联会让 width/height 不生效，只剩深色轨道）',
+      /\.bar-row \.fill\{display:block;height:100%;background:linear-gradient\(90deg,var\(--cy-2\),var\(--cy\)\)/.test(cssBars)
+        && /\.bar-row \.track\{height:8px;background:#0a0f14;border:1px solid var\(--line\);overflow:hidden\}/.test(cssBars),
+      'fill 必须有 display:block，否则内联元素忽略宽度/高度，条形图只剩 8px 深色轨道');
+
+    check('非零来源至少给 2% 宽度（「上传 1 个」这类小占比不再缩成看不见的细线）',
+      /var pct = v > 0 \? Math\.max\(2, Math\.round\(v \/ maxv \* 100\)\) : 0;/.test(jsBars)
+        && /el\('i', \{ class: 'fill', style: 'width:' \+ pct \+ '%' \}\)/.test(jsBars)
+        && /var maxv = 1;[\s\S]*?maxv = Math\.max\(maxv, Number\(by\[k\]\) \|\| 0\)/.test(jsBars),
+      '按最大值归一化，非零值最小 2% 宽度');
+  }
+
   console.log(`\n\x1b[1m结果：${pass}/${pass + fail} 通过\x1b[0m\n`);
   finish(fail === 0 ? 0 : 1);
 })().catch((e) => { console.error('自检异常：', e); finish(1); });
