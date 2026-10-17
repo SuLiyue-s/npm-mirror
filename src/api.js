@@ -176,6 +176,7 @@ async function handleAdmin(ctx) {
     const data = store.list({
       q: q.get('q') || '',
       source: q.get('source') || 'all',
+      tarballs: q.get('tarballs') || 'all',
       sort: q.get('sort') || '-updated',
       page: q.get('page') || 1,
       size: q.get('size') || 20,

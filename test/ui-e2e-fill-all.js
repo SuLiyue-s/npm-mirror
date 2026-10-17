@@ -160,6 +160,39 @@ async function main() {
   check('工具栏有「全部包补最新版本」按钮', btns.ids && /全部包补最新版本/.test(btns.latest || ''), String(btns.latest));
   check('工具栏有「全部包补全部版本」按钮', btns.ids && /全部包补全部版本/.test(btns.all || ''), String(btns.all));
 
+  // ---- 「缺 tarball / 不缺 tarball」快捷筛选：真机点一下，断言列表真的按徽标过滤，再点同一个按钮回到全部
+  const tbState = () => evaluate(ws, `(function(){
+    var segs = document.querySelectorAll('#pkg-tb [data-tb]');
+    var on = null;
+    for (var i = 0; i < segs.length; i++) if (segs[i].classList.contains('is-on')) on = segs[i].getAttribute('data-tb');
+    var rows = document.querySelectorAll('#pkg-tbody tr');
+    var badges = 0;
+    for (var j = 0; j < rows.length; j++) if ((rows[j].textContent || '').indexOf('缺 tarball') >= 0) badges++;
+    var pager = document.getElementById('pkg-pager');
+    return { on: on, rows: rows.length, badges: badges, pager: pager ? (pager.textContent || '').trim().slice(0, 48) : '' };
+  })()`);
+  const clickTb = v => evaluate(ws, `(function(){ var b = document.querySelector('#pkg-tb [data-tb="${v}"]'); if (b) b.click(); return !!b; })()`);
+  const waitTb = async (fn, ms) => {
+    let st = null;
+    for (let i = 0; i < Math.ceil((ms || 8000) / 250); i++) {
+      await sleep(250);
+      st = await tbState();
+      if (st && fn(st)) return st;
+    }
+    return st;
+  };
+  const tb0 = await tbState();
+  check('工具栏有「缺 tarball / 不缺 tarball」两个分段按钮（默认都不选中）', tb0 && tb0.on === null && tb0.rows > 0, JSON.stringify(tb0));
+  await clickTb('missing');
+  const tbM = await waitTb(s => s.on === 'missing' && s.rows > 0 && s.badges === s.rows);
+  check('点「缺 tarball」后列表只剩缺 tarball 的包（每行都带徽标）', !!tbM && tbM.on === 'missing' && (tbM.rows === 0 || tbM.badges === tbM.rows), JSON.stringify(tbM));
+  await clickTb('complete');
+  const tbC = await waitTb(s => s.on === 'complete' && s.rows > 0 && s.badges === 0);
+  check('点「不缺 tarball」后列表只剩齐全的包（行内没有缺 tarball 徽标）', !!tbC && tbC.on === 'complete' && (tbC.rows === 0 || tbC.badges === 0), JSON.stringify(tbC));
+  await clickTb('complete');
+  const tbBack = await waitTb(s => s.on === null && s.rows > 0);
+  check('再点一次同一个按钮取消筛选、回到全部包', !!tbBack && tbBack.on === null && tbBack.rows > 0, JSON.stringify(tbBack));
+
   try {
     // ---- 全部包补最新版本
     await evaluate(ws, `document.getElementById('pkg-fill-latest-all').click(); 1`);

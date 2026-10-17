@@ -68,6 +68,7 @@ async function get(p, { json = false } = {}) {
     '缺少 [hidden]{display:none!important}，用 hidden 属性隐藏的元素会被 display:flex 覆盖而一直显示');
 
   const apiSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'api.js'), 'utf8');
+  const storeSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'store.js'), 'utf8');
 
   console.log('\x1b[1m三、前端调用的管理接口后端都有实现\x1b[0m');
   {
@@ -155,7 +156,7 @@ async function get(p, { json = false } = {}) {
     }
   }
 
-  console.log('\x1b[1m五、批量入口：「全部包补 dist-tag 版本 / 全部包补最新版本 / 全部包补全部版本」\x1b[0m');
+  console.log('\x1b[1m五、包管理工具栏：批量入口 + 「缺 tarball / 不缺 tarball」快捷筛选\x1b[0m');
   {
     const allBtns = ['pkg-fill-tags-all', 'pkg-fill-latest-all', 'pkg-fill-all-all'];
     const bothBtns = allBtns.every((id) => new RegExp(`id="${id}"`).test(home.text));
@@ -185,6 +186,33 @@ async function get(p, { json = false } = {}) {
 
     const skipLocal = /function allPackageNames\s*\(/.test(apiSrc) && /src !== 'upload' && src !== 'private'/.test(apiSrc);
     check('全部包模式会跳过只在本地的包（上传包 / 私有包），不会每次跑完都报失败', skipLocal);
+
+    // 快捷筛选：缺 tarball / 不缺 tarball（再点一次同一个按钮回到全部）
+    const tbHtml = /id="pkg-tb"/.test(home.text) && /data-tb="missing"/.test(home.text) && /data-tb="complete"/.test(home.text)
+      && /缺 tarball/.test(home.text) && /不缺 tarball/.test(home.text);
+    check('包管理工具栏有「缺 tarball / 不缺 tarball」两个快捷筛选按钮', tbHtml,
+      tbHtml ? '' : 'index.html 里缺少 #pkg-tb 或 data-tb="missing|complete"');
+    const tbJs = /tarballs: 'all'/.test(js.text) && /&tarballs=/.test(js.text)
+      && /function paintPackages/.test(js.text) && /data-tb/.test(js.text);
+    check('前端把 tarballs 筛选带进包列表请求，并在每次渲染时同步按钮高亮', tbJs);
+    const tbToggle = /state\.pkg\.tarballs === v \? 'all' : v/.test(js.text);
+    check('点同一个筛选按钮可取消筛选（再点一下回到「全部」）', tbToggle);
+    const tbBack = /tarballs: q\.get\('tarballs'\) \|\| 'all'/.test(apiSrc)
+      && /tarballs === 'missing' && missing === 0/.test(storeSrc)
+      && /tarballs === 'complete' && missing > 0/.test(storeSrc);
+    check('后端 /packages 透传 tarballs，store.list 按「版本数 - 已缓存数」判定缺/不缺', tbBack);
+    try {
+      const r1 = await get('/__admin/api/packages?size=5&tarballs=missing', { json: true });
+      const d1 = r1.json && r1.json.data;
+      const r2 = await get('/__admin/api/packages?size=5&tarballs=complete', { json: true });
+      const d2 = r2.json && r2.json.data;
+      const ok1 = r1.status === 200 && d1 && Array.isArray(d1.items) && d1.items.every((x) => x.hasAllTarballs === false);
+      const ok2 = r2.status === 200 && d2 && Array.isArray(d2.items) && d2.items.every((x) => x.hasAllTarballs === true);
+      check('GET /packages?tarballs=missing / complete 返回的每一行都符合筛选条件（真接口）', ok1 && ok2,
+        `missing=${d1 && d1.total} complete=${d2 && d2.total}`);
+    } catch (e) {
+      check('GET /packages?tarballs=missing / complete 返回的每一行都符合筛选条件（真接口）', false, e.message);
+    }
   }
 
   console.log('\x1b[1m六、导出时连带依赖 / 缓存导入分页与批量 / 下载进度双栏\x1b[0m');

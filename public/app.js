@@ -21,7 +21,7 @@
     paused: false,
     timers: {},
     authPrompted: false,
-    pkg: { q: '', source: 'all', sort: '-updated', page: 1, size: 20, total: 0, items: [], selected: {}, loading: false },
+    pkg: { q: '', source: 'all', tarballs: 'all', sort: '-updated', page: 1, size: 20, total: 0, items: [], selected: {}, loading: false },
     mig: { bundles: [], limits: null, scope: 'all', scan: null, scanSel: {}, scanFilter: '', scanPage: 1 },
     cfg: { raw: null, baseline: null, path: '', revealed: false },
     logs: { lines: [], level: '' }
@@ -581,6 +581,7 @@
 
   function loadPackages() {
     var p = state.pkg, qs = '?q=' + encodeURIComponent(p.q) + '&source=' + encodeURIComponent(p.source) +
+      '&tarballs=' + encodeURIComponent(p.tarballs || 'all') +
       '&sort=' + encodeURIComponent(p.sort) + '&page=' + p.page + '&size=' + p.size;
     setSideHint('LOADING…');
     var tb = $('#pkg-tbody');
@@ -596,9 +597,21 @@
     var p = state.pkg, tb = clear($('#pkg-tbody'));
     if (!tb) return;
     if (!p.items.length) {
+      var plain = !p.q && p.source === 'all';
+      var head = '镜像源里还没有包', sub = '点右上角「添加公共包」从上游拉取，或「上传包」导入本地 .tgz';
+      if (p.tarballs === 'missing') {
+        head = '没有「缺 tarball」的包';
+        sub = plain ? '当前镜像里每个包的所有版本都已缓存 tarball，可以放心离线安装' : '换个关键词或清掉其它筛选条件再试';
+      } else if (p.tarballs === 'complete') {
+        head = '没有 tarball 齐全的包';
+        sub = plain ? '每个包都还有版本没缓存 tarball，点「补 tarball」或上面的批量入口先补齐' : '换个关键词或清掉其它筛选条件再试';
+      } else if (!plain) {
+        head = '没有匹配的包';
+        sub = '换个关键词、把来源改成「全部」或取消 tarball 筛选再试';
+      }
       tb.appendChild(el('tr', {}, [el('td', { colspan: '9', class: 'empty' }, [
-        el('b', { text: p.q || p.source !== 'all' ? '没有匹配的包' : '镜像源里还没有包' }),
-        el('span', { text: p.q || p.source !== 'all' ? '换个关键词或把来源改成「全部」再试' : '点右上角「添加公共包」从上游拉取，或「上传包」导入本地 .tgz' })
+        el('b', { text: head }),
+        el('span', { text: sub })
       ])]));
     } else {
       p.items.forEach(function (it) {
@@ -634,6 +647,13 @@
     if (chk) {
       var allSel = p.items.length > 0 && p.items.every(function (i) { return p.selected[i.name]; });
       chk.checked = allSel; chk.indeterminate = !allSel && p.items.some(function (i) { return p.selected[i.name]; });
+    }
+    /* 「缺 tarball / 不缺 tarball」快捷筛选：按钮高亮跟随当前筛选（再点一次同一个按钮回到全部） */
+    var tbBar = $('#pkg-tb');
+    if (tbBar) {
+      $$('[data-tb]', tbBar).forEach(function (b) {
+        b.classList.toggle('is-on', b.getAttribute('data-tb') === p.tarballs);
+      });
     }
     paintPager();
     paintSelbar();
@@ -3525,6 +3545,15 @@
     on('pkg-q', 'input', debounce(function () { state.pkg.q = $('#pkg-q').value.trim(); state.pkg.page = 1; loadPackages(); }, 340));
     on('pkg-q', 'keydown', function (ev) { if (ev.key === 'Enter') { state.pkg.q = $('#pkg-q').value.trim(); state.pkg.page = 1; loadPackages(); } });
     on('pkg-source', 'change', function () { state.pkg.source = $('#pkg-source').value; state.pkg.page = 1; loadPackages(); });
+    /* 快捷筛选「缺 tarball / 不缺 tarball」：点一下筛选，再点同一个回到全部（两个按钮互斥高亮） */
+    on('pkg-tb', 'click', function (ev) {
+      var b = ev.target && ev.target.closest ? ev.target.closest('[data-tb]') : null;
+      if (!b) return;
+      var v = b.getAttribute('data-tb');
+      state.pkg.tarballs = state.pkg.tarballs === v ? 'all' : v;
+      state.pkg.page = 1;
+      loadPackages();
+    });
     on('pkg-sort', 'change', function () { state.pkg.sort = $('#pkg-sort').value; state.pkg.page = 1; loadPackages(); });
     on('pkg-size', 'change', function () { state.pkg.size = Number($('#pkg-size').value) || 20; state.pkg.page = 1; loadPackages(); });
     on('pkg-chk-all', 'change', function () {

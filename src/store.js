@@ -290,7 +290,7 @@ class Store {
     return Array.from(this.index.keys()).sort((a, b) => a.localeCompare(b));
   }
 
-  list({ q = '', source = 'all', sort = '-updated', page = 1, size = 20 } = {}) {
+  list({ q = '', source = 'all', tarballs = 'all', sort = '-updated', page = 1, size = 20 } = {}) {
     const kw = String(q || '').trim().toLowerCase();
     let items = [];
     for (const [name, meta] of this.index) {
@@ -300,6 +300,9 @@ class Store {
       const versionCount = Number.isFinite(meta.versionCount) ? meta.versionCount : fileCount;
       // 用「版本数 - 已缓存 tarball 数」估算缺失，避免逐个包读磁盘
       const missing = Math.max(0, versionCount - fileCount);
+      // 「缺 tarball / tarball 齐全」快捷筛选：missing 与 complete 互补，未知取值一律当全部（向后兼容）
+      if (tarballs === 'missing' && missing === 0) continue;
+      if (tarballs === 'complete' && missing > 0) continue;
       items.push({
         name,
         description: meta.description || '',

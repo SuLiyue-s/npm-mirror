@@ -143,6 +143,15 @@
             </select>
           </div>
           <div class="field">
+            <label>tarball 筛选</label>
+            <div class="segbar" id="pkg-tb">
+              <button class="seg" type="button" data-tb="missing"
+                      title="只显示还有版本没缓存 tarball 的包（离线前要重点补这些）">缺 tarball</button>
+              <button class="seg" type="button" data-tb="complete"
+                      title="只显示所有版本的 tarball 都已缓存的包">不缺 tarball</button>
+            </div>
+          </div>
+          <div class="field">
             <label for="pkg-sort">排序</label>
             <select id="pkg-sort">
               <option value="-updated">更新时间 ↓</option>

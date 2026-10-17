@@ -1160,6 +1160,51 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
     await roStore.close();
   }
 
+  // ---------------------------------------------------------------- 包管理页快捷筛选
+  section('五之九、包管理页「缺 tarball / 不缺 tarball」快捷筛选（GET /packages?tarballs=）');
+  {
+    const { Store } = require('../src/store');
+    const cfgMod = require('../src/config');
+    const quiet = { info() {}, warn() {}, error() {}, debug() {} };
+    const roStore = new Store({ dir: cfgMod.storageDir(), logger: quiet });
+    await roStore.init();
+
+    const names = roStore.names();
+    const allList = await api('/__admin/api/packages?size=1');
+    const totalAll = Number((allList.json && allList.json.data && allList.json.data.total) || 0);
+    let expMissing = 0;
+    for (const n of names) if (roStore.missingTarballs(n).length) expMissing++;
+    const expComplete = names.length - expMissing;
+
+    const missList = await api('/__admin/api/packages?size=5&tarballs=missing');
+    const compList = await api('/__admin/api/packages?size=5&tarballs=complete');
+    const missTotal = Number((missList.json && missList.json.data && missList.json.data.total) || 0);
+    const compTotal = Number((compList.json && compList.json.data && compList.json.data.total) || 0);
+    check('tarballs=missing 与 tarballs=complete 命中数之和 = 全部包数（两个筛选互补，不漏包不重包）',
+      missList.status === 200 && compList.status === 200 && missTotal + compTotal === totalAll,
+      `missing=${missTotal} complete=${compTotal} all=${totalAll}`);
+    check(`tarballs=missing 的命中数与逐包扫描一致（${expMissing} 个）`,
+      missTotal === expMissing, `api=${missTotal} store=${expMissing}`);
+    check(`tarballs=complete 的命中数与逐包扫描一致（${expComplete} 个）`,
+      compTotal === expComplete, `api=${compTotal} store=${expComplete}`);
+
+    const missItems = ((missList.json && missList.json.data && missList.json.data.items) || []);
+    const compItems = ((compList.json && compList.json.data && compList.json.data.items) || []);
+    check('tarballs=missing 返回的每一行都确实缺 tarball（hasAllTarballs=false，前端据此显示「缺 tarball」徽标）',
+      expMissing === 0 ? missItems.length === 0 : (missItems.length > 0 && missItems.every((x) => x.hasAllTarballs === false)),
+      `rows=${missItems.length} 首行=${missItems[0] && missItems[0].name}`);
+    check('tarballs=complete 返回的每一行 tarball 都齐全（hasAllTarballs=true）',
+      expComplete === 0 ? compItems.length === 0 : (compItems.length > 0 && compItems.every((x) => x.hasAllTarballs === true)),
+      `rows=${compItems.length} 首行=${compItems[0] && compItems[0].name}`);
+
+    const bogus = await api('/__admin/api/packages?size=1&tarballs=nonsense');
+    check('未知的 tarballs 取值按「全部」处理（老调用方/拼错参数不会把列表变空）',
+      Number((bogus.json && bogus.json.data && bogus.json.data.total) || -1) === totalAll,
+      `total=${bogus.json && bogus.json.data && bogus.json.data.total}`);
+
+    await roStore.close();
+  }
+
   // ---------------------------------------------------------------- 离线包
   section('六、离线包导出 / 导入（迁移用）');
   let bundleFile = null;
@@ -1805,11 +1850,17 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
       fs.rmSync(w3, { recursive: true, force: true });
     }
 
-    // B) 并发配置项：默认值、非法值、改大后任务并发度跟着变
+    // B) 并发配置项：字段暴露、默认值、非法值、改大后任务并发度跟着变
+    // 注意：这是用户可改的配置（可能已被改成 10 之类），断言只要求「字段在 1~16 合法范围 + 代码默认值是 4」，
+    // 并在小节结束处恢复成进来时的原值，别把测试改动留在用户配置里。
+    const cfgModD4 = require('../src/config');
+    const dflt4 = cfgModD4.defaults();
     const cfg0 = await api('/__admin/api/config');
     const st0 = (((cfg0.json || {}).data || {}).config || {}).storage || {};
-    check('GET /config 暴露离线包导出/导入并发（默认 4）',
-      Number(st0.bundleExportConcurrency) === 4 && Number(st0.bundleImportConcurrency) === 4,
+    const numIn = (v, lo, hi) => Number.isFinite(Number(v)) && Number(v) >= lo && Number(v) <= hi;
+    check('GET /config 暴露离线包导出/导入并发（字段在 1~16 之间，代码默认 4）',
+      numIn(st0.bundleExportConcurrency, 1, 16) && numIn(st0.bundleImportConcurrency, 1, 16)
+        && Number(dflt4.storage.bundleExportConcurrency) === 4 && Number(dflt4.storage.bundleImportConcurrency) === 4,
       JSON.stringify(st0));
     const badC1 = await api('/__admin/api/config', { method: 'PUT', body: { storage: { bundleExportConcurrency: 0 } } });
     check('PUT /config storage.bundleExportConcurrency=0 → 400',
@@ -1873,8 +1924,16 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
       }
     }
     for (const f of madeBundles4) await api(`/__admin/api/bundles?file=${encodeURIComponent(f)}`, { method: 'DELETE' });
-    // 恢复默认并发（4/4），别把测试改动留在用户配置里
-    await api('/__admin/api/config', { method: 'PUT', body: { storage: { bundleExportConcurrency: 4, bundleImportConcurrency: 4 } } });
+    // 恢复成本小节开始时的原值（用户可能把并发改过，别把测试用的 6 或默认 4 留在用户配置里）
+    await api('/__admin/api/config', {
+      method: 'PUT',
+      body: {
+        storage: {
+          bundleExportConcurrency: Number(st0.bundleExportConcurrency) || 4,
+          bundleImportConcurrency: Number(st0.bundleImportConcurrency) || 4,
+        },
+      },
+    });
   }
 
   // ---------------------------------------------------------------- 版本删除
