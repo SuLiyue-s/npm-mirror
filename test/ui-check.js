@@ -750,6 +750,21 @@ async function get(p, { json = false } = {}) {
         && /:focus-visible\{outline:2px solid rgba\(46,230,196,\.5\);outline-offset:2px\}/.test(cssCsel)
         && !/window\.confirm\(/.test(jsCsel)
         && /title: '覆盖已发布版本', sub: 'OVERWRITE', danger: true, confirmText: '覆盖'/.test(jsCsel));
+
+    check('下拉按钮右侧箭头在悬停 / 键盘聚焦 / 展开时变成项目青色（不再固定灰色）',
+      /\.csel-btn::after\{[\s\S]*?border-top:5px solid var\(--txt-dim\)/.test(cssCsel)
+        && /\.csel-btn:hover::after\{border-top-color:var\(--cy\)\}/.test(cssCsel)
+        && /\.csel-btn:focus-visible::after\{border-top-color:var\(--cy\)\}/.test(cssCsel)
+        && /\.csel-btn\[aria-expanded=true\]::after\{border-top-color:var\(--cy\)\}/.test(cssCsel)
+        && /\.dt-sel\[aria-expanded=true\]::after\{border-top-color:var\(--cy\)\}/.test(cssCsel)
+        && !/\.csel-btn\{[^}]*background-image/.test(cssCsel),
+      '箭头用边框三角绘制，颜色随状态切换，避免双渐变拼接的接缝');
+
+    check('复选框对勾放大加粗（5×9、45°）不再像斜线，全选「半选」态有横杠',
+      /input\[type=checkbox\]:checked::after\{[\s\S]*?width:5px;height:9px;[\s\S]*?rotate\(45deg\)/.test(cssCsel)
+        && /input\[type=checkbox\]:indeterminate\{background:var\(--cy\);border-color:var\(--cy\)/.test(cssCsel)
+        && /input\[type=checkbox\]:indeterminate::after\{[\s\S]*?width:8px;height:2px/.test(cssCsel),
+      '对勾两臂 5px/9px，浏览器整数取整后仍是清晰的 ✓；半选态画横杠');
   }
 
   console.log(`\n\x1b[1m结果：${pass}/${pass + fail} 通过\x1b[0m\n`);

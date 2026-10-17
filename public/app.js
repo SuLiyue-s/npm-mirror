@@ -1341,6 +1341,14 @@
     paintSelbar();
     var tr = $('#pkg-tbody input[data-name="' + (window.CSS && CSS.escape ? CSS.escape(name) : name.replace(/"/g, '\\"')) + '"]');
     if (tr && tr.closest) { var row = tr.closest('tr'); if (row) row.classList.toggle('is-selected', !!on); }
+    /* 同步表头「全选」框：部分勾选显示半选横杠，而不是一直空着 */
+    var chkAll = $('#pkg-chk-all');
+    if (chkAll && state.pkg.items && state.pkg.items.length) {
+      var selCount = 0;
+      state.pkg.items.forEach(function (i) { if (state.pkg.selected[i.name]) selCount++; });
+      chkAll.checked = selCount === state.pkg.items.length;
+      chkAll.indeterminate = selCount > 0 && selCount < state.pkg.items.length;
+    }
   }
 
   function delPackage(name) {

@@ -509,8 +509,12 @@ input[type=checkbox]{
 input[type=checkbox]:hover{border-color:var(--line-3)}
 input[type=checkbox]:checked{background:var(--cy);border-color:var(--cy);box-shadow:0 0 8px var(--cy-glow)}
 input[type=checkbox]:checked::after{
-  content:"";display:block;width:3px;height:7px;margin:1px 0 0 4px;
-  border:solid #06231e;border-width:0 2px 2px 0;transform:rotate(42deg);
+  content:"";display:block;width:5px;height:9px;margin:0 0 0 2.5px;
+  border:solid #06231e;border-width:0 2px 2px 0;transform:rotate(45deg);
+}
+input[type=checkbox]:indeterminate{background:var(--cy);border-color:var(--cy);box-shadow:0 0 8px var(--cy-glow)}
+input[type=checkbox]:indeterminate::after{
+  content:"";display:block;width:8px;height:2px;margin:5px 0 0 2px;background:#06231e;
 }
 input[type=checkbox]:disabled{opacity:.4;cursor:not-allowed}
 .checkline{display:inline-flex;align-items:center;gap:7px;font-size:12px;color:var(--txt-dim);cursor:pointer;user-select:none;padding-bottom:3px}
@@ -529,13 +533,19 @@ input[type=checkbox]:disabled{opacity:.4;cursor:not-allowed}
   background:#080d12;border:1px solid var(--line);border-radius:var(--r);
   color:var(--txt-hi);font-size:12.5px;font-family:var(--body);
   transition:border-color .15s,box-shadow .15s,background .15s;
-  background-image:linear-gradient(45deg,transparent 50%,var(--txt-dim) 50%),linear-gradient(135deg,var(--txt-dim) 50%,transparent 50%);
-  background-position:calc(100% - 14px) 51%,calc(100% - 9px) 51%;
-  background-size:5px 5px,5px 5px;background-repeat:no-repeat;
+}
+/* 右侧下拉箭头：边框三角，颜色跟随悬停 / 键盘聚焦 / 展开变成项目青色 */
+.csel-btn::after{
+  content:'';position:absolute;right:9px;top:50%;width:0;height:0;margin-top:-2px;
+  border-left:4px solid transparent;border-right:4px solid transparent;border-top:5px solid var(--txt-dim);
+  transition:border-top-color .15s;pointer-events:none;
 }
 .csel-btn:hover{border-color:var(--line-3)}
+.csel-btn:hover::after{border-top-color:var(--cy)}
 .csel-btn:focus-visible{outline:0;border-color:rgba(46,230,196,.6);box-shadow:0 0 0 2px var(--cy-glow);background-color:#0a1117}
+.csel-btn:focus-visible::after{border-top-color:var(--cy)}
 .csel-btn[aria-expanded=true]{border-color:rgba(46,230,196,.6);box-shadow:0 0 0 2px var(--cy-glow)}
+.csel-btn[aria-expanded=true]::after{border-top-color:var(--cy)}
 .csel-btn[disabled]{opacity:.5;cursor:not-allowed}
 .csel-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .field .csel{display:flex;width:100%}
