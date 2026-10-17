@@ -1734,6 +1734,13 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
         check('导出 inFlight 每项都是 {name,done,total}（右栏画进度条要的数值）',
           packs5.every((d) => d.inFlight.every(validFlight5)),
           JSON.stringify(packs5.map((d) => d.inFlight).slice(0, 3)));
+        /* 一个包可能被多个压缩分片同时写：每项带 workers（几路在写这个包），
+         * 「workers 之和」才是真正在并发写条目的路数，不能超过配置的并发数。 */
+        const maxWorkers5 = packs5.reduce((a, d) => Math.max(a, d.inFlight.reduce((s, x) => s + (Number(x.workers) || 1), 0)), 0);
+        check('导出 inFlight 带 workers，且并行写条目的路数不超过配置并发数',
+          packs5.every((d) => d.inFlight.every((x) => x.workers === undefined || (Number.isFinite(Number(x.workers)) && Number(x.workers) >= 1)))
+            && maxWorkers5 >= 1 && maxWorkers5 <= exConc5,
+          `maxWorkers=${maxWorkers5} 配置并发=${exConc5} 示例=${JSON.stringify((packs5.find((d) => d.inFlight.some((x) => Number(x.workers) > 1)) || {}).inFlight || [])}`);
         const rf5 = (fin && fin.result) || {};
         if (rf5.file) bundle5 = rf5.file;
         check('导出任务结束后 inFlight 清空（右栏不留残留行）',
@@ -1755,6 +1762,12 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
           `采样=${snaps.length} 有并行包快照=${ims5.length} 示例=${JSON.stringify((ims5[0] || {}).inFlight || [])}`);
         check('导入任务结束后 inFlight 清空', !!fin && Array.isArray(fin.inFlight) && fin.inFlight.length === 0,
           `status=${fin && fin.status} inFlight=${JSON.stringify(fin && fin.inFlight)}`);
+        /* 导入是「一个 worker 独占一个包」，每个在跑的包就是一路：workers 恒为 1，
+         * 行数 == 路数；这里顺带确认它不会超过配置的导入并发数。 */
+        const imMax5 = ims5.reduce((a, d) => Math.max(a, d.inFlight.length), 0);
+        check('导入 inFlight 每项 workers=1（一包一路），行数不超过配置并发数',
+          ims5.every((d) => d.inFlight.every((x) => Number(x.workers) === 1)) && imMax5 >= 1 && imMax5 <= imConc5,
+          `maxRows=${imMax5} 配置并发=${imConc5}`);
         check('导入任务的并发数来自配置（bundleImportConcurrency）', fin && Number(fin.concurrency) === imConc5,
           `concurrency=${fin && fin.concurrency} 期望=${imConc5}`);
       }

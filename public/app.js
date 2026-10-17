@@ -1454,19 +1454,25 @@
       });
       running = running.slice(0, max);
       var seen = {};
+      var totalWorkers = 0;
       running.forEach(function (p) {
         seen[p.name] = true;
+        totalWorkers += Math.max(1, Number(p.workers) || 1);
         var it = map[p.name];
         if (!it) {
           var fill = el('i', { class: 'tr-fill', style: 'width:0' });
           var tv = el('span', { class: 'tv', text: '' });
+          var nameEl = el('span', { class: 'tr-name', text: p.name });
           var row = el('div', { class: 'taskrow tr-fillrow busy' }, [
             fill,
-            el('div', { class: 'tr-in' }, [el('span', { class: 'tr-name', text: p.name }), tv])
+            el('div', { class: 'tr-in' }, [nameEl, tv])
           ]);
-          it = map[p.name] = { row: row, fill: fill, tv: tv };
+          it = map[p.name] = { row: row, fill: fill, tv: tv, nameEl: nameEl };
           box.appendChild(row);
         }
+        /* 一个包可能被多个压缩分片同时写：包名后标 ×N，别让人误以为只有 1 路在干活 */
+        var w = Math.max(1, Number(p.workers) || 1);
+        it.nameEl.textContent = w > 1 ? (p.name + ' ×' + w) : p.name;
         var pct = Math.round(Number(p.done) / Number(p.target) * 100);
         it.fill.style.width = Math.max(0, Math.min(100, pct)) + '%';
         it.tv.textContent = p.done + ' / ' + p.target + ' ' + unit + '（' + pct + '%）' + (showBytes ? ' · ' + fmtBytes(p.bytes || 0) : '');
@@ -1479,7 +1485,8 @@
       });
       empty.hidden = running.length > 0;
       if (!running.length) empty.textContent = ended ? endedText : emptyText;
-      cnt.textContent = running.length ? (countPrefix + ' ' + running.length + ' 个') : '';
+      cnt.textContent = running.length ? (countPrefix + ' ' + running.length + ' 个' +
+        (totalWorkers > running.length ? '（共 ' + totalWorkers + ' 路）' : '')) : '';
     }
 
     return {
@@ -2926,7 +2933,7 @@
       if (Array.isArray(d.inFlight) && d.inFlight.length) {
         d.inFlight.forEach(function (p) {
           if (!p || !p.name) return;
-          feed.push({ name: p.name, status: 'running', target: Number(p.total) || 0, done: Number(p.done) || 0 });
+          feed.push({ name: p.name, status: 'running', target: Number(p.total) || 0, done: Number(p.done) || 0, workers: Number(p.workers) || 1 });
         });
         lastCur = null;
       } else if (d.current) {

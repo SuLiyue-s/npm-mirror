@@ -464,22 +464,25 @@ async function exportBundle({
     },
     onProgress: (info) => {
       const cur = info.entry > 0 ? entryPkg[info.entry - 1] : null;
-      /* 并行打包时同时有多个包在写：把「正在写的条目」映射成包，去重后交给界面显示
-       * （原来只报最近完成的那个包，界面右栏就只剩 1 条，看起来像没有并行）。 */
-      const inFlight = [];
-      const seenFlight = new Set();
+      /* 并行打包时同时有多个包在写：把「正在写的条目」映射成包交给界面显示。
+       * 注意按包聚合后行数会比并发路数少：一个包可能被多个压缩分片同时写（如 typescript 有 3857 个文件），
+       * 所以给每行带上 workers（有几路正在写这个包），界面用「共 N 路」把真实并发数说清楚。 */
+      const byName = new Map();
       for (const idx of Array.isArray(info.active) ? info.active : []) {
         const p = entryPkg[idx];
-        if (!p || seenFlight.has(p.name)) continue;
-        seenFlight.add(p.name);
-        inFlight.push({
+        if (!p) continue;
+        const it = byName.get(p.name);
+        if (it) { it.workers += 1; continue; }
+        byName.set(p.name, {
           name: p.name,
           done: Math.min(pkgSeen.get(p.name) || 0, p.entries),
           total: p.entries,
           tarballs: p.tarballs,
           versions: p.versions,
+          workers: 1,
         });
       }
+      const inFlight = Array.from(byName.values());
       emit({
         phase: 'pack',
         entriesDone: info.count,
@@ -560,7 +563,9 @@ async function importBundle({
   /* 并行导入时同时有多个包在处理：维护「正在导入的包」集合，随每个事件带给界面，
    * 右栏才能像补 tarball 那样一条包一行（原来只留单个 current，并行 4 路也只显示 1 条）。 */
   const running = new Map();          // name -> {name, done, total}
-  const flight = () => Array.from(running.values()).map(x => ({ name: x.name, done: x.done, total: x.total }));
+  /* 导入是「一个 worker 独占一个包」，所以每个在跑的包就是一路；workers 固定 1，
+   * 界面统一用「共 N 路」汇总显示（导出侧一个包可能被多路分片同时写，workers 会 >1）。 */
+  const flight = () => Array.from(running.values()).map(x => ({ name: x.name, done: x.done, total: x.total, workers: 1 }));
   const emit = (ev) => {
     if (!onProgress) return;
     if (ev && ev.phase === 'package-start') {

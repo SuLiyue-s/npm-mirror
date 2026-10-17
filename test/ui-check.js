@@ -502,6 +502,13 @@ async function get(p, { json = false } = {}) {
         && /正在打包 · 并行包/.test(js.text) && /正在导入 · 并行包/.test(js.text));
     check('任务收尾清空 inFlight（导出/导入结束后右栏不留残行）',
       /update\(\{ inFlight: \[\] \}\)/.test(apiSrc) && /o\.update\(\{ inFlight: \[\] \}\)/.test(apiSrc));
+    /* 按包聚合后行数可能少于并发路数（一个包可被多个压缩分片同时写），
+     * 所以每行带 workers、标题汇总「共 N 路」，导入侧每包一路 workers:1。 */
+    check('并行包带 workers：导出按包聚合多路、导入一包一路，界面显示「共 N 路」与 ×N',
+      /const byName = new Map\(\)/.test(bundleSrc) && /it\.workers \+= 1/.test(bundleSrc)
+        && /workers: 1 \}/.test(bundleSrc)
+        && /（共 ' \+ totalWorkers \+ ' 路）/.test(js.text) && /' ×' \+ w/.test(js.text)
+        && /workers: Number\(p\.workers\) \|\| 1/.test(js.text));
   }
 
   console.log('\x1b[1m九、离线包并行导出 / 导入 + 「根目录名不是 package」兼容\x1b[0m');
