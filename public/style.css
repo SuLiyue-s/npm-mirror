@@ -795,7 +795,24 @@ pre.code{
   animation:spin .85s linear infinite;box-shadow:0 0 22px -4px var(--cy-glow);
 }
 
-/* ---------- 24. 响应式 ---------- */
+/* ---------- 24. 自绘悬浮提示（替代浏览器原生 title 弹窗） ---------- */
+.ui-tip{
+  position:fixed;left:0;top:0;z-index:6000;max-width:min(360px,calc(100vw - 16px));
+  padding:7px 10px 8px;background:linear-gradient(180deg,#101720 0%,#0a1017 100%);
+  border:1px solid var(--line-2);border-left:2px solid var(--cy-2);border-radius:var(--r);
+  box-shadow:0 14px 34px rgba(0,0,0,.62),inset 0 1px 0 rgba(255,255,255,.035);
+  color:var(--txt);font:11.5px/1.6 var(--mono);letter-spacing:.2px;white-space:pre-line;
+  pointer-events:none;opacity:0;transition:opacity .12s ease;will-change:left,top;
+}
+.ui-tip.on{opacity:1}
+.ui-tip::after{
+  content:"";position:absolute;left:var(--tip-ax,14px);top:-4px;width:7px;height:7px;
+  background:#101720;border-left:1px solid var(--line-2);border-top:1px solid var(--line-2);
+  transform:translateX(-50%) rotate(45deg);
+}
+.ui-tip.above::after{top:auto;bottom:-4px;transform:translateX(-50%) rotate(225deg)}
+
+/* ---------- 25. 响应式 ---------- */
 @media (max-width:1180px){
   .stat-grid{grid-template-columns:repeat(auto-fit,minmax(148px,1fr))}
 }

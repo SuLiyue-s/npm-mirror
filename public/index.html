@@ -26,14 +26,14 @@
     </span>
   </div>
   <div class="topbar-chips">
-    <span class="chip" id="chip-mode" title="运行模式"><span class="lamp lamp-idle"></span><b>—</b></span>
-    <span class="chip" id="chip-uptime" title="服务运行时长">运行 —</span>
-    <span class="chip" id="chip-version" title="服务端版本">v—</span>
-    <span class="chip" id="chip-auth" title="鉴权状态"><span class="lamp lamp-idle"></span><span id="chip-auth-text">检测中…</span></span>
+    <span class="chip" id="chip-mode" data-tip="运行模式"><span class="lamp lamp-idle"></span><b>—</b></span>
+    <span class="chip" id="chip-uptime" data-tip="服务运行时长">运行 —</span>
+    <span class="chip" id="chip-version" data-tip="服务端版本">v—</span>
+    <span class="chip" id="chip-auth" data-tip="鉴权状态"><span class="lamp lamp-idle"></span><span id="chip-auth-text">检测中…</span></span>
   </div>
   <div class="topbar-right">
     <span class="clock" id="clock">--:--:--</span>
-    <button class="btn btn-ghost btn-sm" id="btn-token" title="设置 / 清除访问令牌">令牌</button>
+    <button class="btn btn-ghost btn-sm" id="btn-token" data-tip="设置 / 清除访问令牌">令牌</button>
   </div>
 </header>
 
@@ -146,9 +146,9 @@
             <label>tarball 筛选</label>
             <div class="segbar" id="pkg-tb">
               <button class="seg" type="button" data-tb="missing"
-                      title="只显示还有版本没缓存 tarball 的包（离线前要重点补这些）">缺 tarball</button>
+                      data-tip="只显示还有版本没缓存 tarball 的包（离线前要重点补这些）">缺 tarball</button>
               <button class="seg" type="button" data-tb="complete"
-                      title="只显示所有版本的 tarball 都已缓存的包">不缺 tarball</button>
+                      data-tip="只显示所有版本的 tarball 都已缓存的包">不缺 tarball</button>
             </div>
           </div>
           <div class="field">
@@ -174,22 +174,22 @@
           <button class="btn btn-sm" id="pkg-refresh">刷新</button>
           <span class="toolbar-sep"></span>
           <button class="btn btn-sm" id="pkg-fill-tags-all"
-                  title="对镜像里【所有】包补 dist-tags 指向的版本（只下载缺的 tarball）。不用勾选任何包">全部包补 dist-tag 版本</button>
+                  data-tip="对镜像里【所有】包补 dist-tags 指向的版本（只下载缺的 tarball）。不用勾选任何包">全部包补 dist-tag 版本</button>
           <button class="btn btn-sm" id="pkg-fill-latest-all"
-                  title="对镜像里【所有】包只补它们的最新版本（latest）的 tarball。不用勾选任何包">全部包补最新版本</button>
+                  data-tip="对镜像里【所有】包只补它们的最新版本（latest）的 tarball。不用勾选任何包">全部包补最新版本</button>
           <button class="btn btn-sm btn-amber" id="pkg-fill-all-all"
-                  title="对镜像里【所有】包补齐全部缺失版本的 tarball（最全，也最耗流量和磁盘）。不用勾选任何包，弹窗里可随时取消">全部包补全部版本</button>
+                  data-tip="对镜像里【所有】包补齐全部缺失版本的 tarball（最全，也最耗流量和磁盘）。不用勾选任何包，弹窗里可随时取消">全部包补全部版本</button>
         </div>
 
         <div class="selbar" id="pkg-selbar" hidden>
           <span>已选 <b id="pkg-selnum">0</b> 个包<span class="muted" id="pkg-miss-hint"></span></span>
-          <button class="btn btn-sm btn-amber" id="pkg-fill-tarball" title="把勾选的包缺的 tarball 从上游补下来（离线前必做）">补 tarball</button>
-          <select id="pkg-fill-mode" class="mini-sel" title="补 tarball 的范围">
+          <button class="btn btn-sm btn-amber" id="pkg-fill-tarball" data-tip="把勾选的包缺的 tarball 从上游补下来（离线前必做）">补 tarball</button>
+          <select id="pkg-fill-mode" class="mini-sel" data-tip="补 tarball 的范围">
             <option value="tags">补 dist-tag 版本</option>
             <option value="latest">只补最新版本</option>
             <option value="all">补全部版本</option>
           </select>
-          <label class="selbar-conc" title="同时下载的 tarball 数量（1~32），留空用配置页里的值">并发
+          <label class="selbar-conc" data-tip="同时下载的 tarball 数量（1~32），留空用配置页里的值">并发
             <input type="number" id="pkg-fill-conc" class="mini-num" min="1" max="32" step="1" placeholder="6">
           </label>
           <button class="btn btn-sm" id="pkg-export-sel">导出选中</button>
@@ -201,14 +201,14 @@
           <table class="tbl" id="pkg-table">
             <thead>
               <tr>
-                <th class="col-chk"><input type="checkbox" id="pkg-chk-all" title="选中本页" /></th>
+                <th class="col-chk"><input type="checkbox" id="pkg-chk-all" data-tip="选中本页" /></th>
                 <th class="col-name">包名</th>
                 <th class="col-ver">最新版本</th>
-                <th class="num" title="已存 = 本地已有 tarball 的版本数；总 = 元数据里的全部版本数">版本数<small>已存 / 总</small></th>
+                <th class="num" data-tip="已存 = 本地已有 tarball 的版本数；总 = 元数据里的全部版本数">版本数<small>已存 / 总</small></th>
                 <th class="num">体积</th>
                 <th class="num">下载量</th>
                 <th>来源</th>
-                <th class="col-time" title="本镜像最近一次收录/更新该包元数据的本地时间（不是上游发布时间，上游时间见包详情的「上游创建/上游更新」）">更新时间</th>
+                <th class="col-time" data-tip="本镜像最近一次收录/更新该包元数据的本地时间（不是上游发布时间，上游时间见包详情的「上游创建/上游更新」）">更新时间</th>
                 <th class="col-ops">操作</th>
               </tr>
             </thead>
@@ -304,7 +304,7 @@
                 <th>文件</th>
                 <th class="num">包数</th>
                 <th class="num">体积</th>
-                <th class="col-time" title="本机创建这个 bundle 的本地时间">创建时间</th>
+                <th class="col-time" data-tip="本机创建这个 bundle 的本地时间">创建时间</th>
                 <th>范围</th>
                 <th class="col-ops">操作</th>
               </tr>
@@ -327,8 +327,8 @@
         </div>
         <div class="toolbar">
           <button class="btn btn-sm btn-amber" id="scan-import" disabled>导入选中</button>
-          <button class="btn btn-sm" id="scan-import-new" disabled title="只导入镜像里还没有的包，已存在的跳过">仅导入不存在的包</button>
-          <button class="btn btn-sm" id="scan-import-all" disabled title="把本机缓存里扫描到的包全部导入（已存在的按「覆盖已存在」决定是否覆盖）">全部导入</button>
+          <button class="btn btn-sm" id="scan-import-new" disabled data-tip="只导入镜像里还没有的包，已存在的跳过">仅导入不存在的包</button>
+          <button class="btn btn-sm" id="scan-import-all" disabled data-tip="把本机缓存里扫描到的包全部导入（已存在的按「覆盖已存在」决定是否覆盖）">全部导入</button>
           <div class="grow"></div>
           <div class="pager" id="scan-pager"></div>
         </div>

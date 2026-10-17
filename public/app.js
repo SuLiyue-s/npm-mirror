@@ -41,6 +41,8 @@
       else if (k === 'text') n.textContent = v;
       else if (k === 'html') n.innerHTML = v;
       else if (k.slice(0, 2) === 'on') n.addEventListener(k.slice(2), v);
+      /* 原生 title 弹窗又慢又丑，统一转成 data-tip 由 uiTip 自绘（样式与本项目一致） */
+      else if (k === 'title') n.setAttribute('data-tip', v === true ? '' : String(v));
       else n.setAttribute(k, v === true ? '' : String(v));
     }
     (kids || []).forEach(function (c) {
@@ -52,8 +54,89 @@
 
   function clear(node) { while (node && node.firstChild) node.removeChild(node.firstChild); return node; }
   function setText(id, t) { var n = document.getElementById(id); if (n) n.textContent = t; }
+  /* 动态改提示文案：统一写 data-tip，别用原生 title */
+  function setTip(n, s) {
+    if (!n) return;
+    if (s == null || s === '') n.removeAttribute('data-tip');
+    else n.setAttribute('data-tip', String(s));
+  }
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
   function pad2(n) { return (n < 10 ? '0' : '') + n; }
+
+  /* ================= 自绘悬浮提示（替代浏览器原生 title 弹窗） =================
+   * 所有 title 属性（HTML 中的 title="" 和 el() 里的 title:）都改写成 data-tip，
+   * 悬停时用本项目风格的浮层显示：深色面板 + 青色左侧强调条 + 等宽字体 + 指向目标的小箭头。 */
+  var uiTip = (function () {
+    var box = null, cur = null, timer = 0;
+    function node() {
+      if (!box) {
+        box = el('div', { class: 'ui-tip', 'aria-hidden': 'true' });
+        document.body.appendChild(box);
+      }
+      return box;
+    }
+    function textOf(t) {
+      var s = t.getAttribute ? t.getAttribute('data-tip') : null;
+      return s == null ? '' : String(s);
+    }
+    function place(t) {
+      var n = node(), r = t.getBoundingClientRect(), b = n.getBoundingClientRect();
+      var gap = 9, vw = window.innerWidth, vh = window.innerHeight;
+      var x = r.left + r.width / 2 - b.width / 2;
+      var y = r.bottom + gap;
+      var above = false;
+      if (y + b.height > vh - 8 && r.top - gap - b.height >= 8) { y = r.top - gap - b.height; above = true; }
+      if (x < 8) x = 8;
+      if (x + b.width > vw - 8) x = vw - 8 - b.width;
+      if (y < 8) y = 8;
+      var ax = Math.max(11, Math.min(b.width - 11, Math.round(r.left + r.width / 2 - x)));
+      n.style.left = Math.round(x) + 'px';
+      n.style.top = Math.round(y) + 'px';
+      n.style.setProperty('--tip-ax', ax + 'px');
+      n.classList.toggle('above', above);
+    }
+    function show(t) {
+      var s = textOf(t);
+      if (!s) return;
+      var n = node();
+      n.textContent = s;
+      n.classList.remove('on', 'above');
+      place(t);
+      n.classList.add('on');
+      cur = t;
+    }
+    function hide() {
+      clearTimeout(timer);
+      cur = null;
+      if (box) box.classList.remove('on');
+    }
+    function schedule(t) {
+      clearTimeout(timer);
+      cur = t;
+      timer = setTimeout(function () { if (cur === t) show(t); }, 130);
+    }
+    function closestTip(ev) {
+      var t = ev.target;
+      return t && t.closest ? t.closest('[data-tip]') : null;
+    }
+    document.addEventListener('mouseover', function (ev) {
+      var t = closestTip(ev);
+      if (!t || t === cur) return;
+      schedule(t);
+    });
+    document.addEventListener('mouseout', function (ev) {
+      var t = closestTip(ev);
+      if (!t) return;
+      var to = ev.relatedTarget;
+      if (to && t.contains(to)) return;
+      hide();
+    });
+    window.addEventListener('scroll', hide, true);
+    window.addEventListener('resize', hide);
+    window.addEventListener('mousedown', hide, true);
+    return { hide: hide, show: show };
+  })();
+
 
   function fmtNum(n) {
     if (n === null || n === undefined || isNaN(n)) return '—';
@@ -1097,9 +1180,9 @@
       versions.forEach(function (v) { if (pick[v.version] && v.cached) already++; });
       btnSel.textContent = '补选中 ' + items.length + ' 个';
       btnSel.disabled = items.length ? null : true;
-      btnSel.title = already
+      setTip(btnSel, already
         ? ('其中已缓存 ' + already + ' 个会被跳过；服务端只统计本地缺失的版本')
-        : '按勾选的版本补 tarball（后台任务 + 进度）';
+        : '按勾选的版本补 tarball（后台任务 + 进度）');
       var filt = available().length;
       btnAll.disabled = (filt && inFilter < filt) ? null : true;
       btnNone.disabled = items.length ? null : true;
@@ -1456,7 +1539,7 @@
         it.subEl.textContent = String(d.version) + ' · ' + (total > 0
           ? (pct + '% · ' + fmtBytes(recv) + ' / ' + fmtBytes(total))
           : (recv > 0 ? '已下载 ' + fmtBytes(recv) : '连接中…'));
-        it.row.title = key + (it.speed > 0 ? ' · ' + fmtBytes(it.speed) + '/秒' : '');
+        setTip(it.row, key + (it.speed > 0 ? ' · ' + fmtBytes(it.speed) + '/秒' : ''));
       });
       Object.keys(map).forEach(function (key) {
         if (seen[key]) return;
@@ -2436,8 +2519,8 @@
     var n = scanSelNames().length;
     if (importBtn) { importBtn.disabled = n === 0; importBtn.textContent = n ? ('导入选中（' + n + '）') : '导入选中'; }
     var newCount = (d.packages || []).filter(function (p) { return !p.local; }).length;
-    if (newBtn) { newBtn.disabled = newCount === 0; newBtn.title = '只导入镜像里还没有的包（当前 ' + fmtNum(newCount) + ' 个），已存在的跳过'; }
-    if (allBtn) { allBtn.disabled = !(d.packages || []).length; allBtn.title = '把本机缓存里扫描到的 ' + fmtNum((d.packages || []).length) + ' 个包全部导入（已存在的按「覆盖已存在」决定）'; }
+    if (newBtn) { newBtn.disabled = newCount === 0; setTip(newBtn, '只导入镜像里还没有的包（当前 ' + fmtNum(newCount) + ' 个），已存在的跳过'); }
+    if (allBtn) { allBtn.disabled = !(d.packages || []).length; setTip(allBtn, '把本机缓存里扫描到的 ' + fmtNum((d.packages || []).length) + ' 个包全部导入（已存在的按「覆盖已存在」决定）'); }
   }
 
   /**

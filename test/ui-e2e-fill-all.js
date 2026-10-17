@@ -193,6 +193,50 @@ async function main() {
   const tbBack = await waitTb(s => s.on === null && s.rows > 0);
   check('再点一次同一个按钮取消筛选、回到全部包', !!tbBack && tbBack.on === null && tbBack.rows > 0, JSON.stringify(tbBack));
 
+  // ---- 自绘悬浮提示：真机悬停，断言不再用浏览器原生 title、浮层按项目风格显示并自动隐藏
+  const tipState = () => evaluate(ws, `(function(){
+    var t = document.querySelector('.ui-tip');
+    var on = !!(t && t.classList.contains('on'));
+    var r = t ? t.getBoundingClientRect() : null;
+    return {
+      nativeTitles: document.querySelectorAll('[title]').length,
+      tips: document.querySelectorAll('[data-tip]').length,
+      on: on, text: t ? (t.textContent || '') : '',
+      rect: r ? { l: Math.round(r.left), t: Math.round(r.top), r: Math.round(r.right), b: Math.round(r.bottom) } : null,
+      vw: window.innerWidth, vh: window.innerHeight
+    };
+  })()`);
+  const hover = async (sel) => {
+    const box = await evaluate(ws, `(function(){ var n = document.querySelector(${JSON.stringify(sel)}); if (!n) return null;
+      var r = n.getBoundingClientRect(); return { x: Math.round(r.left + Math.min(r.width / 2, 24)), y: Math.round(r.top + r.height / 2) }; })()`);
+    if (!box) return null;
+    await rpc(ws, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: box.x, y: box.y, buttons: 0 });
+    for (let i = 0; i < 16; i++) {
+      await sleep(120);
+      const st = await tipState();
+      if (st && st.on) return st;
+    }
+    return await tipState();
+  };
+  const waitTipGone = async () => {
+    for (let i = 0; i < 16; i++) {
+      const st = await tipState();
+      if (st && !st.on) return st;
+      await sleep(120);
+    }
+    return await tipState();
+  };
+  const tip0 = await tipState();
+  check('页面不再用浏览器原生 title 提示（提示都走自绘浮层）', tip0 && tip0.nativeTitles === 0 && tip0.tips > 0, JSON.stringify({ nativeTitles: tip0 && tip0.nativeTitles, tips: tip0 && tip0.tips }));
+  await rpc(ws, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: 4, y: 4, buttons: 0 });
+  const tipHover = await hover('#chip-mode');
+  const inView = tipHover && tipHover.rect && tipHover.rect.l >= 0 && tipHover.rect.t >= 0 && tipHover.rect.r <= tipHover.vw && tipHover.rect.b <= tipHover.vh;
+  check('悬停顶栏「运行模式」出现自绘浮层，文案正确且完整落在视口内',
+    !!(tipHover && tipHover.on && /运行模式/.test(tipHover.text) && inView), JSON.stringify(tipHover && { text: tipHover.text, rect: tipHover.rect, vw: tipHover.vw, vh: tipHover.vh }));
+  await rpc(ws, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: 4, y: 4, buttons: 0 });
+  const tipGone = await waitTipGone();
+  check('鼠标移开后自绘浮层自动隐藏', !!(tipGone && !tipGone.on), JSON.stringify(tipGone && { on: tipGone.on }));
+
   try {
     // ---- 全部包补最新版本
     await evaluate(ws, `document.getElementById('pkg-fill-latest-all').click(); 1`);

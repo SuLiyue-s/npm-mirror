@@ -70,6 +70,28 @@ async function get(p, { json = false } = {}) {
   const apiSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'api.js'), 'utf8');
   const storeSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'store.js'), 'utf8');
 
+  console.log('\x1b[1m二之二、自绘悬浮提示（替代浏览器原生 title 弹窗）\x1b[0m');
+  {
+    const nativeTitles = (home.text.match(/[\s"']title=/g) || []).length;
+    const tipAttrs = (home.text.match(/[\s"']data-tip=/g) || []).length;
+    check('首页不再用原生 title 提示，全部改成 data-tip（交给自绘浮层）',
+      nativeTitles === 0 && tipAttrs >= 15, `原生 title=${nativeTitles} data-tip=${tipAttrs}`);
+    const mapTitle = /k === 'title'\) n\.setAttribute\('data-tip'/.test(js.text) && /function setTip\(n, s\)/.test(js.text);
+    check('app.js 的 el() 把 title: 自动映射成 data-tip，动态文案统一走 setTip',
+      mapTitle && !/\.title\s*=/.test(js.text), mapTitle ? '' : 'el() 没把 title 映射成 data-tip');
+    const ctrl = /var uiTip = \(function \(\)/.test(js.text) && /'\[data-tip\]'/.test(js.text)
+      && /addEventListener\('mouseover'/.test(js.text) && /addEventListener\('mouseout'/.test(js.text)
+      && /--tip-ax/.test(js.text) && /window\.innerWidth/.test(js.text);
+    check('自绘浮层逻辑齐全（悬停延迟显示、跟随鼠标目标、按视口自动翻转/夹边、箭头对准目标）', ctrl);
+    const tipCss = /\.ui-tip\{[^}]*position\s*:\s*fixed/.test(css.text)
+      && /\.ui-tip\.on\{[^}]*opacity\s*:\s*1/.test(css.text)
+      && /\.ui-tip::after\{/.test(css.text) && /\.ui-tip\.above::after\{/.test(css.text);
+    check('样式表有 .ui-tip 浮层样式（固定定位、显示态、小箭头、上方翻转）', tipCss);
+    const themed = /\.ui-tip\{[^}]*var\(--mono\)/.test(css.text)
+      && /\.ui-tip\{[^}]*var\(--line-2\)/.test(css.text) && /\.ui-tip\{[^}]*var\(--cy-2\)/.test(css.text);
+    check('浮层用项目自有配色/字体变量（--mono、--line-2、--cy-2），与整体风格一致', themed);
+  }
+
   console.log('\x1b[1m三、前端调用的管理接口后端都有实现\x1b[0m');
   {
     const ADMIN_API = (apiSrc.match(/const API\s*=\s*'([^']+)'/) || [])[1] || '/__admin/api';
