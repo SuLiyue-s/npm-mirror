@@ -3,7 +3,7 @@
  * 深度端到端检查（可选）：真机验证本轮三项改造
  *   A. 导出选中包时连带导出依赖（withDeps）
  *   B. 从本机 npm 缓存导入：候选表分页 + 「导入选中 / 仅导入不存在的包 / 全部导入」+ 成功提示不再恒为「成功 0」
- *   C. 下载进度弹窗右侧「正在下载的包」栏：单包大进度条、两栏等高、各自滚动
+ *   C. 下载进度弹窗右侧「正在下载 · 版本进度」栏：每个并发下载的 tarball 一条实时进度、两栏等高、各自滚动
  *
  * 断言链路：
  *   A1 包管理页搜索并勾选 chalk → 迁移页切到「选中包」→ 依赖勾选框出现且默认勾上 → 导出
@@ -15,7 +15,7 @@
  *   B5 导入后该行的状态徽标变成「本地已有」
  *   C1 自造一个缺 tarball 的测试包（120 个版本，dist.tarball 指向真实上游小文件）
  *   C2 勾选它 → 范围「补全部版本」→ 并发放 3 → 进度弹窗里左右两栏等高、各自 overflow:auto
- *   C3 右栏出现「正在下载 · 单包进度」，每条是 tr-fillrow 大进度条，文字形如「k / N 个（p%）」
+ *   C3 右栏出现「正在下载 · 版本进度」，每条是 tr-fillrow，文字形如「版本号 · p% · 已下载 / 总共」
  *   C4 截图、取消下载、弹窗关闭
  *   清理：删掉导出产物、导入进来的测试包、自造测试包
  *
@@ -129,7 +129,7 @@ const FILL = `(function(){
   var all = right ? right.querySelectorAll('.taskrow') : [];
   var busy = right ? right.querySelectorAll('.taskrow.busy') : [];
   function txt(e){ return e ? e.textContent.replace(/\\s+/g, ' ').trim() : ''; }
-  var tvEl = busy.length ? busy[0].querySelector('.tv') : (all.length ? all[0].querySelector('.tv') : null);
+  var tvEl = busy.length ? (busy[0].querySelector('.tr-sub') || busy[0].querySelector('.tv')) : (all.length ? (all[0].querySelector('.tr-sub') || all[0].querySelector('.tv')) : null);
   return {
     open: true, title: txt(h3), wide: m.classList.contains('wide'),
     colCount: cols.length, leftH: h(left), rightH: h(right), leftOv: ov(left), rightOv: ov(right),
@@ -659,7 +659,8 @@ async function main() {
         const s = await evaluate(ws, FILL);
         if (!s || !s.open) { closedEarly = true; break; }
         if (s.rightBusy > maxBusy) maxBusy = s.rightBusy;
-        if (s.tv) sawTv = s.tv;
+        if (s.tv && /\/\s*[\d.]+\s*(B|KB|MB|GB)/.test(String(s.tv))) sawTv = s.tv;   // 优先留「有字节数」的那次采样
+        else if (s.tv && !sawTv) sawTv = s.tv;
         if (!best || (s.colCount === 2 && (!best.colCount || s.rightBusy > best.rightBusy))) best = s;
         if (s.rightBusy >= 1 && Date.now() - t0 > 1500) {
           shotSize = await shot(ws, SHOT);
@@ -675,9 +676,11 @@ async function main() {
         Math.abs(snap.leftH - snap.rightH) <= 1 && snap.leftH >= 250, `left=${snap.leftH} right=${snap.rightH}`);
       check('两栏各自独立滚动（overflow-y: auto）',
         snap.leftOv === 'auto' && snap.rightOv === 'auto', `left=${snap.leftOv} right=${snap.rightOv}`);
-      check('右栏标题写明「正在下载 · 单包进度」', /正在下载/.test(snap.head || '') && /单包进度/.test(snap.head || ''), snap.head);
-      check('右栏出现正在下载的包（单包大进度条 ≥1 条）', maxBusy >= 1, `maxBusy=${maxBusy}`);
-      check('大进度条文字形如「k / N 个（p%）」（与单包下载行同款）', /\/\s*\d+\s*个（\d+%）/.test(String(sawTv || '')), String(sawTv).slice(0, 120));
+      check('右栏标题写明「正在下载 · 版本进度」', /正在下载/.test(snap.head || '') && /版本进度/.test(snap.head || ''), snap.head);
+      check('右栏出现正在下载的版本（每个并发下载一条实时进度）', maxBusy >= 1, `maxBusy=${maxBusy}`);
+      check('版本进度行文字形如「版本号 · p% · 已下载 / 总共」（测试包 tarball 很小，刚建连时可能是「连接中…」）',
+        /\d+%\s*·\s*[\d.]+\s*(B|KB|MB|GB)\s*\/\s*[\d.]+\s*(B|KB|MB|GB)/.test(String(sawTv || '')) || /连接中…/.test(String(sawTv || '')),
+        String(sawTv).slice(0, 120));
       check('左栏仍有原来的任务列表（没动原有内容）', snap.leftRows >= 1, `leftRows=${snap.leftRows}`);
       check(`截图已保存（${path.basename(SHOT)}）`, fs.existsSync(SHOT) && fs.statSync(SHOT).size > 10000, `${shotSize} 字节`);
 

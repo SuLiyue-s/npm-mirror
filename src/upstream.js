@@ -114,7 +114,7 @@ function disposeResponse(res) {
  * 读取响应体：超时覆盖整个 body 读取过程，并且限制最大字节数。
  * 超限时主动取消 body；超时时通过 __mirrorAbort 中断底层请求。
  */
-async function readBodyBuffer(res, { timeoutMs, maxBytes = DEFAULT_METADATA_MAX_BYTES, label = '上游响应读取超时' } = {}) {
+async function readBodyBuffer(res, { timeoutMs, maxBytes = DEFAULT_METADATA_MAX_BYTES, label = '上游响应读取超时', onProgress = null } = {}) {
   let timer = null;
   let reader = null;
   let timedOut = false;
@@ -151,6 +151,10 @@ async function readBodyBuffer(res, { timeoutMs, maxBytes = DEFAULT_METADATA_MAX_
         throw err;
       }
       chunks.push(Buffer.from(value));
+      // 实时字节进度：给「正在下载的每个版本」显示收到多少 / 总共多少（declared 缺失时为 0）
+      if (typeof onProgress === 'function') {
+        try { onProgress(total, Number.isFinite(declared) ? declared : 0); } catch { /* 进度回调异常不影响下载 */ }
+      }
     }
     if (timedOut) {
       const err = new Error(label);
@@ -453,8 +457,8 @@ class Upstream {
     return data;
   }
 
-  /** 下载并返回 Buffer（小文件用）；带超时、大小上限与完整性校验 */
-  async downloadTarball(url, { expectedIntegrity, expectedShasum, maxBytes } = {}) {
+  /** 下载并返回 Buffer（小文件用）；带超时、大小上限与完整性校验；onProgress(received, total) 用于实时字节进度 */
+  async downloadTarball(url, { expectedIntegrity, expectedShasum, maxBytes, onProgress } = {}) {
     assertSameHost(this.registry, url);
     const timeout = downloadTimeoutMs(this.cfg);
     const limit = tarballMaxBytes(this.cfg, maxBytes);
@@ -470,6 +474,7 @@ class Upstream {
       timeoutMs: timeout,
       maxBytes: limit,
       label: `上游 tarball 下载超时: ${url}`,
+      onProgress,
     });
     if (buf.length === 0) {
       const err = new Error(`上游 tarball 为空: ${url}`);

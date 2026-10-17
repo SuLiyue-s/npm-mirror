@@ -24,6 +24,8 @@ function brief(t) {
     skipped: t.skipped || 0,
     versions: t.versions || 0, tarballs: t.tarballs || 0,
     current: t.current || '', currentDone: t.currentDone || 0, currentTotal: t.currentTotal || 0,
+    /* 正在并发下载的每个版本（tarball）的实时字节进度：{name,version,received,total}[] */
+    downloads: t.downloads || [],
     percent, elapsedMs, ratePerSec: Number(rate.toFixed(2)),
     bytesPerSec: Math.round(t.bytes / sec), etaSec,
     concurrency: t.concurrency,

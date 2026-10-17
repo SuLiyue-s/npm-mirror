@@ -243,6 +243,21 @@ async function get(p, { json = false } = {}) {
     check('弹窗加宽到 wide 才能并排两栏（补 tarball 弹窗已用 wide）',
       /title: scopeAll \? '补 tarball · 全部包' : '补 tarball', sub: 'FETCH TARBALLS', body: body, sticky: true, wide: true/.test(js.text));
 
+    // ③-b 右侧改成「版本进度」：每个正在并发下载的版本（tarball 文件）一条，实时显示自身字节进度
+    const pullSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'pull.js'), 'utf8');
+    const upSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'upstream.js'), 'utf8');
+    const regSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'registry.js'), 'utf8');
+    check('补 tarball 弹窗右栏换成「正在下载 · 版本进度」栏（downloadsPane：每个并发下载一条实时进度）',
+      /function downloadsPane\s*\(/.test(js.text) && /正在下载 · 版本进度/.test(js.text)
+      && /runPane\.paint\(d\.downloads\)/.test(js.text) && /同时 ' \+ list\.length/.test(js.text));
+    check('版本进度行显示「已下载 / 总共（百分比）」字节数，并按采样算实时速度',
+      /fmtBytes\(recv\) \+ ' \/ ' \+ fmtBytes\(total\)/.test(js.text) && /it\.speed > 0/.test(js.text));
+    check('服务端把每个 tarball 的下载字节数逐块上报：readBodyBuffer/downloadTarball → ensureTarballEx(opts) → pullTarballs 的 downloads',
+      /onProgress/.test(upSrc) && /onProgress,/.test(upSrc) && /ensureTarballEx\(ctx, name, version, opts\)/.test(regSrc)
+      && /downloads: \[\]/.test(pullSrc) && /active\.delete\(ak\)/.test(pullSrc));
+    check('任务快照带 downloads 字段（api.js 把 info.downloads 透传，前端据此渲染版本级进度）',
+      /downloads: \(info\.downloads \|\| \[\]\)/.test(apiSrc));
+
     // ④ 从本机缓存导入的「具体导入进度」弹窗：正在导入的包 + 逐包导入详情
     const cacheModal = /function runCacheImport\s*\(/.test(js.text) && /从本机缓存导入/.test(js.text)
       && /正在导入 · 当前包/.test(js.text) && /取消导入/.test(js.text);

@@ -707,6 +707,11 @@ pre.code{
 .fill-run{display:flex;flex-direction:column;gap:5px}
 .fill-run-empty{color:var(--txt-faint);font-size:11.5px;padding:4px 2px;line-height:1.7}
 .fill-run-cnt{font-variant-numeric:tabular-nums;color:var(--txt-dim)}
+/* 右栏「版本进度」：每个正在下载的 tarball 一行（两行文字：包名 / 版本·字节），包名超长省略 */
+.taskrow.tr-fillrow.fill-dl{padding:3px 8px}
+.taskrow.tr-fillrow.fill-dl .tr-in{flex-direction:column;align-items:flex-start;gap:1px;padding:0}
+.taskrow.tr-fillrow.fill-dl .tr-name{max-width:100%;font-family:var(--mono);font-size:11.5px}
+.taskrow.tr-fillrow.fill-dl .tr-sub{max-width:100%;font-family:var(--mono);font-size:10.5px;color:var(--txt-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 /* 两栏都固定高度：窄屏（弹窗被压窄）时改成上下两栏，避免每栏窄到看不清 */
 @media (max-width:760px){
   .fill-cols{flex-direction:column}

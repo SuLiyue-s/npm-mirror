@@ -1382,6 +1382,76 @@
     return { el: col, paint: paint };
   }
 
+  /**
+   * 右侧「正在下载 · 版本进度」栏：每个**正在并发下载的版本（tarball）**一条进度条，
+   * 实时显示这个文件自己已收到多少字节 / 总共多少字节（像普通下载器那样看单个文件下到哪了）。
+   * 数据来自任务快照的 d.downloads（服务端 pullTarballs 逐数据块上报，400ms 节流）。
+   * 返回 { el, paint(downloads, ended) }。
+   */
+  function downloadsPane(conc, opts) {
+    opts = opts || {};
+    var headText = opts.head || '正在下载 · 版本进度';
+    var emptyText = opts.emptyText || '等待开始…';
+    var endedText = opts.endedText || '下载已结束';
+    var box = el('div', { class: 'fill-run' });
+    var empty = el('div', { class: 'fill-run-empty', text: emptyText });
+    box.appendChild(empty);
+    var cnt = el('span', { class: 'fill-run-cnt', text: '' });
+    var col = el('div', { class: 'fill-col fill-col-right' }, [
+      el('div', { class: 'fill-col-head' }, [el('span', { text: headText }), cnt]),
+      box
+    ]);
+    var map = {}, max = Math.max(1, Math.min(32, conc || 6));
+
+    function paint(downloads, ended) {
+      var list = (Array.isArray(downloads) ? downloads : []).slice(0, max);
+      var seen = {};
+      list.forEach(function (d) {
+        var key = String(d.name) + '@' + String(d.version);
+        seen[key] = true;
+        var it = map[key];
+        if (!it) {
+          var fill = el('i', { class: 'tr-fill', style: 'width:0' });
+          var nameEl = el('span', { class: 'tr-name', text: String(d.name) });
+          var subEl = el('span', { class: 'tr-sub', text: '' });
+          var row = el('div', { class: 'taskrow tr-fillrow busy fill-dl', title: key }, [
+            fill,
+            el('div', { class: 'tr-in' }, [nameEl, subEl])
+          ]);
+          it = map[key] = { row: row, fill: fill, nameEl: nameEl, subEl: subEl, lastRecv: 0, lastAt: 0, speed: 0 };
+          box.appendChild(row);
+        }
+        var recv = Number(d.received) || 0;
+        var total = Number(d.total) || 0;
+        var now = Date.now();
+        if (!it.lastAt) { it.lastRecv = recv; it.lastAt = now; }
+        else if (now - it.lastAt >= 300 && recv >= it.lastRecv) {
+          it.speed = (recv - it.lastRecv) / ((now - it.lastAt) / 1000);
+          it.lastRecv = recv; it.lastAt = now;
+        }
+        var pct = total > 0 ? Math.max(0, Math.min(100, Math.round(recv / total * 100))) : 0;
+        it.fill.style.width = pct + '%';
+        /* 两行：第一行包名（超长省略），第二行「版本 · 百分比 · 单文件已下载 / 总共」；
+         * 速度放 tooltip 里，避免窄栏被截断（用户要的是「这个文件实时下了多少」）。 */
+        it.subEl.textContent = String(d.version) + ' · ' + (total > 0
+          ? (pct + '% · ' + fmtBytes(recv) + ' / ' + fmtBytes(total))
+          : (recv > 0 ? '已下载 ' + fmtBytes(recv) : '连接中…'));
+        it.row.title = key + (it.speed > 0 ? ' · ' + fmtBytes(it.speed) + '/秒' : '');
+      });
+      Object.keys(map).forEach(function (key) {
+        if (seen[key]) return;
+        var old = map[key];
+        if (old.row.parentNode) old.row.parentNode.removeChild(old.row);
+        delete map[key];
+      });
+      empty.hidden = list.length > 0;
+      if (!list.length) empty.textContent = ended ? endedText : emptyText;
+      cnt.textContent = list.length ? '同时 ' + list.length + ' 个' : '';
+    }
+
+    return { el: col, paint: paint };
+  }
+
   function runFill(names, mode, targets, opts) {
     opts = opts || {};
     var scopeAll = !!opts.all;
@@ -1400,8 +1470,9 @@
     var skippedLocal = 0;                     // 全部包模式：服务端跳过的「仅本地」包（上传/私有）个数
     function noteSuffix() { return skippedLocal > 0 ? ' · 已跳过 ' + fmtNum(skippedLocal) + ' 个仅本地的包' : ''; }
     var rows = {}, list = el('div', { class: 'tasklist' });
-    /* 右侧新增一栏「正在下载的包」：与左侧任务列表等高、各自独立滚动；左侧原有内容不动。 */
-    var runPane = runningPane(conc);
+    /* 右侧新增一栏「正在下载的版本」：与左侧任务列表等高、各自独立滚动；左侧原有内容不动。
+     * 这里按「单个 tarball 实时字节进度」显示，而不是包级别的 已完成版本数/总数。 */
+    var runPane = downloadsPane(conc);
     var leftCol = el('div', { class: 'fill-col' }, [list]);   // 左栏才是滚动容器（.tasklist 在里面 overflow:visible）
     var cols = el('div', { class: 'fill-cols' }, [leftCol, runPane.el]);
     var bar = el('i', { style: 'width:0' });
@@ -1503,7 +1574,7 @@
         }
         mark('busy', pct, p.done + ' / ' + p.target + ' 个（' + pct + '%）· ' + fmtBytes(p.bytes || 0));
       });
-      runPane.paint(d.packages);
+      runPane.paint(d.downloads);
       lastPkgs = d.packages || [];
     }
 
@@ -1629,8 +1700,8 @@
     leftCol.addEventListener('scroll', function () {
       follow = leftCol.scrollTop + leftCol.clientHeight >= leftCol.scrollHeight - 24;
     });
-    /* 右侧新增一栏「正在下载的包」：解析阶段先显示「等待开始…」，下载阶段逐包显示大进度条 */
-    var runPane = runningPane(conc);
+    /* 右侧新增一栏「正在下载的版本」：解析阶段先显示「等待开始…」，下载阶段逐条（每个 tarball）显示实时字节进度 */
+    var runPane = downloadsPane(conc);
     var cols = el('div', { class: 'fill-cols' }, [leftCol, runPane.el]);
     var body = el('div', {}, [note, el('div', { class: 'progressbar' }, [bar]), stat, cols]);
     var timer = null, finished = false, taskId = null, phase = 'resolve', pollFails = 0;
@@ -1739,7 +1810,7 @@
           }
           mark('busy', pct, p.done + ' / ' + p.target + ' 个（' + pct + '%）· ' + fmtBytes(p.bytes || 0));
         });
-        runPane.paint(d.packages);
+        runPane.paint(d.downloads);
         return;
       }
       // 解析阶段：依赖树按发现顺序一行行长出来

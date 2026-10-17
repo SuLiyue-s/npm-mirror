@@ -232,11 +232,12 @@ async function ensurePackument(ctx, name, { force = false, full = false, publish
  * 返回 { path, reason }：path 非空=已可用；
  * path 为空时 reason 说明原因（cached/downloaded/offline/not-found/no-url），供调用方区分「下载失败」与「本来就没得下」。
  */
-async function ensureTarballEx(ctx, name, version) {
+async function ensureTarballEx(ctx, name, version, opts) {
   const existing = ctx.store.tarballPath(name, version);
   if (existing) return { path: existing, reason: 'cached' };
   const cfg = ctx.cfg();
   if ((cfg.mode || 'cache') === 'offline') return { path: null, reason: 'offline' };
+  const onProgress = opts && typeof opts.onProgress === 'function' ? opts.onProgress : null;
 
   // 同一个包同一版本并发请求时只下载一次，避免多个 npm install 同时触发重复下载与并发写同一文件
   const key = `${name}@${version}`;
@@ -257,6 +258,7 @@ async function ensureTarballEx(ctx, name, version) {
       const buf = await ctx.upstream.downloadTarball(url, {
         expectedIntegrity: manifest.dist.integrity,
         expectedShasum: manifest.dist.shasum,
+        onProgress,
       });
       const info = ctx.store.putTarball(name, version, buf);
       await ctx.store.withLock(name, async () => {

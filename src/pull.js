@@ -93,15 +93,42 @@ async function pullTarballs(ctx, opts) {
     mode, concurrency: limit, requested: names.length,
     total: jobs.length, done: 0, ok: 0, failed: 0, bytes: 0,
     packages: pkgs, errors: [], canceled: false,
+    downloads: [],
   };
   for (const p of plan) if (p.error) result.errors.push({ name: p.name, error: p.error });
 
-  const report = () => {
+  /* 正在下载的「版本」清单（不是包）：界面上要给每个并发下载显示它自己的实时字节进度，
+   * 类似「一个 10 MB 的文件已经下了多少」。下完 / 失败 / 取消后从清单里移除。 */
+  const active = new Map();            // key=name@version → { name, version, received, total, startedAt }
+  const activeKey = (n, v) => `${n}@${v}`;
+  let reportTimer = null;
+  let lastReportAt = 0;
+  const downloadsSnapshot = () => Array.from(active.values()).map(d => ({
+    name: d.name, version: d.version, received: d.received, total: d.total, startedAt: d.startedAt,
+  }));
+
+  const emit = () => {
+    result.downloads = downloadsSnapshot();
     if (typeof opts.onProgress === 'function') {
       try { opts.onProgress(result); } catch (e) { /* 进度回调异常不影响下载 */ }
     }
   };
-  report();
+  /* 每个数据块都推一次进度会让任务快照更新过于频繁（包清单本身很大），
+   * 所以按 400ms 节流；结束 / 开始新下载时用 report(true) 立即推。 */
+  function report(immediate) {
+    const now = Date.now();
+    if (!immediate && now - lastReportAt < 400) {
+      if (!reportTimer) {
+        reportTimer = setTimeout(() => { reportTimer = null; report(true); }, 400);
+        if (typeof reportTimer.unref === 'function') reportTimer.unref();
+      }
+      return;
+    }
+    lastReportAt = now;
+    if (reportTimer) { clearTimeout(reportTimer); reportTimer = null; }
+    emit();
+  }
+  report(true);
 
   let guard = 0;                       // 正在跑的任务数
   let cursor = 0;                      // 下一个待取任务下标
@@ -118,6 +145,8 @@ async function pullTarballs(ctx, opts) {
         // 收尾这一刻也要再看一眼取消标志：全部任务已派发、最后一个下载期间按下取消也必须生效
         if (!canceled && typeof opts.shouldStop === 'function' && opts.shouldStop()) canceled = true;
         if (canceled) result.canceled = true;
+        report(true);                    // 结束前把最终字节数推出去
+        if (reportTimer) { clearTimeout(reportTimer); reportTimer = null; }
         resolve(result);
       }
     }
@@ -129,8 +158,18 @@ async function pullTarballs(ctx, opts) {
         guard++;
         const pkg = byName.get(job.name);
         if (pkg) pkg.status = 'running';
+        const ak = activeKey(job.name, job.version);
+        const ad = { name: job.name, version: job.version, received: 0, total: 0, startedAt: Date.now() };
+        active.set(ak, ad);
+        report(true);                    // 立刻让界面出现这条「正在下载的版本」
         Promise.resolve()
-          .then(() => ctx.registry.ensureTarballEx(ctx, job.name, job.version))
+          .then(() => ctx.registry.ensureTarballEx(ctx, job.name, job.version, {
+            onProgress: (received, total) => {
+              ad.received = Number(received) || 0;
+              if (total) ad.total = Number(total) || 0;
+              report(false);             // 按 400ms 节流推给任务快照
+            },
+          }))
           .then((r) => {
             // 注意：ensureTarballEx 不抛异常时也可能"什么都没下到"（如元数据里没有 tarball 地址），
             // 这种情况必须算失败，否则会出现「新增 1 个 · 0 B」的假成功
@@ -152,7 +191,8 @@ async function pullTarballs(ctx, opts) {
             if (ctx.log && ctx.log.warn) ctx.log.warn(`补 tarball 失败 ${job.name}@${job.version}：${msg}`);
           })
           .then(() => {
-            report();
+            active.delete(ak);           // 从「正在下载」清单里移除
+            report(true);
             done();
             // 已取消 / 已停止就绝不再取新任务（避免"取消后仍在后台悄悄下载"）
             if (!canceled && guard < limit && cursor < jobs.length && !(typeof opts.shouldStop === 'function' && opts.shouldStop())) pump();
@@ -163,6 +203,8 @@ async function pullTarballs(ctx, opts) {
           canceled = true;
           result.canceled = true;
         }
+        report(true);
+        if (reportTimer) { clearTimeout(reportTimer); reportTimer = null; }
         resolve(result);
       }
     }

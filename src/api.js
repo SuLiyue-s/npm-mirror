@@ -398,6 +398,8 @@ async function handleAdmin(ctx) {
           onProgress: (info) => tasks.update(task.id, {
             done: info.done, ok: info.ok, failed: info.failed, bytes: info.bytes, packages: info.packages,
             errors: (info.errors || []).slice(0, 50),
+            /* 正在并发下载的「版本」实时字节进度（name/version/received/total），前端右栏逐条显示 */
+            downloads: (info.downloads || []).slice(0, 64),
           }),
           shouldStop: () => task.cancelRequested,
         }))
@@ -516,6 +518,8 @@ async function handleAdmin(ctx) {
               onProgress: (info) => tasks.update(task.id, {
                 done: info.done, ok: info.ok, failed: info.failed, bytes: info.bytes,
                 packages: info.packages, errors: (info.errors || []).slice(0, 50),
+                /* 每个正在下载版本的实时字节进度（递归添加依赖弹窗右栏也按版本显示） */
+                downloads: (info.downloads || []).slice(0, 64),
               }),
               shouldStop: () => task.cancelRequested,
             });

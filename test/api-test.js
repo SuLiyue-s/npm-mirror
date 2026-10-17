@@ -490,32 +490,51 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
 
   section('五之四、详情页按版本补 tarball（selected 模式 + 源体积字段）');
   {
-    // 详情接口要能给出「源服务器体积」，未缓存的版本也要有
-    const r = await api('/__admin/api/packages/' + encodeURIComponent('ms'));
-    const d = r.json && r.json.data;
-    const vs = (d && d.versions) || [];
+    // 详情接口要能给出「源服务器体积」，未缓存的版本也要有。
+    // 注意：不能硬编码 ms —— 镜像可能已被「全部包补全部版本」/用户操作补齐，全都缓存了就没有
+    // 「未缓存且带源体积」的版本可断言（会变成环境导致的假失败）。这里动态选一个还有未缓存版本的包。
+    const SRC_CANDS = ['typescript', 'debug', 'semver', 'chalk', 'lodash', 'ms'];
+    let srcName = '';
+    let vs = [];
+    for (const cand of SRC_CANDS) {
+      const cr = await api('/__admin/api/packages/' + encodeURIComponent(cand));
+      const cv = (cr.json && cr.json.data && cr.json.data.versions) || [];
+      if (cv.some(v => v.sourceSizeBytes > 0 && !v.cached)) { srcName = cand; vs = cv; break; }
+    }
+    if (!srcName) {
+      const r0 = await api('/__admin/api/packages/ms');
+      srcName = 'ms';
+      vs = (r0.json && r0.json.data && r0.json.data.versions) || [];
+    }
     check('详情每个版本都带 sourceSizeBytes（源服务器 tarball 体积）',
       vs.length > 0 && vs.every(v => Number.isFinite(v.sourceSizeBytes)),
-      `versions=${vs.length} 首个=${JSON.stringify(vs[0] && { version: vs[0].version, src: vs[0].sourceSizeBytes })}`);
+      `包=${srcName} versions=${vs.length} 首个=${JSON.stringify(vs[0] && { version: vs[0].version, src: vs[0].sourceSizeBytes })}`);
     check('源体积来自上游元数据（至少一个 > 0，未缓存版本也有）',
       vs.some(v => v.sourceSizeBytes > 0 && !v.cached),
-      `未缓存且带源体积的版本数=${vs.filter(v => v.sourceSizeBytes > 0 && !v.cached).length}`);
+      `包=${srcName} 未缓存且带源体积的版本数=${vs.filter(v => v.sourceSizeBytes > 0 && !v.cached).length}`);
     check('详情带 unpackedSizeBytes / fileCount（可为 0）',
       vs.every(v => Number.isFinite(v.unpackedSizeBytes) && Number.isFinite(v.fileCount)),
       `首个=${JSON.stringify(vs[0] && { un: vs[0].unpackedSizeBytes, fc: vs[0].fileCount })}`);
 
-    // selected 模式：只补点名的、且本地缺失的版本；已缓存的不计入 total
-    const cachedOne = vs.find(v => v.cached && v.sourceSizeBytes > 0);
-    const uncachedOne = vs.find(v => !v.cached && v.sourceSizeBytes > 0);
+    // selected 模式：只补点名的、且本地缺失的版本；已缓存的不计入 total。
+    // 同样不能硬编码 ms：它可能已被补全（全缓存）就没有「未缓存版本」可用，动态挑一个两种版本都有的包。
+    const SEL_CANDS = ['ms', 'debug', 'semver', 'chalk', 'lodash', 'typescript', 'is-number'];
+    let selName = '', cachedOne = null, uncachedOne = null;
+    for (const cand of SEL_CANDS) {
+      const cvs = ((await api('/__admin/api/packages/' + encodeURIComponent(cand))).json.data || {}).versions || [];
+      const c1 = cvs.find(v => v.cached && v.sourceSizeBytes > 0);
+      const u1 = cvs.find(v => !v.cached && v.sourceSizeBytes > 0);
+      if (c1 && u1) { selName = cand; cachedOne = c1; uncachedOne = u1; break; }
+    }
     if (cachedOne && uncachedOne) {
       const rr = await api('/__admin/api/packages/pull', {
         method: 'POST',
-        body: { mode: 'selected', targets: [{ name: 'ms', version: cachedOne.version }, { name: 'ms', version: uncachedOne.version }] },
+        body: { mode: 'selected', targets: [{ name: selName, version: cachedOne.version }, { name: selName, version: uncachedOne.version }] },
       });
       const dd = rr.json && rr.json.data;
       check('selected 模式只统计「未缓存」的点名版本（已缓存的不计入 total）',
         rr.status === 200 && dd && dd.mode === 'selected' && dd.total === 1,
-        `status=${rr.status} mode=${dd && dd.mode} total=${dd && dd.total}（点了 1 个已缓存 ${cachedOne.version} + 1 个未缓存 ${uncachedOne.version}）`);
+        `包=${selName} status=${rr.status} mode=${dd && dd.mode} total=${dd && dd.total}（点了 1 个已缓存 ${cachedOne.version} + 1 个未缓存 ${uncachedOne.version}）`);
       let td = null;
       for (let i = 0; i < 40; i++) {
         const t = await api(`/__admin/api/tasks/${dd.taskId}`);
@@ -526,7 +545,7 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
       check('selected 模式只下载点名的那一个版本',
         !!td && td.total === 1 && td.ok === 1 && td.failed === 0,
         `total=${td && td.total} ok=${td && td.ok} failed=${td && td.failed}`);
-      const after = (await api('/__admin/api/packages/' + encodeURIComponent('ms'))).json.data;
+      const after = (await api('/__admin/api/packages/' + encodeURIComponent(selName))).json.data;
       const rec = (after.versions || []).find(v => v.version === uncachedOne.version);
       check('补充后该版本变为已缓存，且本地体积与源体积一致',
         !!rec && rec.cached === true && rec.sizeBytes === rec.sourceSizeBytes,
@@ -534,8 +553,8 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
       const emp = await api('/__admin/api/packages/pull', { method: 'POST', body: { mode: 'selected', targets: [] } });
       check('selected 模式不给 targets 返回 400', emp.status === 400, `status=${emp.status} ${emp.text.slice(0, 120)}`);
     } else {
-      // 不删除用户 ms 的已有缓存来硬造前置条件：环境不满足就显式跳过（SKIP 会单列，不算通过）
-      skip('selected 模式（按版本补 tarball）', `ms 需要同时存在已缓存/未缓存版本，当前 cachedOne=${!!cachedOne} uncachedOne=${!!uncachedOne}`);
+      // 不删除用户已有缓存来硬造前置条件：环境不满足就显式跳过（SKIP 会单列，不算通过）
+      skip('selected 模式（按版本补 tarball）', `需要同时存在已缓存/未缓存版本的包，候选 ${SEL_CANDS.join('/')} 都没有（可能都被补全了）`);
     }
   }
 
@@ -1008,6 +1027,58 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
       planAll.length === totalPkgs && sum(planAll) === missTotal && sum(planAll) >= sum(planTags),
       `all=${sum(planAll)} tags=${sum(planTags)} missing=${missTotal}`);
 
+    // ---- 版本级实时下载进度：进度弹窗右侧「正在下载 · 版本进度」栏的数据来源 ----
+    // 用假 store / registry 验证：onProgress 里能看到每个并发下载的版本各自 received/total（像普通下载器看单个文件），
+    // 下载完成即从 downloads 列表移除；400ms 节流不会把最终数据吞掉。
+    {
+      const fsM = require('node:fs');
+      const osM = require('node:os');
+      const pathM = require('node:path');
+      const tarFile = pathM.join(osM.tmpdir(), `pull-progress-${process.pid}-${Date.now()}.tgz`);
+      fsM.writeFileSync(tarFile, Buffer.alloc(1024));
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+      const fakeStore = {
+        get() { return { packument: { 'dist-tags': { latest: '1.0.1' }, versions: { '1.0.0': {}, '1.0.1': {} } } }; },
+        missingTarballs() { return ['1.0.0', '1.0.1']; },
+      };
+      const seen = [];
+      const fakeCtx = {
+        cfg: () => ({ mode: 'cache', upstream: { concurrency: 2 } }),
+        store: fakeStore,
+        log: quiet,
+        registry: {
+          TARBALL_REASON_TEXT: {},
+          async ensureTarballEx(c, pkgName, version, o) {
+            // 模拟真实下载：先报到 30%，过一会儿到 70%，再返回本地文件
+            if (o && o.onProgress) o.onProgress(30, 100);
+            await sleep(430);                 // 超过 400ms 节流窗口，确保这个中间值会被推出去
+            if (o && o.onProgress) o.onProgress(70, 100);
+            await sleep(430);
+            return { path: tarFile, reason: 'downloaded' };
+          },
+        },
+      };
+      const pr = await pullMod.pullTarballs(fakeCtx, {
+        names: ['fake-progress-pkg'], mode: 'all', concurrency: 2,
+        onProgress: (info) => seen.push((info.downloads || []).map((d) => ({
+          name: d.name, version: d.version, received: d.received, total: d.total,
+        }))),
+      });
+      const flat = seen.flat();
+      const got30 = flat.find((d) => d.received === 30 && d.total === 100);
+      const got70 = flat.find((d) => d.received === 70 && d.total === 100);
+      check('版本级进度：每个正在下载的版本都带「已收到 / 总共」字节数（received=30/70, total=100）',
+        !!got30 && !!got70 && flat.every((d) => d.name === 'fake-progress-pkg'),
+        `snapshots=${seen.length} 30=${JSON.stringify(got30)} 70=${JSON.stringify(got70)}`);
+      check('版本级进度：并发时同时列出多个版本的下载（concurrency=2 → 快照里出现 2 条）',
+        seen.some((list) => list.length === 2 && new Set(list.map((d) => d.version)).size === 2),
+        `max=${Math.max(0, ...seen.map((l) => l.length))}`);
+      check('版本级进度：下载完成后从 downloads 里移除（结束时列表为空）',
+        pr.ok === 2 && pr.total === 2 && Array.isArray(pr.downloads) && pr.downloads.length === 0,
+        `ok=${pr.ok} total=${pr.total} downloads=${pr.downloads && pr.downloads.length}`);
+      try { fsM.unlinkSync(tarFile); } catch { /* 忽略 */ }
+    }
+
     // 走真接口：scope=all 的 all 任务（全部包补全部版本）—— 建任务后立刻取消，只验证模式/标题/可取消，不把镜像真的补全
     const pullAll = await api('/__admin/api/packages/pull', {
       method: 'POST', body: { all: true, mode: 'all', concurrency: 1 }, timeoutMs: 60000,
@@ -1075,6 +1146,10 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
     check('全部包任务能取消并正常收尾（不会顺手把镜像补全）',
       !!fin && fin.status !== 'running' && fin.status !== 'error',
       `status=${fin && fin.status} message=${fin && fin.message}`);
+
+    check('任务快照带 downloads 字段（版本级实时字节进度；任务结束后清空）',
+      Array.isArray(fin && fin.downloads) && fin.downloads.length === 0,
+      `downloads=${JSON.stringify((fin && fin.downloads) || null)}`);
 
     const res = (fin && fin.result) || {};
     check('任务结果带 scope=all 与逐包明细（前端「全部包」模式据此渲染每一行）',

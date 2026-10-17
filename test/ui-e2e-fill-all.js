@@ -127,6 +127,18 @@ async function main() {
   });
   await rpc(ws, 'Runtime.enable');
   await rpc(ws, 'Page.enable');
+  /* 无头浏览器刚起时，CDP 的 page target 可能还停在 about:blank / 正在导航，
+   * 这时读写 localStorage 会抛 SecurityError；先等页面真正落到镜像源地址再继续 */
+  let onApp = false;
+  for (let i = 0; i < 40 && !onApp; i++) {
+    const href = await evaluate(ws, `String(location.href)`).catch(() => '');
+    if (href && href.indexOf(BASE) === 0) onApp = true;
+    else await sleep(300);
+  }
+  if (!onApp) {
+    await rpc(ws, 'Page.navigate', { url: `${BASE}/#/packages` }).catch(() => null);
+    await sleep(1500);
+  }
   if (TOKEN) {
     await evaluate(ws, `localStorage.setItem('npm-mirror-token', ${JSON.stringify(TOKEN)}); location.reload(); 1`);
     await sleep(1500);
@@ -176,6 +188,21 @@ async function main() {
       return false;
     })()`);
     check('点「开始补下载」进入进度弹窗', !!startOk);
+
+    // 右栏必须是「版本进度」：每个正在并发下载的 tarball 一条，显示自身已收/总共字节（不是包级版本计数）
+    const rightPane = await evaluate(ws, `(function(){
+      var h = document.querySelector('#modal-root .fill-col-right .fill-col-head');
+      var rows = document.querySelectorAll('#modal-root .fill-col-right .fill-run .taskrow');
+      return {
+        head: h ? (h.textContent||'').trim() : '',
+        rows: rows.length,
+        texts: Array.prototype.map.call(rows, function(r){ return (r.textContent||'').trim(); }).slice(0, 4)
+      };
+    })()`);
+    check('进度弹窗右栏标题是「正在下载 · 版本进度」', /版本进度/.test(rightPane.head || ''), rightPane.head);
+    check('版本进度行显示单文件的「已下载 / 总共」字节（有正在下的版本时）',
+      rightPane.rows === 0 || rightPane.texts.some(x => /\//.test(x) && /(B|KB|MB|GB)/.test(x)),
+      `rows=${rightPane.rows} texts=${JSON.stringify(rightPane.texts)}`);
 
     // ---- 进度弹窗：标题 / 说明 / 跑完后的按钮状态
     let snap = null, finishedSnap = null;
@@ -229,6 +256,71 @@ async function main() {
     check('全部包模式覆盖镜像全量包、只跳过仅本地的包（规划数 + 跳过本地数 = 镜像包总数）',
       res.scope === 'all' && mirrorTotal > 0 && planned + skipped === mirrorTotal,
       `规划=${planned} + 跳过本地=${skipped} / 镜像全量=${mirrorTotal}`);
+
+    // ---- 真机验证「版本进度」：再跑一次补全部版本，等右栏出现「已下载 / 总共」字节数，截图后取消
+    try {
+      const tasksBefore2 = new Set();
+      const tl2 = await apiJSON('/__admin/api/tasks');
+      for (const t of ((((tl2.body || {}).data) || {}).items || [])) tasksBefore2.add(t.id);
+      await evaluate(ws, `document.getElementById('pkg-fill-all-all').click(); 1`);
+      let confirmAll = null;
+      for (let i = 0; i < 40; i++) {
+        await sleep(200);
+        confirmAll = await evaluate(ws, SNAP);
+        if (confirmAll && confirmAll.open) break;
+      }
+      check('点「全部包补全部版本」弹出确认框（用于版本进度真机验证）', !!(confirmAll && confirmAll.open));
+      await evaluate(ws, `(function(){
+        var bs = document.querySelectorAll('#modal-root .modal .modal-foot button');
+        for (var i = 0; i < bs.length; i++) if (/(开始补下载|确认补)/.test(bs[i].textContent||'')) { bs[i].click(); return true; }
+        return false;
+      })()`);
+
+      let bytesRow = null;
+      const t1 = Date.now();
+      while (Date.now() - t1 < 25000) {
+        await sleep(350);
+        const info = await evaluate(ws, `(function(){
+          var rows = document.querySelectorAll('#modal-root .fill-col-right .fill-run .taskrow');
+          var texts = Array.prototype.map.call(rows, function(r){ return (r.textContent||'').trim(); });
+          return { rows: rows.length, texts: texts.slice(0, 8) };
+        })()`).catch(() => null);
+        if (!info) continue;
+        const hit = (info.texts || []).find(x => x.indexOf(' / ') >= 0 && /(B|KB|MB|GB)/.test(x));
+        if (hit) { bytesRow = hit; console.log('右栏示例：' + JSON.stringify(info.texts.slice(0, 3))); break; }
+      }
+      check('版本进度行真的显示单文件实时字节（如「3.08 MB / 8.84 MB（35%）· 3.65 MB/秒」）',
+        !!bytesRow, bytesRow || '25 秒内没等到字节数');
+      const midShot = await shot(ws, SHOT);
+      check(`真机截图已保存（${path.basename(SHOT)}）`, midShot > 10000, `${midShot} 字节`);
+
+      await evaluate(ws, `(function(){
+        var bs = document.querySelectorAll('#modal-root .modal .modal-foot button');
+        for (var i = 0; i < bs.length; i++) if ((bs[i].textContent||'').indexOf('取消下载') >= 0) { bs[i].click(); return true; }
+        return false;
+      })()`);
+      await sleep(800);
+      const tl3 = await apiJSON('/__admin/api/tasks');
+      for (const t of ((((tl3.body || {}).data) || {}).items || [])) {
+        if (t.type === 'pull' && !tasksBefore2.has(t.id)) await apiJSON('/__admin/api/tasks/' + t.id + '/cancel', { method: 'POST' });
+      }
+      for (let i = 0; i < 40; i++) {
+        await sleep(300);
+        const tl4 = await apiJSON('/__admin/api/tasks');
+        const mine = ((((tl4.body || {}).data) || {}).items || []).filter(t => t.type === 'pull' && !tasksBefore2.has(t.id));
+        if (!mine.some(t => t.status === 'running')) break;
+      }
+      await sleep(300);
+      const closed2 = await evaluate(ws, `(function(){
+        var bs = document.querySelectorAll('#modal-root .modal .modal-foot button');
+        for (var i = 0; i < bs.length; i++) if ((bs[i].textContent||'').trim() === '关闭') { bs[i].click(); return true; }
+        return false;
+      })()`);
+      await sleep(300);
+      check('版本进度真机验证后弹窗能正常关闭/收尾', !!closed2 || !(await evaluate(ws, `!!document.querySelector('#modal-root .modal')`)));
+    } catch (e) {
+      check('版本进度真机验证（不因验证本身失败而中断主流程）', false, (e && e.message) || String(e));
+    }
 
     // ---- 另一个入口：确认框能弹出（这次取消）
     await evaluate(ws, `document.getElementById('pkg-fill-tags-all').click(); 1`);
