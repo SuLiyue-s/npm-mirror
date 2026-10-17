@@ -493,7 +493,12 @@ commands.export = async function () {
       names: positional,
       fileName: flags.out,
       logger: lg,
-      onProgress: (p) => { if (flags.verbose) log(`  …${p.done}/${p.total} ${p.name || ''}`); },
+      concurrency: Math.max(1, Number(config.get().storage.bundleExportConcurrency) || 4),
+      onProgress: (p) => {
+        if (!flags.verbose) return;
+        if (p.phase === 'collect') log(`  …已统计 ${p.packages}/${p.total} 个包`);
+        else if (p.phase === 'pack') log(`  …已打包 ${p.entriesDone}/${p.entriesTotal} 个文件（${human(p.bytes)} / ${human(p.totalBytes)}）`);
+      },
     });
     log(`${C.green}导出完成${C.reset} ${r.path}`);
     log(`  包含 ${r.packages} 个包 / ${r.versions} 个版本 / ${r.tarballs} 个 tarball，共 ${human(r.sizeBytes)}，耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s`);
@@ -522,10 +527,17 @@ commands.import = async function () {
       let isBundle = false;
       try { isBundle = !!(await bundle.readBundleManifest(abs)); } catch { isBundle = false; }
       if (isBundle) {
+        let totalPkgs = 0;
+        let donePkgs = 0;
         const r = await bundle.importBundle({
           store, file: abs, overwrite, logger: lg,
+          concurrency: Math.max(1, Number(config.get().storage.bundleImportConcurrency) || 4),
           onProgress: (p) => {
-            if (p.total) { const pct = Math.floor((p.done / p.total) * 100); if (pct !== lastPct) { lastPct = pct; process.stdout.write(`\r  导入进度 ${pct}%  ${p.name || ''}`.padEnd(60)); } }
+            let pct = -1;
+            if (p.phase === 'extract' && p.totalBytes > 0) pct = Math.floor((p.bytes / p.totalBytes) * 100);
+            else if (p.phase === 'extract-done') { totalPkgs = Number(p.packages) || 0; pct = 0; }
+            else if (p.phase === 'package' && totalPkgs > 0) { donePkgs++; pct = Math.floor((donePkgs / totalPkgs) * 100); }
+            if (pct >= 0 && pct !== lastPct) { lastPct = pct; process.stdout.write(`\r  导入进度 ${pct}%  ${p.name || ''}`.padEnd(60)); }
           },
         });
         process.stdout.write('\r' + ' '.repeat(60) + '\r');

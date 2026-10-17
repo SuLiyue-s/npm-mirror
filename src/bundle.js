@@ -49,6 +49,15 @@ function sameDigest(a, b) {
   return ba.length === bb.length && crypto.timingSafeEqual(ba, bb);
 }
 
+/**
+ * 版本比较用的归一化键：npm 会把 tarball 里的版本写法规范化（express@1.0.0-beta 的 tarball 内
+ * package.json 里写的是 `1.0.0beta`），所以「tarball 内版本 vs packument 版本」不能直接字符串比。
+ * 这里把分隔符（- . _ +）统一去掉再比，只用于「是否同一个版本」的兼容判断，不影响存储键。
+ */
+function versionKey(v) {
+  return String(v == null ? '' : v).trim().toLowerCase().replace(/^v/, '').replace(/[^0-9a-z]/g, '');
+}
+
 /** 按 packument 里 dist.integrity（缺失时用 dist.shasum）校验 tarball 实际字节；返回 null 表示通过 */
 function verifyTarballBytes(buf, dist) {
   const d = dist && typeof dist === 'object' ? dist : {};
@@ -132,9 +141,10 @@ function collectDepClosure(store, roots, { max = DEPS_MAX_PACKAGES } = {}) {
  *   { phase:'pack', entriesDone, entriesTotal, bytes, totalBytes, pkg, pkgDone, pkgTotal }
  *   { phase:'package', name, status:'packed', tarballs, versions, sizeBytes }  某个包的全部条目已写入
  * @param {function} [o.isCanceled] 返回 true 时尽快中止（抛 code=ECANCELED）
+ * @param {number} [o.concurrency=1] 打包并发：>1 时按体积切成多段并行 gzip 压缩（产物仍是标准 tar.gz）
  */
 async function exportBundle({
-  store, scope = 'all', names = [], fileName, withDeps = false, logger, onProgress, isCanceled,
+  store, scope = 'all', names = [], fileName, withDeps = false, logger, onProgress, isCanceled, concurrency = 1,
 }) {
   const emit = (ev) => {
     if (!onProgress) return;
@@ -268,30 +278,30 @@ async function exportBundle({
     if (logger) logger.warn(`离线包同名已存在，改名保存为 ${finalName}`);
   }
   const tmpPath = path.join(bundleDir(), `.${finalName}.part`);
-  // entries[0] 是 manifest.json，所以每个包在打包进度里的「完成下标」要整体 +1
-  const pkgEnds = [];
-  {
-    let at = 1;
-    for (const p of pkgPlan) {
-      at += p.entries;
-      pkgEnds.push({ end: at, name: p.name, tarballs: p.tarballs, versions: p.versions, sizeBytes: p.sizeBytes, entries: p.entries });
-    }
+  /* 条目下标 → 所属包的映射：并行打包时条目完成顺序不固定，不能再靠「已完成条目数」猜当前是哪个包，
+   * 必须用 packTarGz 的 onEntryDone(index) 按条目下标定位。entries[0] 是 manifest.json，所以包从下标 1 开始。 */
+  const entryPkg = new Array(entries.length).fill(null);
+  for (let pi = 0, at = 1; pi < pkgPlan.length; pi++) {
+    for (let k = 0; k < pkgPlan[pi].entries; k++) entryPkg[at + k] = pkgPlan[pi];
+    at += pkgPlan[pi].entries;
   }
-  let pkgIdx = 0;
+  const pkgSeen = new Map();   // 包名 -> 已写完的条目数（并行模式下条目完成顺序不固定）
   const res = await tar.packTarGz(tmpPath, entries, {
     gzip: true,
     shouldAbort: isCanceled,
-    onProgress: (info) => {
-      // 某个包的全部条目（tarball + packument/meta）都写完了：给界面补一条「逐包打包详情」
-      while (pkgIdx < pkgEnds.length && info.count >= pkgEnds[pkgIdx].end) {
-        const p = pkgEnds[pkgIdx++];
+    concurrency,
+    onEntryDone: ({ index }) => {
+      const p = entryPkg[index];
+      if (!p) return;
+      const seen = (pkgSeen.get(p.name) || 0) + 1;
+      pkgSeen.set(p.name, seen);
+      // 这个包的全部条目（tarball + packument/meta）都写完了：补一条「逐包打包详情」
+      if (seen >= p.entries) {
         emit({ phase: 'package', name: p.name, status: 'packed', tarballs: p.tarballs, versions: p.versions, sizeBytes: p.sizeBytes });
       }
-      const cur = pkgEnds[pkgIdx] || (pkgEnds.length ? pkgEnds[pkgEnds.length - 1] : null);
-      // 当前包进度条按 tarball 个数走（packument/meta 也占条目，但界面显示「个 tarball」更直观）
-      const pkgTotal = cur ? Math.max(1, cur.tarballs) : 0;
-      const startAt = cur ? cur.end - cur.entries : 0;
-      const doneEntries = cur ? Math.max(0, Math.min(cur.entries, info.entry - 1 - startAt)) : 0;
+    },
+    onProgress: (info) => {
+      const cur = info.entry > 0 ? entryPkg[info.entry - 1] : null;
       emit({
         phase: 'pack',
         entriesDone: info.count,
@@ -299,8 +309,8 @@ async function exportBundle({
         bytes: info.total,
         totalBytes: expectedBytes,
         pkg: cur ? cur.name : '',
-        pkgDone: Math.min(doneEntries, pkgTotal),
-        pkgTotal,
+        pkgDone: cur ? Math.min(pkgSeen.get(cur.name) || 0, cur.entries) : 0,
+        pkgTotal: cur ? cur.entries : 0,
       });
     },
   });
@@ -348,13 +358,15 @@ async function readBundleManifest(file) {
  * @param {function} [o.onProgress] 进度回调：
  *   { phase:'extract', bytes, totalBytes, current }            正在解包到临时目录（bytes=已解出数据字节）
  *   { phase:'extract-done', bytes, packages }                  解包完成
- *   { phase:'package-start', index, total, name, versionTotal } 开始导入某个包
+ *   { phase:'package-start', index, total, name, versionTotal, running } 开始导入某个包（并行时会有多个包同时开始）
  *   { phase:'version', name, versionDone, versionTotal }        该包内正在处理第 k/N 个版本
  *   { phase:'package', name, status:'imported'|'skipped'|'failed', versions, tarballs, skipped, failed, reason }
+ *     status='skipped' 时 reason 会说明原因（版本已存在 / bundle 内缺少 tarball 等）
  * @param {function} [o.isCanceled] 返回 true 时在包之间/版本之间尽快停下来（结果带 canceled=true 的部分数据）
+ * @param {number} [o.concurrency=1] 包级并发：不同包并行导入（包内版本仍按顺序写）
  */
 async function importBundle({
-  store, file, overwrite = false, metadataOnly = false, onProgress, isCanceled, logger,
+  store, file, overwrite = false, metadataOnly = false, onProgress, isCanceled, logger, concurrency = 1,
 }) {
   const manifest = await readBundleManifest(file); // 先校验格式与 manifest 是否可读
   const mstats = (manifest && manifest.stats) || {};
@@ -390,29 +402,34 @@ async function importBundle({
     const dirs = fs.existsSync(path.join(tmp, 'storage')) ? fs.readdirSync(path.join(tmp, 'storage')) : [];
     emit({ phase: 'extract-done', bytes: extracted, packages: dirs.length });
 
-    let pkgIndex = 0;
+    /* 先过滤出真正要处理的包目录（顺序稳定，日志/结果可复现）。
+     * 不同包之间可以并行导入：每个包只锁自己（store.withLock(name)），包内版本仍按顺序写，
+     * 所以并发不会改变任何单个包的最终内容，只是把多个包的磁盘读写/校验摊开。 */
+    const pkgDirs = [];
     for (const dir of dirs) {
-      if (canceled()) { result.canceled = true; break; }
       const pkgDir = path.join(tmp, 'storage', dir);
       if (!fs.statSync(pkgDir).isDirectory()) continue;
       const incomingPackument = readJson(path.join(pkgDir, 'packument.json'), null);
       if (!incomingPackument || !incomingPackument.versions) continue;
-      const name = incomingPackument.name || dir.replace(/__/g, '/');
-      pkgIndex++;
+      pkgDirs.push({ dir, pkgDir, incomingPackument, name: incomingPackument.name || dir.replace(/__/g, '/') });
+    }
+    const totalPkgs = pkgDirs.length;
+
+    /** 导入单个包目录（并行时会被多个 worker 同时调用）：只做本包的版本循环，返回本包的结果统计 */
+    async function importOneDir({ pkgDir, incomingPackument, name }) {
       const versionEntries = Object.entries(incomingPackument.versions);
       const versionTotal = versionEntries.length;
-      emit({ phase: 'package-start', index: pkgIndex, total: dirs.length, name, versionTotal });
       if (!isSafePkgName(name)) {
         const error = `非法包名，已跳过导入：${String(name)}`;
         result.failed.push({ name: String(name), error });
         if (logger) logger.warn(`导入离线包跳过：${error}`);
-        emit({ phase: 'package', index: pkgIndex, name: String(name), status: 'failed', versions: 0, tarballs: 0, skipped: 0, failed: 1, reason: error });
-        continue;
+        return { name: String(name), status: 'failed', versions: 0, tarballs: 0, skipped: 0, failed: 1, reason: error };
       }
-      // 本包的计数起点：结束时用差值算出这个包实际导入/跳过/失败的数量，供界面逐包显示
-      const before = { versions: result.versions, tarballs: result.tarballs, skipped: result.skipped, failed: result.failed.length };
       const incomingMeta = readJson(path.join(pkgDir, 'meta.json'), {}) || {};
+      let pv = 0, pt = 0, ps = 0, pf = 0;   // 本包：新增版本 / tarball / 跳过 / 失败（并行时不能用全局差值算）
+      let metadataOnlySkipped = 0;
       let versionDone = 0;
+      let reason = '';
       try {
         await store.withLock(name, async () => {
           const local = store.get(name);
@@ -427,7 +444,7 @@ async function importBundle({
             emit({ phase: 'version', name, versionDone, versionTotal });
             if ((versionDone & 15) === 0 && canceled()) { result.canceled = true; break; }
             if (!isSafeVersion(v)) { invalidVersions++; continue; }
-            if (packument.versions[v] && !overwrite) { result.skipped++; continue; }
+            if (packument.versions[v] && !overwrite) { ps++; continue; }
             const srcFile = path.join(pkgDir, 'tarballs', `${pkgBaseName(name)}-${v}.tgz`);
             const altName = incomingMeta.files && typeof incomingMeta.files[v] === 'string' ? incomingMeta.files[v] : '';
             // files 映射来自包内 meta.json，可能被构造成 ../ 路径；只接受纯文件名
@@ -448,22 +465,33 @@ async function importBundle({
             const buf = fs.readFileSync(useFile);
             const badBytes = verifyTarballBytes(buf, manifestV && manifestV.dist);
             if (badBytes) {
+              pf++;
               result.failed.push({ name, version: v, error: `${name}@${v}：${badBytes}` });
               if (logger) logger.warn(`导入离线包跳过 ${name}@${v}：${badBytes}`);
               continue;
             }
-            // 篡改校验 2：tarball 内 package/package.json 的 name/version 必须与 packument 的键一致
+            // 篡改校验 2：tarball 内「根级 package.json」的 name/version 必须与 packument 的键一致。
+            // 注意根目录名不一定叫 package：既有 types-registry/ 这种包名目录，也有 DefinitelyTyped 的
+            // 「node v22.20/」、git 导出风格「mscdex-cpu-features-c6f574c/」，所以按「一层目录 + package.json」匹配。
             let innerPkg = null;
-            try {
-              const pj = await tar.readTarEntry(useFile, 'package/package.json');
-              innerPkg = pj ? JSON.parse(pj.toString('utf8')) : null;
-            } catch { innerPkg = null; }
-            if (!innerPkg || innerPkg.name !== name || innerPkg.version !== v) {
-              const got = innerPkg ? `${String(innerPkg.name)}@${String(innerPkg.version)}` : '无法解析 package/package.json';
-              const error = `${name}@${v}：tarball 内 package.json 与 packument 不一致（实际 ${got}）`;
+            try { innerPkg = await tar.readRootPackageJson(useFile); } catch { innerPkg = null; }
+            if (innerPkg && innerPkg.name !== name) {
+              pf++;
+              const error = `${name}@${v}：tarball 内 package.json 的包名与 packument 不一致（实际 ${String(innerPkg.name)}）`;
               result.failed.push({ name, version: v, error });
               if (logger) logger.warn(`导入离线包跳过：${error}`);
               continue;
+            }
+            if (innerPkg && versionKey(innerPkg.version) !== versionKey(v)) {
+              // tarball 字节本身已通过 integrity 校验，只是里面写的版本与 packument 键不同。
+              // 这是上游镜像自身的元数据问题（例：npmmirror 上 npm@6.8.0 的 dist 指向 npm-6.7.0.tgz，
+              // 下载到的 tarball 内版本就是 6.7.0），不是包被篡改；按 packument 版本导入并留告警。
+              if (logger) logger.warn(`导入 ${name}@${v}：tarball 内 package.json 版本是 ${String(innerPkg.version)}（integrity 已校验通过，按 packument 版本导入）`);
+            }
+            if (!innerPkg) {
+              // integrity 已经校验过字节与 packument 一致；极少数历史 tarball 没有可解析的根级 package.json，
+              // 不能因此丢弃（否则「导出的包再导入」会平白失败），按兼容方式导入并留一条告警。
+              if (logger) logger.warn(`导入 ${name}@${v}：tarball 内找不到可解析的根级 package.json（integrity 已校验通过），按兼容方式导入`);
             }
             if (packument.versions[v] && overwrite) result.overwritten++;
             // 用刚校验过的字节直接写入，避免校验后再按路径读一次造成 TOCTOU；dist 以实际写入结果为准
@@ -481,7 +509,7 @@ async function importBundle({
               },
             };
             files[v] = saved.file; sizes[v] = saved.sizeBytes; origins[v] = 'bundle';
-            result.tarballs++;
+            pt++;
             if (incomingMeta.deprecated && incomingMeta.deprecated[v]) deprecated[v] = incomingMeta.deprecated[v];
             added++;
           }
@@ -515,30 +543,53 @@ async function importBundle({
               files, sizes, origins, deprecated,
             });
           }
-          if (added > 0) result.packages++;
-          result.versions += added;
+          if (added > 0) pv += added;
         });
       } catch (e) {
+        pf++;
+        reason = e.message;
         result.failed.push({ name, error: e.message });
         if (logger) logger.warn(`导入 ${name} 失败：${e.message}`);
       }
-      // 逐包结果（左栏一行）：用计数差值判断这个包最终是「导入成功 / 全部已存在跳过 / 失败」
-      const dv = result.versions - before.versions;
-      const dt = result.tarballs - before.tarballs;
-      const ds = result.skipped - before.skipped;
-      const failedNow = result.failed.length - before.failed;
-      emit({
-        phase: 'package',
-        index: pkgIndex,
+      result.versions += pv;
+      result.tarballs += pt;
+      result.skipped += ps;
+      // 「导入成功的包数」按「确实往存储里写了东西」算：覆盖导入（版本已存在但 overwrite）时
+      // pv 为 0 而 pt>0，不能因此把包数报成 0（界面上会显示「0 包」但明明导入了 tarball）。
+      if (pv > 0 || pt > 0) result.packages++;
+      // 逐包结果（左栏一行）：这个包最终是「导入成功 / 全部已存在跳过 / 失败」，并尽量给出人话原因
+      if (!reason) {
+        if (metadataOnlySkipped > 0) reason = `bundle 内缺少 ${metadataOnlySkipped} 个版本的 tarball（导出时本地就没有缓存）`;
+        else if (pf > 0) reason = result.failed.length ? result.failed[result.failed.length - 1].error : '导入失败';
+        else if (ps > 0) reason = '版本已存在';
+      }
+      return {
         name,
-        status: dv > 0 ? 'imported' : (failedNow > 0 ? 'failed' : 'skipped'),
-        versions: dv,
-        tarballs: dt,
-        skipped: ds,
-        failed: failedNow,
-        reason: failedNow > 0 ? result.failed[result.failed.length - 1].error : '',
-      });
+        status: pv > 0 ? 'imported' : (pf > 0 ? 'failed' : 'skipped'),
+        versions: pv, tarballs: pt, skipped: ps, failed: pf, reason,
+      };
     }
+
+    /* worker 池：不同包并行导入（并发数由 storage.bundleImportConcurrency 决定，1 = 完全串行）。
+     * 包内版本仍按顺序写；取消时 worker 在包边界停下，已完成的部分保留。 */
+    const workerCount = Math.max(1, Math.min(Number(concurrency) || 1, totalPkgs || 1));
+    let nextPkg = 0;
+    let startedPkgs = 0;
+    const worker = async () => {
+      for (;;) {
+        if (canceled()) { result.canceled = true; return; }
+        if (nextPkg >= pkgDirs.length) return;
+        const item = pkgDirs[nextPkg++];
+        const index = ++startedPkgs;
+        emit({
+          phase: 'package-start', index, total: totalPkgs, name: item.name,
+          versionTotal: Object.keys(item.incomingPackument.versions).length, running: workerCount,
+        });
+        const r = await importOneDir(item);
+        emit({ phase: 'package', index, ...r });
+      }
+    };
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
     if (logger) {
       const tail = result.canceled ? '（已取消，保留已导入的部分）' : '';
       logger.info(`导入离线包完成: ${result.file} → ${result.packages} 个包 / ${result.versions} 个版本 / ${result.tarballs} 个 tarball${tail}`);
@@ -551,9 +602,9 @@ async function importBundle({
 
 /** 导入单个 npm tarball（.tgz）：解析 package.json 后登记为一个版本 */
 async function importTarballFile({ store, file, overwrite = false, source = 'upload' }) {
-  const pkgJsonBuf = await tar.readTarEntry(file, 'package/package.json');
-  if (!pkgJsonBuf) throw new Error('不是有效的 npm 包 tarball（缺少 package/package.json）');
-  const pkg = JSON.parse(pkgJsonBuf.toString('utf8'));
+  // tarball 根目录名不一定是 package（历史包可能是包名目录 / DefinitelyTyped 风格），按根级 package.json 读
+  const pkg = await tar.readRootPackageJson(file);
+  if (!pkg) throw new Error('不是有效的 npm 包 tarball（找不到可解析的根级 package.json）');
   const name = pkg.name;
   const version = pkg.version;
   if (!name || !version) throw new Error('tarball 里的 package.json 缺少 name 或 version');

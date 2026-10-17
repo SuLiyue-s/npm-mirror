@@ -2774,6 +2774,7 @@
       var txt = '已打包 ' + fmtNum(d.done || 0) + ' / ' + fmtNum(d.total || 0) + ' 个文件（' + pct + '%）';
       if (d.bytes || d.bytesTotal) txt += ' · ' + fmtBytes(d.bytes || 0) + (d.bytesTotal ? ' / ' + fmtBytes(d.bytesTotal) : '');
       if (d.ok) txt += ' · 已完成 ' + fmtNum(d.ok) + ' 个包';
+      if (d.concurrency > 1) txt += ' · 并行 ' + d.concurrency + ' 路压缩';
       if (d.status === 'running' && d.bytesPerSec && d.bytesTotal && d.bytes < d.bytesTotal) {
         var eta = Math.round((d.bytesTotal - (d.bytes || 0)) / d.bytesPerSec);
         if (eta > 0) txt += ' · 剩余约 ' + fmtDur(eta);
@@ -2785,7 +2786,7 @@
       title: '导出离线包', sub: 'EXPORT BUNDLE',
       intro: '正在统计要导出的包…',
       busyText: '导出中…', sideHint: 'EXPORTING…', waitText: '正在打包…',
-      paneHead: '正在打包 · 当前包', paneUnit: '个 tarball',
+      paneHead: '正在打包 · 当前包', paneUnit: '个文件',
       cancelLabel: '取消导出', btn: btn,
       extractBar: false,
       statText: statText,
@@ -2846,6 +2847,7 @@
       var txt = '已处理 ' + fmtNum(d.done || 0) + ' / ' + fmtNum(d.total || 0) + ' 个包（' + pct + '%）'
         + ' · 成功 ' + fmtNum(d.ok || 0) + ' · 失败 ' + fmtNum(d.failed || 0) + ' · 跳过 ' + fmtNum(d.skipped || 0)
         + ' · 新增 ' + fmtNum(d.versions || 0) + ' 个版本 / ' + fmtNum(d.tarballs || 0) + ' 个 tarball';
+      if (d.concurrency > 1) txt += ' · 并行 ' + d.concurrency + ' 路导入';
       if (d.status === 'running' && d.etaSec) txt += ' · 剩余约 ' + fmtDur(d.etaSec);
       txt += ' · 已用时 ' + fmtDur(secs);
       return txt;
@@ -2936,7 +2938,9 @@
       title: '存储', en: 'STORAGE', fields: [
         { k: 'storage.dir', label: '存储目录', type: 'text' },
         { k: 'storage.maxUploadMB', label: '单包上传上限（MB）', type: 'number', hint: '网页上传单个 .tgz 安装包的上限，1-4096。' },
-        { k: 'storage.maxBundleUploadMB', label: '离线包上传上限（MB）', type: 'number', hint: '网页上传整机备份（离线包）的上限，1-65536；服务端流式落盘，不占内存。更大的包建议直接放进 data/bundles 目录后再用「导入」按钮。' }
+        { k: 'storage.maxBundleUploadMB', label: '离线包上传上限（MB）', type: 'number', hint: '网页上传整机备份（离线包）的上限，1-65536；服务端流式落盘，不占内存。更大的包建议直接放进 data/bundles 目录后再用「导入」按钮。' },
+        { k: 'storage.bundleExportConcurrency', label: '离线包导出并发', type: 'number', hint: '导出整机备份时并行压缩的线程数，1-16，默认 4。设 1 回到单线程；机器核数多时可调大。' },
+        { k: 'storage.bundleImportConcurrency', label: '离线包导入并发', type: 'number', hint: '导入整机备份时同时处理的包数，1-16，默认 4。设 1 回到串行；机械硬盘或 CPU 较忙时调小更稳。' }
       ]
     },
     {

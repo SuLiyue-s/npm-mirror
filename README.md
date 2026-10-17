@@ -13,7 +13,7 @@
 
 - **公共包缓存**：`npm install` 走本镜像时自动回源上游（默认 `https://registry.npmmirror.com`）并缓存元数据与 tarball；支持 `cache`（本地优先）/ `proxy`（过期即回源）/ `offline`（纯离线）三种模式
 - **私有包仓库**：支持 `npm publish`、`npm unpublish`、`npm deprecate`、`npm dist-tag`，私有包与上游同名包隔离，不会混淆
-- **离线迁移**：导出整个镜像为单个 `.tgz` bundle，拷贝到无网络电脑后导入；也支持直接导入本机 `~/.npm/_cacache` 已有缓存。**导出和导入都有详细进度弹窗**：一条总进度（导出按字节/文件数，导入按解包字节与包数）+ 逐包明细（已打包 / 新增 / 失败 / 跳过）+ 当前包的大进度条，长任务可取消
+- **离线迁移**：导出整个镜像为单个 `.tgz` bundle，拷贝到无网络电脑后导入；也支持直接导入本机 `~/.npm/_cacache` 已有缓存。**导出和导入都有详细进度弹窗**：一条总进度（导出按字节/文件数，导入按解包字节与包数）+ 逐包明细（已打包 / 新增 / 失败 / 跳过）+ 当前包的大进度条，长任务可取消。**导出/导入都支持多包并行**（默认 4 路，可配置），备份再导入不会因为 tarball 根目录名不叫 `package/` 而误判成坏包（`@types/*` 这类历史包也能正常导入）
 - **可视化管理界面**：概览、包管理、迁移备份（含本机缓存导入）、配置、日志、服务控制共 6 个页面，中文界面，全按钮操作；包详情、依赖解析、任务进度以抽屉/弹窗呈现
 - **补齐工具链**：按版本 / 只补最新 / 全部包批量补 tarball，递归添加依赖（含 `npm:` 别名），后台任务可看进度、可取消
 - **零依赖实现**：HTTP 服务、tar.gz 打包解包、semver 比较、npm 协议、断点与完整性校验全部手写，无任何第三方包
@@ -113,6 +113,8 @@ node cli.js import npm-mirror-all.tgz
 | `security.trustLocalhost` | `true` | 本机回环地址免令牌 |
 | `storage.dir` / `storage.maxUploadMB` | `data/storage` / `500` | 包存储目录 / 单包上传上限（MB，1-4096） |
 | `storage.maxBundleUploadMB` | `4096` | 网页上传整机备份（离线包）的上限（MB，1-65536）。上传走流式落盘，不占内存；更大的包可放进 `data/bundles` 后用界面「导入」 |
+| `storage.bundleExportConcurrency` | `4` | 导出整机备份时的并行压缩线程数（1-16）。整数备份大、机器核数多时可调大，设 1 回到单线程 |
+| `storage.bundleImportConcurrency` | `4` | 导入整机备份时同时处理的包数（1-16）。设 1 回到串行，机械硬盘或 CPU 忙时调小更稳 |
 | `log.level` / `log.maxDays` | `info` / `7` | 日志级别 / 保留天数 |
 | `ui.title` | `私人 npm 镜像源` | 管理界面标题 |
 
@@ -161,8 +163,8 @@ pwsh -File test/acceptance-npm.ps1   # 真实 npm 客户端验收（Windows / Po
 
 | 脚本 | 内容 | 最近结果（2026-10-17，本机） |
 | --- | --- | --- |
-| `test/api-test.js` | npm 协议、管理接口、发布/删除、离线导入导出、进度任务、安全回归等 172 项 | **168 通过 + 4 跳过，0 失败** |
-| `test/ui-check.js` | 前端与后端接口/页面元素契约 | **74/74 通过** |
+| `test/api-test.js` | npm 协议、管理接口、发布/删除、离线导入导出、进度任务、并行导出导入与根目录/版本写法兼容、安全回归等 185 项 | **181 通过 + 4 跳过，0 失败** |
+| `test/ui-check.js` | 前端与后端接口/页面元素契约 | **86/86 通过** |
 | `test/acceptance-npm.ps1` | 真实 `npm install / publish / dist-tag / deprecate / unpublish` | **16/16 通过** |
 | `test/ui-e2e-*.js` | 浏览器端端到端（需要 Chrome 调试端口，可选） | 需本机 Chrome CDP 环境 |
 

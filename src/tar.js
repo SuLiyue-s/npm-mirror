@@ -89,25 +89,42 @@ function createWriter(outFile, gzip) {
   return {
     async write(buf) {
       if (failed) throw failed;
+      // 并行打包时别的分片出错会 abort 本写入流：销毁后的流不会再发 drain，
+      // 这里必须把 close 也当成失败，否则等待背压的 Promise 永不结束（取消任务会卡住）。
+      if (sink.destroyed) throw failed || canceledError('tar: 写入已中止');
       if (sink.write(buf)) return;
       await new Promise((res, rej) => {
         const onDrain = () => { cleanup(); res(); };
         const onErr = (e) => { cleanup(); rej(e); };
-        const cleanup = () => { sink.removeListener('drain', onDrain); sink.removeListener('error', onErr); };
+        const onClose = () => { cleanup(); rej(failed || canceledError('tar: 写入已中止')); };
+        const cleanup = () => {
+          sink.removeListener('drain', onDrain);
+          sink.removeListener('error', onErr);
+          sink.removeListener('close', onClose);
+        };
         sink.once('drain', onDrain);
         sink.once('error', onErr);
+        sink.once('close', onClose);
       });
     },
     async end() {
       await new Promise((res, rej) => {
         const onFinish = () => { cleanup(); res(); };
         const onErr = (e) => { cleanup(); rej(e); };
+        // gzip 流正常结束时也会先 finish 再 close：close 只代表「流关了」，不能当成写入失败。
+        // 这里在 sink 的 finish 时摘掉 close 监听，真正失败（被 destroy）时才会走到 onClose。
+        const onSinkFinish = () => { try { sink.removeListener('close', onClose); } catch { /* 忽略 */ } };
+        const onClose = () => { cleanup(); rej(failed || canceledError('tar: 写入已中止')); };
         const cleanup = () => {
           raw.removeListener('finish', onFinish);
           raw.removeListener('error', onErr);
           sink.removeListener('error', onErr);
+          sink.removeListener('finish', onSinkFinish);
+          sink.removeListener('close', onClose);
         };
         sink.once('error', onErr);
+        sink.once('finish', onSinkFinish);
+        sink.once('close', onClose);
         raw.once('finish', onFinish);
         raw.once('error', onErr);
         sink.end();
@@ -123,6 +140,122 @@ function createWriter(outFile, gzip) {
   };
 }
 
+function canceledError(what) {
+  const e = new Error(what || '打包已取消');
+  e.code = 'ECANCELED';
+  return e;
+}
+
+/** 删除文件（不存在或暂时被占用都不抛错；Windows 上刚 destroy 的句柄可能还没释放，稍等重试） */
+async function unlinkQuiet(files) {
+  for (const f of files) {
+    for (let i = 0; i < 5; i++) {
+      try { fs.unlinkSync(f); break; } catch (e) {
+        if (e.code === 'ENOENT') break;
+        await new Promise(r => setTimeout(r, 100));
+      }
+    }
+  }
+}
+
+/** 把一个条目的 tar 头 + 内容写进 w（数据源可能是内存 Buffer 或磁盘文件） */
+async function writeEntry(w, entries, i, ctx) {
+  const { state, emit, onEntryDone, shouldAbort } = ctx;
+  let e = entries[i];
+  let size = e.size;
+  const data = e.data;
+  if (data !== undefined && data !== null) {
+    // data 分支：声明大小必须与实际数据长度一致，否则归档会错位（不是静默截断）
+    if (!Buffer.isBuffer(data)) throw badTar(`条目 ${e.name} 的 data 必须是 Buffer`, 'EBADTYPE');
+    if (size === undefined) size = data.length;
+    if (Number(size) !== data.length) {
+      throw badTar(`条目 ${e.name} 声明大小 ${size} 与实际数据长度 ${data.length} 不一致`, 'EBADSIZE');
+    }
+  } else if (e.source) {
+    const st = fs.statSync(e.source);
+    if (st.isDirectory()) {
+      await w.write(makeHeader({ ...e, size: 0, type: '5' }));
+      emit(e.name, true);
+      onEntryDone(i, e);
+      return;
+    }
+    size = st.size;
+    e = { ...e, mtime: e.mtime || st.mtimeMs / 1000 };
+  }
+  size = size || 0;
+  await w.write(makeHeader({ ...e, size }));
+  if (data) {
+    if (data.length) {
+      await w.write(data);
+      const pad = zeroPad(data.length);
+      if (pad) await w.write(Buffer.alloc(pad));
+      state.total += data.length;
+    }
+  } else if (e.source && size > 0) {
+    let readBytes = 0;
+    await new Promise((res, rej) => {
+      const rs = fs.createReadStream(e.source, { highWaterMark: 1 << 20 });
+      let settled = false;
+      const fail = (err) => {
+        if (settled) return;
+        settled = true;
+        try { rs.destroy(); } catch { /* 忽略 */ }
+        rej(err);
+      };
+      const done = () => {
+        if (settled) return;
+        settled = true;
+        res();
+      };
+      rs.on('data', chunk => {
+        // 并行打包时一个分片可能正在读几百 MB 的大 tarball：读取过程中也要响应取消
+        if (shouldAbort && shouldAbort()) { fail(canceledError()); return; }
+        state.total += chunk.length;
+        readBytes += chunk.length;
+        emit(e.name, false);          // 大 tarball 读取期间按时间节流补进度
+        rs.pause();
+        w.write(chunk).then(() => { if (!settled) rs.resume(); }, fail);
+      });
+      rs.on('end', done);
+      rs.on('error', fail);
+      // 源文件被外部截断/删除时可能不触发 end 直接 close：按失败处理，避免外层 Promise 永久挂起
+      rs.on('close', () => { if (!settled) fail(new Error('tar: 读取源文件意外中断')); });
+    });
+    // 关键校验：流式读取的实际字节数必须与 stat 声明的一致，否则 tarball 内部会错位
+    if (readBytes !== size) {
+      throw badTar(`源文件 ${e.source} 实际读取 ${readBytes} 字节，与文件大小 ${size} 字节不一致`, 'EBADTAR');
+    }
+    const pad = zeroPad(size);
+    if (pad) await w.write(Buffer.alloc(pad));
+  }
+  // 条目完成必须强制上报一次：并行分段时每条目的进度靠它累计，缺了会让整体进度停在很小的值
+  emit(e.name, true);
+  onEntryDone(i, e);
+}
+
+/** 按顺序把一个或多个 gzip 分片文件拼接到 outFile（标准 gzip 允许多个成员首尾相接） */
+async function concatFiles(parts, outFile) {
+  const out = fs.createWriteStream(outFile);
+  const done = new Promise((res, rej) => {
+    out.on('finish', res);
+    out.on('error', rej);
+  });
+  for (const p of parts) {
+    await new Promise((res, rej) => {
+      const rs = fs.createReadStream(p);
+      let settled = false;
+      const fail = (e) => { if (settled) return; settled = true; try { rs.destroy(); } catch { /* 忽略 */ } rej(e); };
+      const ok = () => { if (settled) return; settled = true; res(); };
+      rs.on('error', fail);
+      rs.on('end', ok);
+      rs.on('close', () => { if (!settled) fail(new Error('tar: 读取压缩分片意外中断')); });
+      rs.pipe(out, { end: false });
+    });
+  }
+  out.end();
+  await done;
+}
+
 /**
  * 打包为 tar.gz
  * entries: [{ name, source? , data?, mtime?, size? }]
@@ -131,14 +264,17 @@ function createWriter(outFile, gzip) {
  *   current = 刚写完（或正在读）的条目名；entry = 当前正在处理的条目序号（1 起）。
  *   每个条目完成时回调一次，大文件流式读取期间每 250ms 再补一次，
  *   让界面上的体积进度条不会在大 tarball 上卡住不动。
- * shouldAbort()：返回 true 时抛 code=ECANCELED（每个条目开始前检查一次）。
+ * shouldAbort()：返回 true 时抛 code=ECANCELED（条目开始前与读大文件期间都会检查）。
+ * onEntryDone({ index, name, bytes })：每个条目写完回调一次；并行模式下顺序不固定，
+ *   上层用 index（0 起）把条目映射回所属的包，别依赖回调顺序。
+ * concurrency：>1 时把条目按体积切成若干段并行压缩（每段一个独立 gzip 成员，最后按序拼接；
+ *   标准 gzip 允许成员首尾相接，本工具读取器 / 7-Zip / gzip 命令都能正常解压）。
+ *   打包结果与单流完全等价，只是把 gzip 的 CPU 摊到多个线程上。
  */
-async function packTarGz(outFile, entries, { gzip = true, onProgress, shouldAbort } = {}) {
-  const w = createWriter(outFile, gzip);
+async function packTarGz(outFile, entries, { gzip = true, onProgress, shouldAbort, onEntryDone, concurrency = 1 } = {}) {
   const entriesTotal = entries.length;
-  let total = 0;
-  let count = 0;
-  let currentEntry = 0;
+  const parts = gzip ? Math.max(1, Math.min(Number(concurrency) || 1, entriesTotal || 1)) : 1;
+  const state = { count: 0, total: 0, entry: 0 };
   let lastEmit = 0;
   const emit = (current, force) => {
     if (!onProgress) return;
@@ -146,93 +282,85 @@ async function packTarGz(outFile, entries, { gzip = true, onProgress, shouldAbor
     // 回调抛错不能影响打包本身：进度只是旁路信息
     if (!force && now - lastEmit < 250) return;
     lastEmit = now;
-    try { onProgress({ count, entriesTotal, total, current: current || '', entry: currentEntry }); } catch { /* 忽略 */ }
+    try { onProgress({ count: state.count, entriesTotal, total: state.total, current: current || '', entry: state.entry }); } catch { /* 忽略 */ }
   };
-  try {
-    for (let i = 0; i < entries.length; i++) {
-      if (shouldAbort && shouldAbort()) {
-        const e = new Error('打包已取消');
-        e.code = 'ECANCELED';
-        throw e;
+  const entryBytes = (e) => (e.data !== undefined && e.data !== null) ? e.data.length : (Number(e.size) || 0);
+  const done = (i, e) => {
+    state.entry = i + 1;
+    state.count++;
+    if (onEntryDone) { try { onEntryDone({ index: i, name: e.name, bytes: entryBytes(e) }); } catch { /* 忽略 */ } }
+  };
+  const ctx = { state, emit, onEntryDone: done, shouldAbort };
+
+  if (parts <= 1) {
+    const w = createWriter(outFile, gzip);
+    try {
+      for (let i = 0; i < entriesTotal; i++) {
+        if (shouldAbort && shouldAbort()) throw canceledError();
+        await writeEntry(w, entries, i, ctx);
       }
-      let e = entries[i];
-      currentEntry = i + 1;
-      let size = e.size;
-      const data = e.data;
-      if (data !== undefined && data !== null) {
-        // data 分支：声明大小必须与实际数据长度一致，否则归档会错位（不是静默截断）
-        if (!Buffer.isBuffer(data)) throw badTar(`条目 ${e.name} 的 data 必须是 Buffer`, 'EBADTYPE');
-        if (size === undefined) size = data.length;
-        if (Number(size) !== data.length) {
-          throw badTar(`条目 ${e.name} 声明大小 ${size} 与实际数据长度 ${data.length} 不一致`, 'EBADSIZE');
-        }
-      } else if (e.source) {
-        const st = fs.statSync(e.source);
-        if (st.isDirectory()) {
-          await w.write(makeHeader({ ...e, size: 0, type: '5' }));
-          count++;
-          emit(e.name, true);
-          continue;
-        }
-        size = st.size;
-        e = { ...e, mtime: e.mtime || st.mtimeMs / 1000 };
-      }
-      size = size || 0;
-      await w.write(makeHeader({ ...e, size }));
-      if (data) {
-        if (data.length) {
-          await w.write(data);
-          const pad = zeroPad(data.length);
-          if (pad) await w.write(Buffer.alloc(pad));
-          total += data.length;
-        }
-      } else if (e.source && size > 0) {
-        let readBytes = 0;
-        await new Promise((res, rej) => {
-          const rs = fs.createReadStream(e.source, { highWaterMark: 1 << 20 });
-          let settled = false;
-          const fail = (err) => {
-            if (settled) return;
-            settled = true;
-            try { rs.destroy(); } catch { /* 忽略 */ }
-            rej(err);
-          };
-          const done = () => {
-            if (settled) return;
-            settled = true;
-            res();
-          };
-          rs.on('data', chunk => {
-            total += chunk.length;
-            readBytes += chunk.length;
-            emit(e.name, false);          // 大 tarball 读取期间按时间节流补进度
-            rs.pause();
-            w.write(chunk).then(() => { if (!settled) rs.resume(); }, fail);
-          });
-          rs.on('end', done);
-          rs.on('error', fail);
-          // 源文件被外部截断/删除时可能不触发 end 直接 close：按失败处理，避免外层 Promise 永久挂起
-          rs.on('close', () => { if (!settled) fail(new Error('tar: 读取源文件意外中断')); });
-        });
-        // 关键校验：流式读取的实际字节数必须与 stat 声明的一致，否则 tarball 内部会错位
-        if (readBytes !== size) {
-          throw badTar(`源文件 ${e.source} 实际读取 ${readBytes} 字节，与文件大小 ${size} 字节不一致`, 'EBADTAR');
-        }
-        const pad = zeroPad(size);
-        if (pad) await w.write(Buffer.alloc(pad));
-      }
-      count++;
-      emit(e.name, true);
+      await w.write(Buffer.alloc(BLOCK * 2));
+      await w.end();
+      return { sizeBytes: fs.statSync(outFile).size, entries: state.count, totalBytes: state.total };
+    } catch (e) {
+      // 失败时销毁写入流并删除半成品，避免留下损坏的归档/悬挂的文件句柄
+      try { w.abort(); } catch { /* 忽略 */ }
+      await unlinkQuiet([outFile]);
+      throw e;
     }
-    await w.write(Buffer.alloc(BLOCK * 2));
+  }
+
+  /* 并行：按体积把条目切成 parts 段（每段至少 1 个条目，切点保证后面还够分），
+   * 每段独立 createWriter（独立 gzip 流）写自己的分片文件；最后一段负责写归档结束的两个零块。 */
+  const sizes = entries.map(entryBytes);
+  const totalBytes = sizes.reduce((a, b) => a + b, 0);
+  const target = totalBytes / parts;
+  const chunks = [];
+  let start = 0;
+  let acc = 0;
+  for (let i = 0; i < entriesTotal; i++) {
+    acc += sizes[i] || 0;
+    const remainingEntries = entriesTotal - i - 1;
+    const remainingParts = parts - chunks.length - 1;
+    if (remainingParts > 0 && acc >= target * (chunks.length + 1) && i > start && remainingEntries >= remainingParts) {
+      chunks.push({ start, end: i + 1 });
+      start = i + 1;
+    }
+  }
+  chunks.push({ start, end: entriesTotal });
+
+  const partFiles = chunks.map((c, idx) => `${outFile}.p${idx}.tar.gz`);
+  const writers = partFiles.map(f => createWriter(f, true));
+  let aborted = false;
+  const abortAll = () => {
+    aborted = true;
+    for (const w of writers) { try { w.abort(); } catch { /* 忽略 */ } }
+  };
+  const jobs = chunks.map((c, idx) => (async () => {
+    const w = writers[idx];
+    for (let i = c.start; i < c.end; i++) {
+      if (aborted) throw canceledError();
+      if (shouldAbort && shouldAbort()) throw canceledError();
+      await writeEntry(w, entries, i, ctx);
+    }
+    if (idx === chunks.length - 1) await w.write(Buffer.alloc(BLOCK * 2));
     await w.end();
-    return { sizeBytes: fs.statSync(outFile).size, entries: count, totalBytes: total };
+  })());
+  try {
+    await Promise.all(jobs);
+    await concatFiles(partFiles, outFile);
   } catch (e) {
-    // 失败时销毁写入流并删除半成品，避免留下损坏的归档/悬挂的文件句柄
-    try { w.abort(); } catch { /* 忽略 */ }
-    try { fs.unlinkSync(outFile); } catch { /* 忽略 */ }
+    abortAll();
+    await Promise.allSettled(jobs);
+    await unlinkQuiet(partFiles);
+    await unlinkQuiet([outFile]);
     throw e;
   }
+  await unlinkQuiet(partFiles);
+  // 收尾再补一次进度：并行模式下各分片完成顺序不固定，最后一条条目的上报可能早于其他分片
+  state.entry = entriesTotal;
+  emit('', true);
+  return { sizeBytes: fs.statSync(outFile).size, entries: state.count, totalBytes: state.total };
 }
 
 function parseOct(buf) {
@@ -651,8 +779,17 @@ async function readTarEntry(file, wanted, opts = {}) {
     maxPaxBytes = DEFAULT_MAX_PAX_BYTES,
     maxTotalBytes = DEFAULT_MAX_TOTAL_BYTES,
   } = opts;
-  const want = sanitizeRel(wanted);
-  if (want === null) throw badTar(`非法的条目名：${String(wanted)}`, 'EBADNAME');
+  /* wanted 支持三种写法：精确条目名（字符串）、正则（RegExp，按条目名匹配）、
+   * 自定义匹配函数（rel => boolean）。正则用于「根目录名不确定」的历史 tarball，
+   * 例如根目录是 types-registry/、node v22.20/ 或 mscdex-cpu-features-c6f574c/ 而不是 package/。 */
+  let isWanted;
+  if (typeof wanted === 'function') isWanted = (rel) => !!wanted(rel);
+  else if (wanted instanceof RegExp) isWanted = (rel) => rel !== null && wanted.test(rel);
+  else {
+    const want = sanitizeRel(wanted);
+    if (want === null) throw badTar(`非法的条目名：${String(wanted)}`, 'EBADNAME');
+    isWanted = (rel) => rel === want;
+  }
   const reader = makeReader(openTarStream(file));
   const { take, drop, avail, close, need: rawNeed } = reader;
   let pendingPath = null;
@@ -754,7 +891,7 @@ async function readTarEntry(file, wanted, opts = {}) {
       checkEntrySize(size, '条目大小');
       const dataTotal = size + zeroPad(size);
       const rel = sanitizeRel(name);
-      if (rel === want) {
+      if (isWanted(rel)) {
         if (!(await need(size))) throw truncated('目标条目内容');
         const data = Buffer.from(take(size));
         addConsumed(size);
@@ -769,8 +906,23 @@ async function readTarEntry(file, wanted, opts = {}) {
   }
 }
 
+/** 根级 package.json 的匹配式：任意一层目录下的 package.json（tarball 根目录名不一定是 package） */
+const ROOT_PACKAGE_JSON = /^[^/]+\/package\.json$/;
+
+/**
+ * 读取 tarball 根级的 package.json，不假定根目录名一定是 package。
+ * 上游有不少历史 tarball 的根目录是包名（types-registry/）、DefinitelyTyped 风格（node v22.20/）
+ * 或 git 导出风格（mscdex-cpu-features-c6f574c/）；只要 integrity 校验通过，这些包应当照常导入。
+ * 返回解析后的对象；找不到、或内容不是合法 JSON 时返回 null。
+ */
+async function readRootPackageJson(file, opts = {}) {
+  const buf = await readTarEntry(file, ROOT_PACKAGE_JSON, opts);
+  if (!buf) return null;
+  try { return JSON.parse(buf.toString('utf8').replace(/^\uFEFF/, '')); } catch { return null; }
+}
+
 module.exports = {
-  packTarGz, extractTarGz, readTarEntry, makeHeader, isZeroBlock,
+  packTarGz, extractTarGz, readTarEntry, readRootPackageJson, makeHeader, isZeroBlock,
   // 供测试/诊断使用
   checksumOf, sanitizeRel, parseOctStrict,
 };

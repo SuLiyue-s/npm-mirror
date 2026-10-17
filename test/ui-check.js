@@ -328,6 +328,60 @@ async function get(p, { json = false } = {}) {
         && /正在解包备份文件…（可以取消/.test(js.text) && /正在把包写入本地存储/.test(js.text));
   }
 
+  console.log('\x1b[1m九、离线包并行导出 / 导入 + 「根目录名不是 package」兼容\x1b[0m');
+  {
+    const bundleSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'bundle.js'), 'utf8');
+    const tarSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'tar.js'), 'utf8');
+    const tasksSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'tasks.js'), 'utf8');
+    const configSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'config.js'), 'utf8');
+    const cliSrc = fs.readFileSync(path.join(__dirname, '..', 'cli.js'), 'utf8');
+
+    // ① 配置项：默认值、范围校验、界面字段
+    check('配置有离线包导出/导入并发项（storage.bundleExportConcurrency / bundleImportConcurrency，默认 4）',
+      /bundleExportConcurrency:\s*4/.test(configSrc) && /bundleImportConcurrency:\s*4/.test(configSrc)
+        && /clampInt\(st\.bundleExportConcurrency, 1, 16, 4\)/.test(configSrc)
+        && /clampInt\(st\.bundleImportConcurrency, 1, 16, 4\)/.test(configSrc));
+    check('PUT /config 校验并发项必须是 1-16 的整数',
+      /bundleExportConcurrency', 'bundleImportConcurrency'/.test(apiSrc) && /1-16 的整数/.test(apiSrc));
+    check('配置页「存储」段有「离线包导出并发 / 离线包导入并发」两个字段',
+      /k: 'storage\.bundleExportConcurrency'/.test(js.text) && /k: 'storage\.bundleImportConcurrency'/.test(js.text)
+        && /离线包导出并发/.test(js.text) && /离线包导入并发/.test(js.text));
+
+    // ② 后端：并发真正接到打包/导入流程，任务快照带并发度
+    check('导出按配置并发打包（packTarGz concurrency + 多段 gzip 拼接成标准 tar.gz）',
+      /concurrency: conc/.test(apiSrc) && /bundleExportConcurrency/.test(apiSrc)
+        && /concurrency = 1 } = \{\}\)/.test(tarSrc) && /function concatFiles/.test(tarSrc)
+        && /\.p\$\{idx\}\.tar\.gz/.test(tarSrc));
+    check('导出逐包明细改用 onEntryDone 的条目下标映射（并行下顺序不固定）',
+      /onEntryDone/.test(tarSrc) && /entryPkg/.test(bundleSrc) && /pkgSeen/.test(bundleSrc));
+    check('导入按配置并发处理不同包（worker 池 + 每包只锁自己，包内版本仍顺序）',
+      /bundleImportConcurrency/.test(apiSrc) && /async function importOneDir/.test(bundleSrc)
+        && /const worker = async \(\)/.test(bundleSrc) && /withLock\(name/.test(bundleSrc)
+        && /concurrency: Math\.max\(1, Number\(cfg\.storage\.bundleImportConcurrency\)/.test(apiSrc));
+    check('并行导入的包进度按「已完成包数」推进（不再用包的起始序号）',
+      /done: pkgs\.length/.test(apiSrc) && !/done: Number\(ev\.index\) \|\| pkgs\.length/.test(apiSrc));
+    check('任务快照带并发度（tasks.create 收 concurrency，前端显示「并行 N 路」）',
+      /concurrency: Number\(init\.concurrency\) \|\| 1/.test(tasksSrc)
+        && /concurrency: conc/.test(apiSrc) && /并行 ' \+ d\.concurrency \+ ' 路压缩/.test(js.text)
+        && /并行 ' \+ d\.concurrency \+ ' 路导入/.test(js.text));
+
+    // ③ 根目录名不是 package 的 tarball：读取/校验改为「一层目录 + package.json」
+    check('读取包描述不再硬编码 package/package.json（readRootPackageJson + 一层目录正则）',
+      /const ROOT_PACKAGE_JSON = \/\^\[\^\/\]\+\\\/package\\\.json\$\/;/.test(tarSrc)
+        && /async function readRootPackageJson/.test(tarSrc)
+        && /wanted instanceof RegExp/.test(tarSrc));
+    check('导入校验与 .tgz 上传都改用根级 package.json，找不到时按兼容方式处理（不再整包丢弃）',
+      /tar\.readRootPackageJson\(useFile\)/.test(bundleSrc) && /tar\.readRootPackageJson\(file\)/.test(bundleSrc)
+        && /按兼容方式导入/.test(bundleSrc));
+    check('跳过原因写清楚（bundle 内缺少 tarball / 版本已存在），界面不再只显示一句含糊的「已存在或不可导入」',
+      /bundle 内缺少 \$\{metadataOnlySkipped\} 个版本的 tarball/.test(bundleSrc)
+        && /'版本已存在'/.test(bundleSrc));
+
+    // ④ 命令行也走并发配置（保持与服务端一致的默认行为）
+    check('命令行 export/import 读取配置里的并发度',
+      /bundleExportConcurrency\) \|\| 4/.test(cliSrc) && /bundleImportConcurrency\) \|\| 4/.test(cliSrc));
+  }
+
   console.log(`\n\x1b[1m结果：${pass}/${pass + fail} 通过\x1b[0m\n`);
   finish(fail === 0 ? 0 : 1);
 })().catch((e) => { console.error('自检异常：', e); finish(1); });

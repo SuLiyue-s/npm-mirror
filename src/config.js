@@ -32,7 +32,11 @@ function defaults() {
       trustLocalhost: true,        // 本机回环地址免令牌，方便自己用
       username: 'admin',
     },
-    storage: { dir: 'data/storage', maxUploadMB: 500, maxBundleUploadMB: 4096 },
+    storage: {
+      dir: 'data/storage', maxUploadMB: 500, maxBundleUploadMB: 4096,
+      // 离线包导出 / 导入的包级并发（1 = 串行）：导出并行压缩、导入并行处理不同包，默认 4。
+      bundleExportConcurrency: 4, bundleImportConcurrency: 4,
+    },
     log: { level: 'info', maxDays: 7 },
     ui: { title: '私人 npm 镜像源' },
   };
@@ -127,6 +131,10 @@ function sanitize(input) {
       // 离线包（整机备份）单独一个上限：几个 GB 的 bundle 是常态，不能跟单包上传共用一个 500MB 门槛；
       // 上传时是流式落盘，不占内存，所以可以给到 64GB。
       maxBundleUploadMB: clampInt(st.maxBundleUploadMB, 1, 65536, 4096),
+      // 离线包导出/导入的包级并发：1-16，默认 4。导出时把 gzip 摊到多个线程，
+      // 导入时多个包同时写（每个包只锁自己，包内版本仍按顺序），太大反而抢磁盘/CPU，所以上限 16。
+      bundleExportConcurrency: clampInt(st.bundleExportConcurrency, 1, 16, 4),
+      bundleImportConcurrency: clampInt(st.bundleImportConcurrency, 1, 16, 4),
     },
     log: {
       level: LOG_LEVELS.includes(level) ? level : 'info',

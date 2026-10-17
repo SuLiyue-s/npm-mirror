@@ -73,8 +73,8 @@ function parsePackageRoute(pathname) {
 /* 离线包「导出 / 导入」的长任务封装：建任务 → 后台跑 → 进度写进 tasks → 收敛成终态。
  * progress:true 的请求立刻拿到 { taskId, async:true }，界面轮询 /tasks/<id> 显示详细进度；
  * 不带该参数的旧调用仍走同步路径（命令行、脚本不受影响）。 */
-function startBundleTask({ type, title, phase = '', total = 0, run, log }) {
-  const task = tasks.create({ type, title, phase, total });
+function startBundleTask({ type, title, phase = '', total = 0, concurrency = 1, run, log }) {
+  const task = tasks.create({ type, title, phase, total, concurrency });
   const isCanceled = () => {
     const t = tasks.get(task.id);
     return !!(t && t.cancelRequested);
@@ -809,11 +809,13 @@ async function handleAdmin(ctx) {
      * 「统计 → 打包」两阶段进度、逐包打包详情与「当前包」进度条；可取消。 */
     if (body.progress === true) {
       const pkgs = [];
+      const conc = Math.max(1, Number(cfg.storage.bundleExportConcurrency) || 4);
       const taskId = startBundleTask({
         type: 'bundle-export',
         title: '导出离线包',
         phase: 'collect',
         total: 0,
+        concurrency: conc,
         log,
         run: ({ update, isCanceled }) => ctx.bundle.exportBundle({
           store,
@@ -823,6 +825,7 @@ async function handleAdmin(ctx) {
           withDeps,
           logger: log,
           isCanceled,
+          concurrency: conc,
           onProgress: (ev) => {
             if (ev.phase === 'collect-start') {
               update({ phase: 'collect', total: Number(ev.total) || 0, message: '正在统计要导出的包…' });
@@ -880,6 +883,7 @@ async function handleAdmin(ctx) {
         fileName: body.name || body.fileName,
         withDeps,
         logger: log,
+        concurrency: Math.max(1, Number(cfg.storage.bundleExportConcurrency) || 4),
       });
       return ok(res, r);
     } catch (e) {
@@ -951,6 +955,7 @@ async function handleAdmin(ctx) {
           overwrite,
           logger: log,
           isCanceled,
+          concurrency: Math.max(1, Number(cfg.storage.bundleImportConcurrency) || 4),
           onProgress: (ev) => {
             if (ev.phase === 'extract') {
               update({
@@ -980,7 +985,8 @@ async function handleAdmin(ctx) {
               update({
                 phase: 'import',
                 total: pkgTotal,
-                done: Math.max(0, (Number(ev.index) || 1) - 1),
+                // 并行导入时包是同时开始的，进度按「已完成的包数」算（pkgs.length），不能再用包的起始序号
+                done: pkgs.length,
                 current: ev.name,
                 currentDone: 0,
                 currentTotal: curTotal,
@@ -1003,8 +1009,8 @@ async function handleAdmin(ctx) {
                 reason: ev.reason || '',
               });
               update({
-                done: Number(ev.index) || pkgs.length,
-                total: Math.max(pkgTotal, Number(ev.index) || 0),
+                done: pkgs.length,
+                total: Math.max(pkgTotal, pkgs.length),
                 ok: pkgs.filter(p => p.status === 'imported').length,
                 failed: pkgs.filter(p => p.status === 'failed').length,
                 skipped: pkgs.filter(p => p.status === 'skipped').length,
@@ -1030,6 +1036,7 @@ async function handleAdmin(ctx) {
         title: `导入离线包 · ${path.basename(file)}`,
         phase: 'extract',
         total: 0,
+        concurrency: Math.max(1, Number(cfg.storage.bundleImportConcurrency) || 4),
         log,
         run: doImport,
       });
@@ -1124,6 +1131,12 @@ async function handleAdmin(ctx) {
       if (st.maxBundleUploadMB !== undefined) {
         const m = Number(st.maxBundleUploadMB);
         if (!Number.isInteger(m) || m < 1 || m > 65536) return bad('storage.maxBundleUploadMB 必须是 1-65536 的整数');
+      }
+      for (const k of ['bundleExportConcurrency', 'bundleImportConcurrency']) {
+        if (st[k] !== undefined) {
+          const n = Number(st[k]);
+          if (!Number.isInteger(n) || n < 1 || n > 16) return bad(`storage.${k} 必须是 1-16 的整数`);
+        }
       }
       if (st.dir !== undefined) {
         if (typeof st.dir !== 'string') return bad('storage.dir 必须是字符串');

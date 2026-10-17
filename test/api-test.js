@@ -1356,6 +1356,207 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
     for (const f of madeBundles3) await api(`/__admin/api/bundles?file=${encodeURIComponent(f)}`, { method: 'DELETE' });
   }
 
+  // ---------------------------------------------------------------- 并行导出/导入与根目录兼容
+  section('六之五、导出/导入并行与「根目录名不是 package」的 tarball');
+  {
+    const crypto = require('node:crypto');
+    const bundleMod4 = require('../src/bundle');
+    const cfgMod4 = require('../src/config');
+    const quietLog4 = { info() {}, warn() {}, error() {}, debug() {} };
+    const { Store: Store4 } = require('../src/store');
+    const oddName = 'mirror-selftest-oddroot';
+    const oddVersion = '1.0.0';
+    const oddFile = `${oddName}-${oddVersion}.tgz`;
+
+    // A) 造一个根目录名是 odd-root/（不是 package/）的 tarball，模拟 @types/* 这类历史包的布局
+    const work = path.join(os.tmpdir(), `mirror-selftest-odd-${util.stamp()}`);
+    util.ensureDir(path.join(work, 'odd-root'));
+    fs.writeFileSync(path.join(work, 'odd-root', 'package.json'),
+      JSON.stringify({ name: oddName, version: oddVersion, main: 'index.js' }));
+    fs.writeFileSync(path.join(work, 'odd-root', 'index.js'), 'module.exports = 42;\n');
+    const innerTgz = path.join(work, 'inner.tgz');
+    await tar.packTarGz(innerTgz, [
+      { name: 'odd-root/package.json', source: path.join(work, 'odd-root', 'package.json') },
+      { name: 'odd-root/index.js', source: path.join(work, 'odd-root', 'index.js') },
+    ], {});
+    const innerBuf = fs.readFileSync(innerTgz);
+    const integrity = `sha512-${crypto.createHash('sha512').update(innerBuf).digest('base64')}`;
+    const shasum = crypto.createHash('sha1').update(innerBuf).digest('hex');
+    const packument = {
+      name: oddName,
+      'dist-tags': { latest: oddVersion },
+      versions: {
+        [oddVersion]: {
+          name: oddName, version: oddVersion,
+          dist: { tarball: `${BASE}/${oddName}/-/${oddFile}`, integrity, shasum },
+        },
+      },
+    };
+    // 非 scoped 包在 storage 下的目录名就是包名
+    const dir = oddName;
+    const bundleFile = path.join(work, `odd-root-bundle-${util.stamp()}.tgz`);
+    await tar.packTarGz(bundleFile, [
+      {
+        name: 'manifest.json',
+        data: Buffer.from(JSON.stringify({
+          format: bundleMod4.FORMAT,
+          formatVersion: bundleMod4.FORMAT_VERSION,
+          createdAt: new Date().toISOString(),
+          tool: 'api-test',
+          scope: 'selected',
+          stats: { packages: 1, versions: 1, tarballs: 1, tarballBytes: innerBuf.length, depsAdded: 0, depsMissing: [] },
+        })),
+      },
+      { name: `storage/${dir}/packument.json`, data: Buffer.from(JSON.stringify(packument)) },
+      { name: `storage/${dir}/meta.json`, data: Buffer.from(JSON.stringify({ files: { [oddVersion]: oddFile }, sizes: { [oddVersion]: innerBuf.length }, deprecated: {} })) },
+      { name: `storage/${dir}/tarballs/${oddFile}`, source: innerTgz },
+    ], {});
+
+    const oddBundle = fs.readFileSync(bundleFile);
+    const up = await api('/__admin/api/bundles/import?overwrite=1', {
+      method: 'POST', raw: oddBundle, timeoutMs: 120000,
+      headers: { 'Content-Type': 'application/octet-stream', 'X-Filename': encodeURIComponent(`selftest-odd-${util.stamp()}.tgz`) },
+    });
+    const ud = (up.json && up.json.data) || {};
+    check('根目录名不是 package 的 tarball（odd-root/package.json）能正常导入，不再报「无法解析 package/package.json」',
+      up.status === 200 && Number(ud.tarballs) >= 1 && (ud.failed || []).length === 0,
+      `status=${up.status} data=${JSON.stringify(ud).slice(0, 300)}`);
+    const gotOdd = await api(`/${encodeURIComponent(oddName)}`);
+    check('该包导入后能在镜像里取到（packument 含版本，说明没被当成坏 tarball 丢掉）',
+      gotOdd.status === 200 && !!(gotOdd.json && gotOdd.json.versions && gotOdd.json.versions[oddVersion]),
+      `status=${gotOdd.status}`);
+    await api(`/__admin/api/packages/${encodeURIComponent(oddName)}`, { method: 'DELETE' });
+    fs.rmSync(work, { recursive: true, force: true });
+
+    // A2) tarball 内版本写法被 npm 规范化（packument 是 1.0.0-beta，tarball 里写 1.0.0beta）不该被判成「不一致」
+    const fmtName = 'mirror-selftest-verfmt';
+    const fmtKey = '1.0.0-beta';
+    const fmtInner = '1.0.0beta';
+    const fmtFile = `${fmtName}-${fmtKey}.tgz`;
+    const work2 = path.join(os.tmpdir(), `mirror-selftest-verfmt-${util.stamp()}`);
+    util.ensureDir(path.join(work2, 'package'));
+    fs.writeFileSync(path.join(work2, 'package', 'package.json'),
+      JSON.stringify({ name: fmtName, version: fmtInner }));
+    const innerTgz2 = path.join(work2, 'inner.tgz');
+    await tar.packTarGz(innerTgz2, [
+      { name: 'package/package.json', source: path.join(work2, 'package', 'package.json') },
+    ], {});
+    const innerBuf2 = fs.readFileSync(innerTgz2);
+    const packument2 = {
+      name: fmtName,
+      'dist-tags': { latest: fmtKey },
+      versions: {
+        [fmtKey]: {
+          name: fmtName, version: fmtKey,
+          dist: {
+            tarball: `${BASE}/${fmtName}/-/${fmtFile}`,
+            integrity: `sha512-${crypto.createHash('sha512').update(innerBuf2).digest('base64')}`,
+            shasum: crypto.createHash('sha1').update(innerBuf2).digest('hex'),
+          },
+        },
+      },
+    };
+    const bundleFile2 = path.join(work2, `verfmt-bundle-${util.stamp()}.tgz`);
+    await tar.packTarGz(bundleFile2, [
+      {
+        name: 'manifest.json',
+        data: Buffer.from(JSON.stringify({
+          format: bundleMod4.FORMAT, formatVersion: bundleMod4.FORMAT_VERSION,
+          createdAt: new Date().toISOString(), tool: 'api-test', scope: 'selected',
+          stats: { packages: 1, versions: 1, tarballs: 1, tarballBytes: innerBuf2.length, depsAdded: 0, depsMissing: [] },
+        })),
+      },
+      { name: `storage/${fmtName}/packument.json`, data: Buffer.from(JSON.stringify(packument2)) },
+      { name: `storage/${fmtName}/meta.json`, data: Buffer.from(JSON.stringify({ files: { [fmtKey]: fmtFile }, sizes: { [fmtKey]: innerBuf2.length }, deprecated: {} })) },
+      { name: `storage/${fmtName}/tarballs/${fmtFile}`, source: innerTgz2 },
+    ], {});
+    const up2 = await api('/__admin/api/bundles/import?overwrite=1', {
+      method: 'POST', raw: fs.readFileSync(bundleFile2), timeoutMs: 120000,
+      headers: { 'Content-Type': 'application/octet-stream', 'X-Filename': encodeURIComponent(`selftest-verfmt-${util.stamp()}.tgz`) },
+    });
+    const ud2 = (up2.json && up2.json.data) || {};
+    check('tarball 内版本写法被规范化（packument 1.0.0-beta / tarball 内 1.0.0beta）也能导入，不误报「不一致」',
+      up2.status === 200 && Number(ud2.tarballs) >= 1 && (ud2.failed || []).length === 0,
+      `status=${up2.status} data=${JSON.stringify(ud2).slice(0, 300)}`);
+    const gotFmt = await api(`/${encodeURIComponent(fmtName)}`);
+    check('版本写法被规范化的包导入后能在镜像里取到该版本',
+      gotFmt.status === 200 && !!(gotFmt.json && gotFmt.json.versions && gotFmt.json.versions[fmtKey]),
+      `status=${gotFmt.status}`);
+    await api(`/__admin/api/packages/${encodeURIComponent(fmtName)}`, { method: 'DELETE' });
+    fs.rmSync(work2, { recursive: true, force: true });
+
+    // B) 并发配置项：默认值、非法值、改大后任务并发度跟着变
+    const cfg0 = await api('/__admin/api/config');
+    const st0 = (((cfg0.json || {}).data || {}).config || {}).storage || {};
+    check('GET /config 暴露离线包导出/导入并发（默认 4）',
+      Number(st0.bundleExportConcurrency) === 4 && Number(st0.bundleImportConcurrency) === 4,
+      JSON.stringify(st0));
+    const badC1 = await api('/__admin/api/config', { method: 'PUT', body: { storage: { bundleExportConcurrency: 0 } } });
+    check('PUT /config storage.bundleExportConcurrency=0 → 400',
+      badC1.status === 400 && /bundleExportConcurrency/.test(badC1.text), `status=${badC1.status}`);
+    const badC2 = await api('/__admin/api/config', { method: 'PUT', body: { storage: { bundleImportConcurrency: 17 } } });
+    check('PUT /config storage.bundleImportConcurrency=17 → 400',
+      badC2.status === 400 && /bundleImportConcurrency/.test(badC2.text), `status=${badC2.status}`);
+    const okC = await api('/__admin/api/config', {
+      method: 'PUT', body: { storage: { bundleExportConcurrency: 6, bundleImportConcurrency: 6 } },
+    });
+    check('PUT /config 把导出/导入并发改成 6 生效',
+      okC.status === 200 && Number(((((okC.json || {}).data || {}).config || {}).storage || {}).bundleExportConcurrency) === 6,
+      `status=${okC.status}`);
+
+    const st4 = new Store4({ dir: cfgMod4.storageDir(), logger: quietLog4 });
+    await st4.init();
+    const pref4 = ['ms', 'is-number', 'debug', 'semver', 'chalk', 'lodash'];
+    let pkgName4 = pref4.find(n => st4.get(n));
+    if (!pkgName4) pkgName4 = (st4.names() || [])[0];
+    await st4.close();
+
+    async function waitTask4(id, timeoutMs = 180000) {
+      const t0 = Date.now();
+      while (Date.now() - t0 < timeoutMs) {
+        const r = await api('/__admin/api/tasks/' + id);
+        const d = r.json && r.json.data;
+        if (d && d.status !== 'running') return d;
+        await util.sleep(200);
+      }
+      return null;
+    }
+
+    const madeBundles4 = [];
+    check('镜像里能找到用于并行导出的包', !!pkgName4, `pkg=${pkgName4}`);
+    if (pkgName4) {
+      const ex = await api('/__admin/api/bundles/export', {
+        method: 'POST', body: { scope: 'selected', names: [pkgName4], progress: true }, timeoutMs: 30000,
+      });
+      const exData = (ex.json && ex.json.data) || {};
+      const exTask = exData.taskId ? await waitTask4(exData.taskId) : null;
+      if (exTask && exTask.result && exTask.result.file) madeBundles4.push(exTask.result.file);
+      check('导出进度任务按配置的并发度运行（concurrency=6）',
+        !!exTask && exTask.status === 'done' && Number(exTask.concurrency) === 6,
+        `status=${exTask && exTask.status} concurrency=${exTask && exTask.concurrency}`);
+      check('并行打包（多段 gzip 拼接）产出的 bundle 能被正常解析（manifest/结果字段齐全）',
+        !!exTask && !!exTask.result && Number(exTask.result.packages) >= 1 && Number(exTask.result.tarballs) >= 1,
+        JSON.stringify(exTask && exTask.result));
+      if (madeBundles4.length) {
+        const im = await api('/__admin/api/bundles/import', {
+          method: 'POST', body: { file: madeBundles4[0], overwrite: true, progress: true }, timeoutMs: 30000,
+        });
+        const imData = (im.json && im.json.data) || {};
+        const imTask = imData.taskId ? await waitTask4(imData.taskId) : null;
+        check('导入进度任务按配置的并发度运行（concurrency=6）',
+          !!imTask && imTask.status === 'done' && Number(imTask.concurrency) === 6,
+          `status=${imTask && imTask.status} concurrency=${imTask && imTask.concurrency}`);
+        check('并行导入（多包同时写）结束后包进度跑满、结果与串行一致',
+          !!imTask && imTask.total >= 1 && imTask.done === imTask.total
+            && !!imTask.result && Number(imTask.result.packages) >= 1 && Array.isArray(imTask.result.failed),
+          `total=${imTask && imTask.total} done=${imTask && imTask.done} result=${JSON.stringify(imTask && imTask.result)}`);
+      }
+    }
+    for (const f of madeBundles4) await api(`/__admin/api/bundles?file=${encodeURIComponent(f)}`, { method: 'DELETE' });
+    // 恢复默认并发（4/4），别把测试改动留在用户配置里
+    await api('/__admin/api/config', { method: 'PUT', body: { storage: { bundleExportConcurrency: 4, bundleImportConcurrency: 4 } } });
+  }
+
   // ---------------------------------------------------------------- 版本删除
   section('七、单版本删除与取消发布');
   {
