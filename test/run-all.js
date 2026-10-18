@@ -7,11 +7,9 @@
  *      非 Windows 或沙箱禁止子进程时其中需真跑 PowerShell 的几项会自动跳过）
  *   3. 再跑 test/api-test.js（注册表协议 + 管理 API + 发布/删除 + 离线包导入导出 + 安全回归；
  *      环境不足 / 破坏性用例会显式 SKIP）
- * 用法：node test/run-all.js [--base 管理界面地址] [--registry-base 镜像源地址] [--full] [--destructive]
+ * 用法：node test/run-all.js [--base 管理界面地址] [--registry-base 镜像源地址] [--destructive]
  *   --base           管理界面监听地址（管理 API + 网页控制台，默认 config.admin.ip:admin.port）
  *   --registry-base  镜像源监听地址（npm 客户端 registry 协议，默认 config.server.ip:server.port）
- *   --full           完整回归：包含会大量导包 / 全部包补 tarball / 本机 npm 缓存导入等耗时用例
- *                    （日常改 UI/后端/文档用默认快速模式即可，不必每次跑耗时导包）
  *   --destructive    额外包含重启服务、清空日志等破坏性用例（默认不跑）
  * 说明：真实 npm 客户端的验收（install/publish/dist-tag/deprecate/unpublish）由
  *       test/acceptance-npm.ps1 负责，需要本机有 npm。
@@ -31,7 +29,6 @@ function argBase(flag, fallbackPort) {
 const ADMIN = cfg.admin || {};
 const BASE = argBase('--base', ADMIN.port || cfg.server.port); // 管理界面
 const REG_BASE = argBase('--registry-base', cfg.server.port); // 镜像源
-const FULL = process.argv.includes('--full');
 const DESTRUCTIVE = process.argv.includes('--destructive');
 
 function runNode(script, args) {
@@ -66,9 +63,7 @@ function runNode(script, args) {
     process.exit(1);
   }
   process.stdout.write('服务在线，开始自检。\n');
-  process.stdout.write(FULL
-    ? '\x1b[2m自检模式：完整回归（--full，包含耗时导包用例）\x1b[0m\n'
-    : '\x1b[2m自检模式：快速（默认跳过耗时导包用例；需要完整回归时加 --full）\x1b[0m\n');
+  process.stdout.write('\x1b[2m自检模式：快速（不包含大量导包类耗时用例）\x1b[0m\n');
 
   if (process.platform === 'win32' && fs.existsSync(path.join(__dirname, 'tray-check.js'))) {
     process.stdout.write('\n===== 托盘 / 图标 / 启动脚本自检（test/tray-check.js）=====\n');
@@ -78,7 +73,6 @@ function runNode(script, args) {
 
   process.stdout.write('\n===== 接口与功能自检（test/api-test.js）=====\n');
   const apiArgs = ['--base', BASE, '--registry-base', REG_BASE];
-  if (FULL) apiArgs.push('--full');
   if (DESTRUCTIVE) apiArgs.push('--destructive');
   process.exit(await runNode('api-test.js', apiArgs));
 })();
