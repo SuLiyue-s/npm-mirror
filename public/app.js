@@ -975,11 +975,37 @@
     else if (state.page === 'logs') { loadLogs(true); startPoll('logs', loadLogs, POLL_LOGS); }
   }
 
+  /* ================= 运行时长（实时刷新） =================
+   * 概览/服务接口返回的 uptimeSec 只是一次快照，页面闲置时顶部「运行 xx」会停在旧值。
+   * 这里记录快照基准（uptimeSec + 本地时间），由时钟每秒用本地时间累加刷新，不额外请求后端；
+   * 每次概览轮询/切页拿到新快照时重置基准，服务重启后运行时长会自动从新值重新计时。 */
+  var uptimeBase = null;
+  function setUptimeBase(sec) {
+    var n = Number(sec);
+    if (!isFinite(n) || n < 0) return;
+    uptimeBase = { sec: Math.floor(n), at: Date.now() };
+  }
+  function uptimeNow() {
+    if (!uptimeBase) return null;
+    return uptimeBase.sec + Math.floor((Date.now() - uptimeBase.at) / 1000);
+  }
+  function paintUptime() {
+    var sec = uptimeNow();
+    if (sec === null) return;
+    var txt = fmtDur(sec);
+    setText('chip-uptime', '运行 ' + txt);
+    var ov = $('#ov-uptime-card');
+    if (ov) { var v1 = ov.querySelector('.stat-value'); if (v1) v1.textContent = txt; }
+    var sv = $('#svc-uptime-card');
+    if (sv) { var v2 = sv.querySelector('.stat-value'); if (v2) v2.textContent = txt; }
+  }
+
   /* ================= 时钟 ================= */
   function startClock() {
     var tick = function () {
       var d = new Date();
       setText('clock', pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds()));
+      paintUptime();
     };
     tick();
     setInterval(tick, 1000);
@@ -1117,10 +1143,13 @@
     box.appendChild(statCard('版本数', 'VERSIONS', fmtNum(st.versions), null, 'tarball ' + fmtNum(st.tarballs) + ' 个'));
     box.appendChild(statCard('存储体积', 'STORAGE', fmtBytes(st.storageBytes), null, 'bundle ' + fmtNum(st.bundles && st.bundles.count) + ' 个 / ' + fmtBytes(st.bundles && st.bundles.bytes), 'is-am'));
     box.appendChild(statCard('累计下载', 'DOWNLOADS', fmtNum(st.downloads), null, '含上游回源计数'));
-    box.appendChild(statCard('运行时长', 'UPTIME', fmtDur(d.uptimeSec), null, '启动于 ' + dtShort(d.startedAt), 'is-am'));
+    var uptimeCard = statCard('运行时长', 'UPTIME', fmtDur(d.uptimeSec), null, '启动于 ' + dtShort(d.startedAt), 'is-am');
+    uptimeCard.id = 'ov-uptime-card';
+    box.appendChild(uptimeCard);
 
     paintModeChip(d.mode);
-    setText('chip-uptime', '运行 ' + fmtDur(d.uptimeSec));
+    setUptimeBase(d.uptimeSec);
+    paintUptime();
     if (d.version) setText('chip-version', 'v' + d.version);
 
     /* 服务状态 */
@@ -2772,6 +2801,7 @@
     setSideHint('EXPORTING…');
     api('/bundles/export', { method: 'POST', body: { scope: 'selected', names: names, withDeps: true }, timeout: 300000 }).then(function (d) {
       var msg = '已导出 ' + d.file + '（' + fmtNum(d.packages) + ' 包 / ' + fmtBytes(d.sizeBytes) + (d.depsAdded ? '，含连带依赖 ' + fmtNum(d.depsAdded) + ' 个' : '') + (d.depsFetched ? '，其中自动下载 ' + fmtNum(d.depsFetched) + ' 个' : '') + '）';
+      if (d.withDeps && !d.depsAdded && !(d.missingDeps && d.missingDeps.length)) msg += '；所选版本没有运行时依赖，只打包了选中的包';
       toast(msg, 'ok', 9000);
       if (d.autoFetch && d.autoFetch.skippedReason) toast('未自动下载缺失依赖：' + d.autoFetch.skippedReason, 'warn', 12000);
       if (d.missingDeps && d.missingDeps.length) {
@@ -4032,6 +4062,9 @@
         if (payload.scope === 'added') msg = '已按添加时间导出（' + (payload.addedFrom ? '从 ' + dtShort(payload.addedFrom) : '起始不限') + ' 到 ' + (payload.addedTo ? dtShort(payload.addedTo) : '现在') + '）：' + fmtNum(r.packages) + ' 包 / ' + fmtNum(r.versions) + ' 版本 / ' + fmtNum(r.tarballs) + ' tarball / ' + fmtBytes(r.sizeBytes);
         if (r.versionFiltered && r.versionFilter) msg += '（只导出指定版本：' + fmtNum(Object.keys(r.versionFilter).length) + ' 个包）';
         if (r.depsAdded) msg += '（其中连带依赖 ' + fmtNum(r.depsAdded) + ' 个' + (r.depsFetched ? '，自动下载 ' + fmtNum(r.depsFetched) + ' 个' : '') + '）';
+        if (payload.withDeps !== false && r.withDeps && !r.depsAdded && !(r.missingDeps && r.missingDeps.length)) {
+          msg += '（所选版本没有运行时依赖，只打包了选中的包）';
+        }
         setText('exp-status', msg);
         toast(msg, 'ok', 9000);
         if (r.autoFetch && r.autoFetch.skippedReason) toast('未自动下载缺失依赖：' + r.autoFetch.skippedReason, 'warn', 12000);
@@ -4624,7 +4657,8 @@
 
   function paintOverviewLite(d) {
     paintModeChip(d.mode);
-    setText('chip-uptime', '运行 ' + fmtDur(d.uptimeSec));
+    setUptimeBase(d.uptimeSec);
+    paintUptime();
     if (d.version) setText('chip-version', 'v' + d.version);
   }
 
@@ -4632,7 +4666,9 @@
     var box = clear($('#svc-stats'));
     if (box) {
       box.appendChild(statCard('服务状态', 'STATUS', '运行中', null, 'PID ' + (d.pid || '—'), 'is-cy'));
-      box.appendChild(statCard('运行时长', 'UPTIME', fmtDur(d.uptimeSec), null, '启动于 ' + dtShort(d.startedAt)));
+      var svcUptimeCard = statCard('运行时长', 'UPTIME', fmtDur(d.uptimeSec), null, '启动于 ' + dtShort(d.startedAt));
+      svcUptimeCard.id = 'svc-uptime-card';
+      box.appendChild(svcUptimeCard);
       box.appendChild(statCard('监听端口', 'PORT', String((d.listen && d.listen.port) || '—'), null, 'IP ' + ((d.listen && d.listen.ip) || '—'), 'is-am'));
       box.appendChild(statCard('镜像包数', 'PACKAGES', fmtNum(d.stats && d.stats.packages), null, '版本 ' + fmtNum(d.stats && d.stats.versions)));
     }

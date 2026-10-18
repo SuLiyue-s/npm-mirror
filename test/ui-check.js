@@ -1265,6 +1265,37 @@ async function get(p, { json = false } = {}) {
       '恢复后把页面刷新到最新状态');
   }
 
+  console.log('\x1b[1m九之十三、顶栏「运行时长」实时刷新 + 无依赖导出提示（新）\x1b[0m');
+  {
+    const jsUp = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
+
+    check('顶栏运行时长以概览快照为基准、由时钟每秒累加刷新（不额外请求后端）',
+      /var uptimeBase = null;/.test(jsUp)
+        && /function setUptimeBase\(sec\)/.test(jsUp)
+        && /function uptimeNow\(\)/.test(jsUp)
+        && /function paintUptime\(\)/.test(jsUp)
+        && /setText\('clock', pad2\(d\.getHours\(\)\)[\s\S]{0,120}?paintUptime\(\);/.test(jsUp)
+        && /setInterval\(tick, 1000\);/.test(jsUp),
+      '页面放着不动时「运行 xx 秒」必须持续增长，不能停在打开页面那一刻');
+    check('概览/服务页轮询拿到新 uptimeSec 时重置基准（服务重启后自动从新值计时），并同步刷新两处时长卡片',
+      /setUptimeBase\(d\.uptimeSec\);/.test(jsUp)
+        && (jsUp.match(/setUptimeBase\(d\.uptimeSec\);/g) || []).length >= 2
+        && /uptimeCard\.id = 'ov-uptime-card';/.test(jsUp)
+        && /svcUptimeCard\.id = 'svc-uptime-card';/.test(jsUp)
+        && /var ov = \$\('#ov-uptime-card'\)/.test(jsUp)
+        && /var sv = \$\('#svc-uptime-card'\)/.test(jsUp),
+      '概览卡片和系统-服务页的运行时长也要跟着走');
+    check('旧的「一次性写入运行时长」已被替换（避免又退回不刷新）',
+      !/setText\('chip-uptime', '运行 ' \+ fmtDur\(d\.uptimeSec\)\);/.test(jsUp)
+        && /paintUptime\(\);/g.test(jsUp),
+      'chip 文案统一由 paintUptime 输出');
+    check('带依赖导出但所选版本没有运行时依赖时，成功文案明确说明「只打包了选中的包」',
+      /所选版本没有运行时依赖，只打包了选中的包/.test(jsUp)
+        && (jsUp.match(/所选版本没有运行时依赖，只打包了选中的包/g) || []).length >= 2
+        && /payload\.withDeps !== false && r\.withDeps && !r\.depsAdded/.test(jsUp),
+      '避免用户误以为依赖导出坏了（如 playwright-core 这类零依赖包）');
+  }
+
   console.log('\x1b[1m十之五、概览页「上游与来源分布」条形图渲染\x1b[0m');
   {
     const jsBars = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
