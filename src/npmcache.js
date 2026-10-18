@@ -272,7 +272,7 @@ async function scanCache({ cacheDir, registry, logger, anyRegistry = false, onPr
     }
     // 进度回调异常不能打断扫描：以前在并发任务里直接调用，回调一抛错该文件结果
     // 就变成 mapLimit 的 {__error} 行，后面合并时 for...of 直接 TypeError 整次扫描失败。
-    if (onProgress && scanned % 2000 === 0) { try { onProgress({ scanned, total: files.length, found: foundNow.size }); } catch { /* 忽略 */ } }
+    if (onProgress && scanned % 2000 === 0) { try { onProgress({ phase: 'index', scanned, total: files.length, found: foundNow.size }); } catch { /* 忽略 */ } }
     return out;
   });
   const found = new Map();
@@ -287,12 +287,14 @@ async function scanCache({ cacheDir, registry, logger, anyRegistry = false, onPr
     }
   }
   if (failedFiles && logger) logger.warn(`扫描 npm 缓存：${failedFiles} 个索引文件读取/解析失败，已跳过`);
-  if (onProgress) { try { onProgress({ scanned, total: files.length, found: found.size }); } catch { /* 忽略 */ } }
+  if (onProgress) { try { onProgress({ phase: 'index-done', scanned, total: files.length, found: found.size }); } catch { /* 忽略 */ } }
 
   /* 第二阶段（并发校验 tarball）：逐包读取本地缓存里的每个版本 tarball 并校验 integrity，
    * 包与包之间并发执行（原来逐包逐版本全串行）。
    * 这里改成「流式」校验：只算哈希、不把 tarball 读进内存。以前 64 路并发时
    * 同时最多有 64 个整包 Buffer 在内存里，遇到大 tarball 会直接把进程内存打满。 */
+  let verified = 0;
+  const verifyTotal = found.size;
   const rows = await mapLimit(Array.from(found.entries()), conc, async ([name, rec]) => {
     const versions = Object.keys(rec.packument.versions || {});
     let avail = 0, size = 0, badTarballs = 0;
@@ -309,6 +311,11 @@ async function scanCache({ cacheDir, registry, logger, anyRegistry = false, onPr
       }
       size += checked.sizeBytes;
       avail++;
+    }
+    verified++;
+    // 校验阶段进度（每 20 个包或最后一个回调一次），前端扫描弹窗显示「正在校验 tarball：N / M 个包」
+    if (onProgress && (verified % 20 === 0 || verified === verifyTotal)) {
+      try { onProgress({ phase: 'verify', verified, total: verifyTotal, scanned, files: files.length, found: verifyTotal }); } catch { /* 忽略 */ }
     }
     const latest = (rec.packument['dist-tags'] && rec.packument['dist-tags'].latest) || versions.sort(compareVersions).pop();
     return {

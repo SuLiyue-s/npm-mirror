@@ -962,6 +962,60 @@ async function get(p, { json = false } = {}) {
         && /app = await createServer\(\{ cliOpts \}\)/.test(cliAudit));
   }
 
+  console.log('\x1b[1m九之六、统计阶段的进度展示（补包统计 / 导入扫描 / 缓存扫描）\x1b[0m');
+  {
+    const pathProg = require('node:path');
+    const fsProg = require('node:fs');
+    const readProg = (p2) => fsProg.readFileSync(pathProg.join(__dirname, '..', p2), 'utf8');
+    const pullProg = readProg('src/pull.js');
+    const apiProg = readProg('src/api.js');
+    const bundleProg = readProg('src/bundle.js');
+    const cacheProg = readProg('src/npmcache.js');
+    const appProg = readProg('public/app.js');
+
+    check('补包统计进度：planTargets 支持 onProgress/shouldStop，取消耗时抛 ECANCELED 而不是当成空结果',
+      /onProgress\?: \(done,total,name\)=>void/.test(pullProg)
+        && /shouldStop\?: \(\)=>boolean/.test(pullProg)
+        && /done % 20 === 0 \|\| now - lastEmit >= 150/.test(pullProg)
+        && /err\.code = 'ECANCELED'/.test(pullProg));
+
+    check('大名单补 tarball 先返回任务、统计在后台跑：任务快照 phase=plan 带「已统计 N / M 个包」进度',
+      /const asyncPlan = scopeAll \|\| names\.length > 200;/.test(apiProg)
+        && /phase: 'plan', total: 0, done: 0, concurrency,/.test(apiProg)
+        && /currentTotal: names\.length/.test(apiProg)
+        && /正在统计需要补的版本：0 \/ \$\{names\.length\} 个包/.test(apiProg)
+        && /planTotal: names\.length/.test(apiProg));
+
+    check('前端「补 tarball」弹窗识别 plan 阶段：进度条按 currentDone/currentTotal 走，文案显示统计进度',
+      /if \(d\.phase === 'plan'\) \{/.test(appProg)
+        && /正在统计需要补的版本：' \+ fmtNum\(planDone\)/.test(appProg)
+        && /已创建任务，正在统计需要补的版本：0 \//.test(appProg)
+        && /function showNoNeed\(d\)/.test(appProg));
+
+    check('离线包导入的解包后扫描阶段有进度事件（phase=scan 每 50 个包 + scan-done），前端弹窗显示「正在统计备份里的包」',
+      /emit\(\{ phase: 'scan', scanned: 0, total: dirs\.length \}\)/.test(bundleProg)
+        && /scannedCount % 50 === 0 \|\| scannedCount === dirs\.length/.test(bundleProg)
+        && /emit\(\{ phase: 'scan-done', scanned: scannedCount, total: dirs\.length \}\)/.test(bundleProg)
+        && /phase === 'scan' && Number\(d\.currentTotal\) > 0/.test(appProg)
+        && /正在统计备份里的包：/.test(appProg)
+        && /正在读取备份里每个包的元数据/.test(appProg));
+
+    check('npm 缓存扫描改成长任务：索引阶段/校验阶段中文进度 + 完成后 result.scan，前端轮询 scan-meta',
+      /phase: 'index', scanned/.test(cacheProg)
+        && /phase: 'index-done'/.test(cacheProg)
+        && /phase: 'verify', verified/.test(cacheProg)
+        && /type: 'cache-scan'/.test(apiProg)
+        && /正在扫描本机 npm 缓存：已检查 \$\{scanned\}/.test(apiProg)
+        && /正在校验 tarball 完整性/.test(apiProg)
+        && /\/npmcache\/scan\?refresh=1&progress=1/.test(appProg)
+        && /t\.message \|\| '正在扫描…'/.test(appProg));
+
+    check('任务快照里统计阶段的字段可由前端直接使用（phase/current/currentDone/currentTotal/message）',
+      /phase: 'plan', currentDone: done, currentTotal: total, current: name/.test(apiProg)
+        && /if \(ev\.phase === 'scan'\) \{/.test(apiProg)
+        && /if \(ev\.phase === 'scan-done'\) \{/.test(apiProg));
+  }
+
   console.log('\x1b[1m十之五、概览页「上游与来源分布」条形图渲染\x1b[0m');
   {
     const jsBars = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');

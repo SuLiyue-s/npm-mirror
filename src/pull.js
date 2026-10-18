@@ -40,7 +40,11 @@ function missingTarballsFrom(store, name, rec) {
  * （并发数取 storage.localScanConcurrency，默认 8，1-64）。此前是同步循环读 1500+ 个包，
  * 会让服务整整卡住 9~15 秒，连 /-/ping、/session 都来不及响应，
  * 托盘健康检查因此误判「服务已停止」并连控制台一起关掉。
- * @param {object} [opts] { concurrency?: number } 规划读盘并发
+ * @param {object} [opts] {
+ *   concurrency?: number,                  规划读盘并发
+ *   onProgress?: (done,total,name)=>void,  每规划完一个包回调一次（已节流，供任务快照显示「已统计 N / M 个包」）
+ *   shouldStop?: ()=>boolean,              返回 true 时尽快停下（任务被取消）
+ * }
  */
 async function planTargets(store, names, mode, selected, opts = {}) {
   const pick = mode === 'selected';
@@ -56,7 +60,18 @@ async function planTargets(store, names, mode, selected, opts = {}) {
   }
   const list = pick ? Array.from(byName.keys()) : names;
   const limit = planConcurrency(opts.concurrency);
+  const total = list.length;
+  const onProgress = typeof opts.onProgress === 'function' ? opts.onProgress : null;
+  const shouldStop = typeof opts.shouldStop === 'function' ? opts.shouldStop : null;
+  let done = 0;
+  let stopped = false;
+  let lastEmit = 0;
   const plan = await mapLimit(list, limit, async (name) => {
+    // 取消后不再读盘，把剩余包快速标记为「已取消」返回，让任务快照停在取消时的进度
+    if (shouldStop && shouldStop()) {
+      stopped = true;
+      return { name, target: [], missingCount: 0, missingVersions: 0, error: '已取消' };
+    }
     const rec = await store.getAsync(name);
     if (!rec) return { name, target: [], missingCount: 0, missingVersions: 0, error: '本地没有这个包' };
     const missing = missingTarballsFrom(store, name, rec);   // 已缓存元数据但没有 tarball 的版本
@@ -79,12 +94,29 @@ async function planTargets(store, names, mode, selected, opts = {}) {
     }
     const meta = rec.meta || {};
     const totalVersions = Number.isFinite(meta.versionCount) ? meta.versionCount : Object.keys(rec.packument.versions || {}).length;
+    // 统计进度：每规划完一个包就上报一次（按 150ms / 20 个包节流，最后一项必发），
+    // 让任务快照能在耗时较长的「读 1500+ 份 packument」阶段显示「已统计 N / M 个包」，
+    // 前端据此画进度条，不再是一动不动的静态文案。
+    done++;
+    if (onProgress) {
+      const now = Date.now();
+      if (done === total || done % 20 === 0 || now - lastEmit >= 150) {
+        lastEmit = now;
+        try { onProgress(done, total, name); } catch { /* 进度回调异常不影响规划结果 */ }
+      }
+    }
     return {
       name, target, missingCount: missing.length, missingVersions: missing.length, totalVersions,
       selectedCount: pick ? (byName.get(name) || new Set()).size : 0,
       latest: (rec.packument['dist-tags'] || {}).latest || '',
     };
   });
+  // 被取消：不把「已取消」当成正常的空规划结果返回，抛 ECANCELED 让上层任务标记为 canceled
+  if (stopped || (shouldStop && shouldStop())) {
+    const err = new Error('已取消');
+    err.code = 'ECANCELED';
+    throw err;
+  }
   // mapLimit 把单个包抛出的异常收成 {__error}：转成与「本地没有这个包」一致的失败行，不中断整批规划
   return plan.map((row, i) => (row && !row.__error ? row : {
     name: list[i], target: [], missingCount: 0, missingVersions: 0,

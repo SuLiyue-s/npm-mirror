@@ -125,15 +125,36 @@ function makeImportProgressHandler(update) {
       return;
     }
     if (ev.phase === 'extract-done') {
+      // 解包完成 → 进入「扫描包目录」阶段（读每个包的 packument.json / meta.json，大备份要几秒）
       update({
-        phase: 'import',
+        phase: 'scan',
         total: Number(ev.packages) || 0,
         done: 0,
         bytes: Number(ev.bytes) || 0,
         bytesTotal: Number(ev.bytes) || 0,
-        current: '', currentDone: 0, currentTotal: 0,
+        current: '', currentDone: 0,
+        currentTotal: Number(ev.packages) || 0,
         inFlight: [],
         message: '',
+      });
+      return;
+    }
+    if (ev.phase === 'scan') {
+      update({
+        phase: 'scan',
+        current: ev.current || '',
+        currentDone: Number(ev.scanned) || 0,
+        currentTotal: Number(ev.total) || 0,
+      });
+      return;
+    }
+    if (ev.phase === 'scan-done') {
+      update({
+        phase: 'import',
+        total: Number(ev.total) || 0,
+        done: 0,
+        current: '', currentDone: 0, currentTotal: 0,
+        inFlight: [],
       });
       return;
     }
@@ -663,9 +684,6 @@ async function handleAdmin(ctx) {
     if (unknown.length === names.length) return fail(res, 404, `本地没有这些包：${unknown.join('、')}`, 'ENOTFOUND');
 
     const concurrency = clamp(Number(body.concurrency) || Number(cfg.upstream.concurrency) || 6, 1, 32);
-    // 规划阶段同样并发读盘（并发数取 storage.localScanConcurrency），不再逐个包串行 get
-    const plan = await pull.planTargets(store, names, mode, targets, { concurrency: localScanConcurrency(cfg) });
-    const total = plan.reduce((a, p) => a + p.target.length, 0);
     const modeLabel = mode === 'all' ? '全部版本'
       : (mode === 'latest' ? '最新版本' : (mode === 'selected' ? '选中版本' : 'dist-tag 版本'));
     const title = scopeAll
@@ -674,46 +692,121 @@ async function handleAdmin(ctx) {
         : (mode === 'selected' ? `选中版本补 tarball · ${names.length} 个包 / ${targets.length} 个点名版本`
           : (mode === 'latest' ? `只补最新版本 · ${names.length} 个包`
             : `dist-tag 版本补 tarball · ${names.length} 个包`)));
+
+    // 任务快照里的逐包行（下载阶段实时更新 target/done/ok/failed/bytes/status）
+    const pkgRows = (plan) => plan.map(p => ({
+      name: p.name, target: p.target.length, done: 0, ok: 0, failed: 0, bytes: 0,
+      missing: p.missingCount, totalVersions: p.totalVersions || 0, latest: p.latest || '',
+      error: p.error || '', status: p.error ? 'error' : 'pending',
+    }));
+    // 规划完成后统计总共要补多少个版本
+    const countTotal = (plan) => plan.reduce((a, p) => a + p.target.length, 0);
+    const scopeName = scopeAll ? 'all' : 'picked';
+    // 下载阶段结束：把 pull.pullTarballs 的汇总写回任务最终状态与结果
+    const finishDownload = (task, r) => {
+      const status = r.canceled ? 'canceled' : (r.failed > 0 && r.ok === 0 ? 'error' : 'done');
+      const parts = [`成功 ${r.ok} 个`];
+      if (r.failed) parts.push(`失败 ${r.failed} 个`);
+      if (r.canceled) parts.push('已取消');
+      tasks.finish(task.id, {
+        status,
+        message: `${parts.join('、')}，共 ${r.done}/${r.total} 个，下载 ${formatBytes(r.bytes)}`,
+        result: {
+          mode, scope: scopeName, skippedLocal, concurrency, total: r.total, ok: r.ok, failed: r.failed,
+          bytes: r.bytes, canceled: !!r.canceled, errors: r.errors.slice(0, 50),
+          packages: r.packages.map(p => ({ name: p.name, target: p.target, done: p.done, ok: p.ok, failed: p.failed, bytes: p.bytes, error: p.error || '' })),
+        },
+      });
+      if (log) log.info(`补 tarball 任务 ${task.id} 结束：模式 ${mode}，并发 ${concurrency}，成功 ${r.ok}，失败 ${r.failed}${r.canceled ? '，已取消' : ''}`);
+    };
+    // 规划完成 → 进入下载阶段（任务总进度先归零，之后由 pullTarballs 的 onProgress 持续更新）
+    const startDownload = (task, plan) => {
+      const total = countTotal(plan);
+      tasks.update(task.id, {
+        phase: 'download', total, done: 0, ok: 0, failed: 0, bytes: 0,
+        current: '', currentDone: 0, currentTotal: 0, inFlight: [],
+        message: '', packages: pkgRows(plan),
+      });
+      return pull.pullTarballs(ctx, {
+        names, mode, selected: targets, concurrency, task, plan,
+        onProgress: (info) => tasks.update(task.id, {
+          done: info.done, ok: info.ok, failed: info.failed, bytes: info.bytes, packages: info.packages,
+          errors: (info.errors || []).slice(0, 50),
+          /* 正在并发下载的「版本」实时字节进度（name/version/received/total），前端右栏逐条显示 */
+          downloads: (info.downloads || []).slice(0, 64),
+        }),
+        shouldStop: () => task.cancelRequested,
+      }).then(finishDownload.bind(null, task));
+    };
+
+    /* 「统计需要补哪些版本」要读 1500+ 份 packument，大镜像要好几秒。名单很长（全部包或 >200 个点名包）时
+     * 先建任务并立即返回 taskId，把规划放进任务里做：边统计边把「已统计 N / M 个包」写进任务快照，
+     * 前端据此显示进度条与数字，不会看起来像无响应。少量点名包的规划是毫秒级，保持同步响应（调用方与测试不用改）。 */
+    const asyncPlan = scopeAll || names.length > 200;
+    if (asyncPlan) {
+      const task = tasks.create({
+        type: 'pull', title, phase: 'plan', total: 0, done: 0, concurrency,
+        currentTotal: names.length,
+        message: `正在统计需要补的版本：0 / ${names.length} 个包`,
+        packages: [],
+      });
+      setImmediate(() => {
+        Promise.resolve()
+          .then(() => pull.planTargets(store, names, mode, targets, {
+            concurrency: localScanConcurrency(cfg),
+            shouldStop: () => task.cancelRequested,
+            onProgress: (done, total, name) => tasks.update(task.id, {
+              phase: 'plan', currentDone: done, currentTotal: total, current: name || '',
+              message: `正在统计需要补的版本：${done} / ${total} 个包`,
+            }),
+          }))
+          .then((plan) => {
+            if (task.cancelRequested) {
+              tasks.finish(task.id, { status: 'canceled', message: '已取消（统计阶段）' });
+              return undefined;
+            }
+            const total = countTotal(plan);
+            if (!total) {
+              // 统计完成但一个都不用补：直接结束，前端从任务快照的 packages 显示「无需补充」
+              tasks.update(task.id, { phase: 'download', total: 0, done: 0, packages: pkgRows(plan), message: '没有需要补的 tarball' });
+              tasks.finish(task.id, {
+                status: 'done',
+                message: `无需补充：${names.length} 个包已齐全`,
+                result: { mode, scope: scopeName, skippedLocal, concurrency, total: 0, ok: 0, failed: 0, bytes: 0, canceled: false, errors: [], packages: pkgRows(plan) },
+              });
+              return undefined;
+            }
+            return startDownload(task, plan);
+          })
+          .catch((e) => {
+            if ((e && e.code === 'ECANCELED') || task.cancelRequested) {
+              tasks.finish(task.id, { status: 'canceled', message: '已取消（统计阶段）' });
+            } else {
+              tasks.finish(task.id, { status: 'error', message: (e && e.message) || String(e) });
+            }
+            if (log) log.error(`补 tarball 任务 ${task.id} 异常：${(e && e.message) || e}`);
+          });
+      });
+      return ok(res, {
+        taskId: task.id, async: true, mode, concurrency, scope: scopeName, skippedLocal,
+        planTotal: names.length,
+      });
+    }
+
+    // 规划阶段同样并发读盘（并发数取 storage.localScanConcurrency），不再逐个包串行 get
+    const plan = await pull.planTargets(store, names, mode, targets, { concurrency: localScanConcurrency(cfg) });
+    const total = countTotal(plan);
     const task = tasks.create({
       type: 'pull',
       title,
       total,
       concurrency,
-      packages: plan.map(p => ({
-        name: p.name, target: p.target.length, done: 0, ok: 0, failed: 0, bytes: 0,
-        missing: p.missingCount, totalVersions: p.totalVersions || 0, latest: p.latest || '',
-        error: p.error || '', status: p.error ? 'error' : 'pending',
-      })),
+      packages: pkgRows(plan),
     });
 
     setImmediate(() => {
       Promise.resolve()
-        .then(() => pull.pullTarballs(ctx, {
-          names, mode, selected: targets, concurrency, task, plan,
-          onProgress: (info) => tasks.update(task.id, {
-            done: info.done, ok: info.ok, failed: info.failed, bytes: info.bytes, packages: info.packages,
-            errors: (info.errors || []).slice(0, 50),
-            /* 正在并发下载的「版本」实时字节进度（name/version/received/total），前端右栏逐条显示 */
-            downloads: (info.downloads || []).slice(0, 64),
-          }),
-          shouldStop: () => task.cancelRequested,
-        }))
-        .then((r) => {
-          const status = r.canceled ? 'canceled' : (r.failed > 0 && r.ok === 0 ? 'error' : 'done');
-          const parts = [`成功 ${r.ok} 个`];
-          if (r.failed) parts.push(`失败 ${r.failed} 个`);
-          if (r.canceled) parts.push('已取消');
-          tasks.finish(task.id, {
-            status,
-            message: `${parts.join('、')}，共 ${r.done}/${r.total} 个，下载 ${formatBytes(r.bytes)}`,
-            result: {
-              mode, scope: scopeAll ? 'all' : 'picked', skippedLocal, concurrency, total: r.total, ok: r.ok, failed: r.failed,
-              bytes: r.bytes, canceled: !!r.canceled, errors: r.errors.slice(0, 50),
-              packages: r.packages.map(p => ({ name: p.name, target: p.target, done: p.done, ok: p.ok, failed: p.failed, bytes: p.bytes, error: p.error || '' })),
-            },
-          });
-          if (log) log.info(`补 tarball 任务 ${task.id} 结束：模式 ${mode}，并发 ${concurrency}，成功 ${r.ok}，失败 ${r.failed}${r.canceled ? '，已取消' : ''}`);
-        })
+        .then(() => startDownload(task, plan))
         .catch((e) => {
           tasks.finish(task.id, { status: 'error', message: (e && e.message) || String(e) });
           if (log) log.error(`补 tarball 任务 ${task.id} 异常：${(e && e.message) || e}`);
@@ -722,7 +815,7 @@ async function handleAdmin(ctx) {
 
     return ok(res, {
       taskId: task.id, mode, concurrency, total,
-      scope: scopeAll ? 'all' : 'picked',
+      scope: scopeName,
       skippedLocal,
       packages: plan.map(p => ({ name: p.name, target: p.target.length, missing: p.missingCount, error: p.error || '' })),
     });
@@ -1610,6 +1703,56 @@ async function handleAdmin(ctx) {
     if (!refresh) {
       const cached = ctx.npmcache.lastScan();
       if (cached && cached.cacheDir === cacheDir) return ok(res, { ...withLocalFlags(cached), cached: true });
+    }
+    /* progress=1 —— 长任务模式：立即返回 taskId，前端轮询 /tasks/<id> 看两段进度：
+     * 「正在扫描本机 npm 缓存：已检查 N / M 个索引文件」和「正在校验 tarball 完整性：N / M 个包」。
+     * 大缓存扫描要几十秒，同步等待会让界面看起来像无响应。默认仍同步返回结果，兼容命令行/旧调用。 */
+    if (q.get('progress') === '1') {
+      const task = tasks.create({
+        type: 'cache-scan',
+        title: '扫描本机 npm 缓存',
+        phase: 'scan',
+        total: 0,
+        message: '正在扫描本机 npm 缓存…',
+      });
+      setImmediate(() => {
+        Promise.resolve()
+          .then(() => ctx.npmcache.scanCache({
+            cacheDir,
+            registry: cfg.upstream.registry,
+            anyRegistry: q.get('anyRegistry') === '1',
+            logger: log,
+            concurrency: localScanConcurrency(cfg),
+            onProgress: (info) => {
+              if (info && info.phase === 'verify') {
+                const done = Number(info.verified) || 0;
+                const total = Number(info.total) || 0;
+                tasks.update(task.id, {
+                  phase: 'verify', currentDone: done, currentTotal: total, total,
+                  message: `正在校验 tarball 完整性：${done} / ${total} 个包`,
+                });
+                return;
+              }
+              const scanned = Number(info && info.scanned) || 0;
+              const total = Number(info && info.total) || 0;
+              tasks.update(task.id, {
+                phase: 'scan', currentDone: scanned, currentTotal: total, total,
+                message: `正在扫描本机 npm 缓存：已检查 ${scanned} / ${total} 个索引文件，发现 ${Number(info && info.found) || 0} 个包`,
+              });
+            },
+          }))
+          .then((r) => {
+            tasks.finish(task.id, {
+              status: 'done',
+              message: `扫描完成：${r.packages.length} 个候选包 / ${formatBytes(r.bytes)}`,
+              result: { scan: withLocalFlags(r) },
+            });
+          })
+          .catch((e) => {
+            tasks.finish(task.id, { status: 'error', message: (e && e.message) || String(e) });
+          });
+      });
+      return ok(res, { taskId: task.id, async: true });
     }
     try {
       const r = await ctx.npmcache.scanCache({

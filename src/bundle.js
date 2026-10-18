@@ -769,6 +769,8 @@ async function importBundle({
       dirs = ents.filter(d => d.isDirectory()).map(d => d.name).sort();
     } catch { dirs = []; }
     emit({ phase: 'extract-done', bytes: extracted, packages: dirs.length });
+    // 解包完成后要逐个读包元数据（大备份 1500+ 个包，要几秒），同样上报「已扫描 N / M 个包」的进度
+    emit({ phase: 'scan', scanned: 0, total: dirs.length });
 
     /* 先并发扫描出真正要处理的包目录（按目录名排序，日志/结果可复现）。
      * 此前是同步逐包 statSync + readJson：1521 个包目录会让事件循环停顿 1~2 秒，
@@ -776,18 +778,28 @@ async function importBundle({
      * 不同包之间本来就可以并行导入：每个包只锁自己（store.withLock(name)），包内版本按版本级调度，
      * 所以并发不会改变任何单个包的最终内容，只是把磁盘读写/校验摊开。 */
     const scanConc = Math.max(1, Math.min(64, Math.floor(Number(scanConcurrency)) || 8));
+    let scannedCount = 0;
     const scanned = await mapLimit(dirs, scanConc, async (dir) => {
-      const pkgDir = path.join(storageDir, dir);
-      let st = null;
-      try { st = await fsp.stat(pkgDir); } catch { st = null; }
-      if (!st || !st.isDirectory()) return null;
-      let incomingPackument = null;
       try {
-        incomingPackument = JSON.parse(await fsp.readFile(path.join(pkgDir, 'packument.json'), 'utf8'));
-      } catch { incomingPackument = null; }
-      if (!incomingPackument || !incomingPackument.versions) return null;
-      return { dir, pkgDir, incomingPackument, name: incomingPackument.name || dir.replace(/__/g, '/') };
+        const pkgDir = path.join(storageDir, dir);
+        let st = null;
+        try { st = await fsp.stat(pkgDir); } catch { st = null; }
+        if (!st || !st.isDirectory()) return null;
+        let incomingPackument = null;
+        try {
+          incomingPackument = JSON.parse(await fsp.readFile(path.join(pkgDir, 'packument.json'), 'utf8'));
+        } catch { incomingPackument = null; }
+        if (!incomingPackument || !incomingPackument.versions) return null;
+        return { dir, pkgDir, incomingPackument, name: incomingPackument.name || dir.replace(/__/g, '/') };
+      } finally {
+        // 进度按「已扫描目录数」上报（每 50 个或最后一个），前端导入弹窗在解包完成后显示这一阶段
+        scannedCount++;
+        if (scannedCount % 50 === 0 || scannedCount === dirs.length) {
+          emit({ phase: 'scan', scanned: scannedCount, total: dirs.length, current: dir });
+        }
+      }
     });
+    emit({ phase: 'scan-done', scanned: scannedCount, total: dirs.length });
     const pkgDirs = scanned.filter((row) => row && !row.__error && row.pkgDir && row.incomingPackument);
     if (pkgDirs.length < dirs.length && logger) {
       logger.warn(`导入离线包：${dirs.length - pkgDirs.length} 个包目录缺少/损坏 packument.json，已跳过`);

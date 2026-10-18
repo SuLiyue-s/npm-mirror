@@ -1090,23 +1090,50 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
       try { fsM.unlinkSync(tarFile); } catch { /* 忽略 */ }
     }
 
-    // 走真接口：scope=all 的 all 任务（全部包补全部版本）—— 建任务后立刻取消，只验证模式/标题/可取消，不把镜像真的补全
+    // 走真接口：scope=all 的 all 任务（全部包补全部版本）
+    // 名单很长（1500+ 包），服务端现在把「统计缺哪些版本」放进后台任务：先返回 async:true + taskId，
+    // 任务快照 phase='plan' 期间带 currentDone/currentTotal（界面据此显示「已统计 N / M 个包」）。
+    // 这里验证统计进度与统计结果，随后立刻取消，只验证规划/标题/可取消，不把镜像真的补全。
     const pullAll = await api('/__admin/api/packages/pull', {
       method: 'POST', body: { all: true, mode: 'all', concurrency: 1 }, timeoutMs: 60000,
     });
     const pjAll = (pullAll.json && pullAll.json.data) || {};
-    check('POST /packages/pull {all:true, mode:"all"} 能建「补全部版本」任务（响应带 scope=all / mode=all / 目标数=全部缺失版本）',
-      pullAll.status === 200 && pjAll.scope === 'all' && pjAll.mode === 'all'
-        // 镜像被「全部包补全部版本」补满后，剩下的缺失版本可能只在「上传/私有」包里（全部包模式会跳过），
-        // 这时 total=0 是合理的；只要不超过本地逐包扫描出的缺失版本总数即可。
-        && Number(pjAll.total) >= 0 && Number(pjAll.total) <= sum(planAll)
-        && (Number(pjAll.total) === 0 || Number(pjAll.total) >= sum(planTags)),
-      `status=${pullAll.status} scope=${pjAll.scope} mode=${pjAll.mode} total=${pjAll.total} planAll=${sum(planAll)} planTags=${sum(planTags)}`);
+    check('POST /packages/pull {all:true, mode:"all"} 立即返回 async:true + taskId（大名单的统计放进后台任务，不再同步阻塞）',
+      pullAll.status === 200 && pjAll.async === true && !!pjAll.taskId && pjAll.scope === 'all' && pjAll.mode === 'all'
+        && Number(pjAll.planTotal) + Number(pjAll.skippedLocal) === totalPkgs,
+      `status=${pullAll.status} async=${pjAll.async} scope=${pjAll.scope} mode=${pjAll.mode} planTotal=${pjAll.planTotal} skipped=${pjAll.skippedLocal} totalPkgs=${totalPkgs}`);
+    let planSnapshot = null;
+    let planSawPhase = false;
+    let planSawProgress = false;
     if (pjAll.taskId) {
-      const tb = await api('/__admin/api/tasks/' + pjAll.taskId);
-      const tj = (tb.json && tb.json.data) || {};
-      check(`「补全部版本」任务标题写明「全部包补 全部版本」（${tj.title || ''}）`,
-        /全部包补/.test(String(tj.title || '')) && /全部版本/.test(String(tj.title || '')), tj.title);
+      // 等统计阶段结束（phase=plan → download）：期间采样任务快照，验证「已统计 N / M 个包」的进度在动
+      for (let i = 0; i < 900; i++) {
+        await new Promise((r) => setTimeout(r, 120));
+        const g = await api('/__admin/api/tasks/' + pjAll.taskId);
+        const t = (g.json && g.json.data) || {};
+        if (t.phase === 'plan' && t.status === 'running') {
+          planSawPhase = true;
+          if (Number(t.currentDone) >= 1 && Number(t.currentTotal) >= 100) planSawProgress = true;
+          continue;
+        }
+        planSnapshot = t;
+        break;
+      }
+      check('统计阶段任务快照带 phase=plan 与「已统计 N / M 个包」进度（currentDone 在递增、currentTotal=可补包数）',
+        planSawPhase && planSawProgress,
+        `phase=${planSawPhase} progress=${planSawProgress} snapDone=${planSnapshot && planSnapshot.currentDone}`);
+      const ps = planSnapshot || {};
+      const planPkgs = ps.packages || [];
+      const sumTarget = planPkgs.reduce((a, p) => a + Number(p.target || 0), 0);
+      check('统计完成后任务快照带 total 与逐包明细（各行 target 合计 = total，覆盖全部可补的包）',
+        Number(ps.total) >= 0 && planPkgs.length + Number(pjAll.skippedLocal || 0) === totalPkgs
+          && sumTarget === Number(ps.total || 0)
+          // 镜像被「全部包补全部版本」补满后，剩下的缺失版本可能只在「上传/私有」包里（全部包模式会跳过），
+          // 这时 total=0 是合理的；只要不超过本地逐包扫描出的缺失版本总数即可。
+          && (Number(ps.total) === 0 || Number(ps.total) <= sum(planAll)),
+        `total=${ps.total} packages=${planPkgs.length} sum=${sumTarget} planAll=${sum(planAll)} planTags=${sum(planTags)}`);
+      check(`「补全部版本」任务标题写明「全部包补 全部版本」（${ps.title || ''}）`,
+        /全部包补/.test(String(ps.title || '')) && /全部版本/.test(String(ps.title || '')), ps.title);
       await api('/__admin/api/tasks/' + pjAll.taskId + '/cancel', { method: 'POST' });
       let finAll = null;
       for (let i = 0; i < 240; i++) {
@@ -1125,10 +1152,21 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
       method: 'POST', body: { all: true, mode: 'latest', concurrency: 1 }, timeoutMs: 60000,
     });
     const pj = (pull.json && pull.json.data) || {};
-    check('POST /packages/pull {all:true} 不传名单也能建任务，响应带 scope=all',
-      pull.status === 200 && pj.scope === 'all' && !!pj.taskId, `status=${pull.status} scope=${pj.scope} taskId=${pj.taskId}`);
+    check('POST /packages/pull {all:true} 不传名单也能建任务，响应带 scope=all 与 async:true',
+      pull.status === 200 && pj.scope === 'all' && !!pj.taskId && pj.async === true,
+      `status=${pull.status} scope=${pj.scope} async=${pj.async} taskId=${pj.taskId}`);
 
-    const pk = pj.packages || [];
+    // 等统计阶段结束，从任务快照里拿规划结果（响应本身不再同步返回 packages）
+    let latestSnap = null;
+    for (let i = 0; i < 900; i++) {
+      await new Promise((r) => setTimeout(r, 120));
+      const g = await api('/__admin/api/tasks/' + pj.taskId);
+      const t = (g.json && g.json.data) || {};
+      if (t.phase === 'plan' && t.status === 'running') continue;
+      latestSnap = t;
+      break;
+    }
+    const pk = (latestSnap && latestSnap.packages) || [];
     const sumTarget = pk.reduce((a, p) => a + Number(p.target || 0), 0);
     const locals = names.filter((n) => {                       // 上传包 / 私有包：不可能从上游补，全部包模式应跳过
       const rec = roStore.get(n);
@@ -1138,15 +1176,14 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
     const skipOk = locals.length
       ? (pj.skippedLocal === locals.length || (locals.length === totalPkgs && pj.skippedLocal === 0))
       : pj.skippedLocal === 0;
-    check(`任务规划覆盖全部 ${totalPkgs} 个包（返回 ${pk.length} 行 + 跳过 ${pj.skippedLocal} 个仅本地的包，各行 target 合计 ${sumTarget} = total ${pj.total}）`,
-      pk.length + Number(pj.skippedLocal || 0) === totalPkgs && sumTarget === Number(pj.total || 0) && skipOk,
-      `packages=${pk.length} skipped=${pj.skippedLocal} locals=${locals.length} sum=${sumTarget} total=${pj.total}`);
+    check(`任务规划覆盖全部 ${totalPkgs} 个包（任务快照 ${pk.length} 行 + 跳过 ${pj.skippedLocal} 个仅本地的包，各行 target 合计 ${sumTarget} = total ${latestSnap && latestSnap.total}）`,
+      pk.length + Number(pj.skippedLocal || 0) === totalPkgs && sumTarget === Number((latestSnap && latestSnap.total) || 0) && skipOk,
+      `packages=${pk.length} skipped=${pj.skippedLocal} locals=${locals.length} sum=${sumTarget} total=${latestSnap && latestSnap.total}`);
     check('全部包模式跳过仅本地的包（上传/私有），规划里不再出现它们',
       locals.every((n) => !pk.some((p) => p.name === n)), `locals=${locals.join('、') || '（无）'}`);
 
-    const brief = await api('/__admin/api/tasks/' + pj.taskId);
-    const bj = (brief.json && brief.json.data) || {};
-    check(`任务标题写明「全部包」（${bj.title || ''}）`, /全部包/.test(String(bj.title || '')), bj.title);
+    check(`任务标题写明「全部包」（${latestSnap && latestSnap.title}）`,
+      /全部包/.test(String((latestSnap && latestSnap.title) || '')), latestSnap && latestSnap.title);
 
     await api('/__admin/api/tasks/' + pj.taskId + '/cancel', { method: 'POST' });
     let fin = null;
@@ -1193,14 +1230,26 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
         await sleep(120);
       }
     })();
+    const tPull = Date.now();
     const pullAll = await api('/__admin/api/packages/pull', { method: 'POST', body: { all: true, mode: 'tags' }, timeoutMs: 180000 });
+    const pullRespMs = Date.now() - tPull;
+    const pjAll = (pullAll.json && pullAll.json.data) || {};
+    // 大名单的统计现在放进后台任务（响应立即返回 async:true），保持探针运行到统计阶段结束，
+    // 才能量到「1500+ 个包的读盘统计进行期间，服务仍能及时响应健康检查」。
+    if (pjAll.taskId) {
+      for (let i = 0; i < 900; i++) {
+        await sleep(120);
+        const g = await api('/__admin/api/tasks/' + pjAll.taskId);
+        const t = (g.json && g.json.data) || {};
+        if (t.phase !== 'plan' || t.status !== 'running') break;
+      }
+    }
     stopProbe = true;
     await probe;
     const maxLat = lat.length ? Math.max(...lat) : 0;
-    check(`全量规划期间 /-/ping 仍能及时响应（${lat.length} 次采样，最大 ${maxLat}ms；修复前整段会超时）`,
-      pullAll.status === 200 && lat.length >= 2 && maxLat < 5000,
-      `status=${pullAll.status} samples=${lat.length} max=${maxLat}ms`);
-    const pjAll = (pullAll.json && pullAll.json.data) || {};
+    check(`大名单补 tarball 立即返回（${pullRespMs}ms，async:true），统计期间 /-/ping 仍及时响应（${lat.length} 次采样，最大 ${maxLat}ms）`,
+      pullAll.status === 200 && pjAll.async === true && pullRespMs < 3000 && lat.length >= 2 && maxLat < 5000,
+      `status=${pullAll.status} async=${pjAll.async} resp=${pullRespMs}ms samples=${lat.length} max=${maxLat}ms`);
     if (pjAll.taskId) {
       await api('/__admin/api/tasks/' + pjAll.taskId + '/cancel', { method: 'POST' });
       for (let i = 0; i < 120; i++) {
@@ -2725,6 +2774,18 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
         evNew.length > 0 && evNew.every((e) => (e.inFlight || []).every((it) => Number.isFinite(Number(it.lanes)) && Number(it.lanes) >= 0)),
         JSON.stringify((evNew.find((e) => (e.inFlight || []).length > 0) || {}).inFlight || []));
 
+      // 5.1) 解包后「扫描包元数据」也要有进度事件：本机解出上千个包时，界面不能看着像卡住
+      const scanEvNew = evNew.filter((e) => e.phase === 'scan');
+      const scanDoneNew = evNew.filter((e) => e.phase === 'scan-done');
+      check('导入扫描阶段逐目录上报进度（phase=scan，scanned 递增、total=包目录数、current=当前包）',
+        scanEvNew.length >= 1 && scanEvNew.every((e) => Number(e.total) === 2 && Number.isFinite(Number(e.scanned)))
+          && scanEvNew.some((e) => Number(e.scanned) >= 1 && String(e.current || '').length > 0)
+          && Number(scanEvNew[scanEvNew.length - 1].scanned) === 2,
+        `scanEvents=${scanEvNew.length} last=${JSON.stringify(scanEvNew[scanEvNew.length - 1] || null)}`);
+      check('导入扫描阶段结束有 phase=scan-done（前端据此从「统计」切到「导入」）',
+        scanDoneNew.length === 1 && Number(scanDoneNew[0].total) === 2 && Number(scanDoneNew[0].scanned) === 2,
+        JSON.stringify(scanDoneNew[0] || null));
+
       // 6) 解包并发：同一批文件分别用并发 1 / 8 解，结果必须完全一致
       const filesBench = Array.from({ length: 600 }, (_, i) => ({ name: `d${i % 20}/f${i}.txt`, data: Buffer.alloc(4096, i % 251) }));
       const benchTar = path.join(workNew, 'bench.tar.gz');
@@ -2803,6 +2864,35 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
     const scan = await api('/__admin/api/npmcache/scan', { timeoutMs: 300000 });
     const d = scan.json && scan.json.data;
     check('GET /npmcache/scan 扫描本机 npm 缓存', scan.status === 200 && d && typeof d.total === 'number', `status=${scan.status} total=${d && d.total} dir=${d && d.cacheDir}`);
+    // progress=1：缓存扫描也改成长任务，前端据此显示「已检查 N / M 个索引文件、发现 X 个包」而不是干等
+    const scanTask = await api('/__admin/api/npmcache/scan?refresh=1&progress=1', { timeoutMs: 60000 });
+    const st = (scanTask.json && scanTask.json.data) || {};
+    check('POST /npmcache/scan?refresh=1&progress=1 立即返回 async:true + taskId',
+      scanTask.status === 200 && st.async === true && !!st.taskId, `status=${scanTask.status} taskId=${st.taskId}`);
+    let stFin = null;
+    let sawScanPhase = false;
+    let sawScanMsg = false;
+    if (st.taskId) {
+      for (let i = 0; i < 1800; i++) {
+        await new Promise((r) => setTimeout(r, 120));
+        const g = await api('/__admin/api/tasks/' + st.taskId);
+        const t = (g.json && g.json.data) || {};
+        if (t.status === 'running') {
+          if (t.phase === 'scan' || t.phase === 'verify') sawScanPhase = true;
+          if (/正在扫描本机 npm 缓存|正在校验 tarball 完整性/.test(String(t.message || ''))) sawScanMsg = true;
+          continue;
+        }
+        stFin = t;
+        break;
+      }
+      check('缓存扫描任务快照带扫描/校验阶段与中文进度文案（phase=scan/verify + message）',
+        sawScanPhase && sawScanMsg, `phase=${sawScanPhase} msg=${sawScanMsg} last=${stFin && stFin.message}`);
+      const scanRes = (stFin && stFin.result && stFin.result.scan) || null;
+      check('缓存扫描任务完成后 result.scan 带 packages 数组（前端直接渲染候选包列表）',
+        !!stFin && stFin.status === 'done' && !!scanRes && Array.isArray(scanRes.packages) && typeof scanRes.total === 'number',
+        `status=${stFin && stFin.status} total=${scanRes && scanRes.total}`);
+    }
+
     if (d && d.total > 0 && d.packages && d.packages.length) {
       // 「本地已有」标记：缓存里的包是否已经在镜像里（前端据此显示徽标、也决定「仅导入不存在的包」导哪些）
       const localN = d.packages.filter((p) => p.local === true).length;

@@ -2255,6 +2255,20 @@
     }
 
     function paint(d) {
+      /* 统计阶段（服务端在后台规划「哪些版本要补」）：大镜像要读 1500+ 份 packument，
+       * 用 currentDone / currentTotal 显示「已统计 N / M 个包」，进度条跟着走，避免看起来像无响应。 */
+      if (d.phase === 'plan') {
+        var planDone = Number(d.currentDone) || 0;
+        var planTotal = Number(d.currentTotal) || 0;
+        var planPct = planTotal > 0 ? Math.max(2, Math.min(99, Math.round(planDone / planTotal * 100))) : 2;
+        bar.style.width = planPct + '%';
+        note.textContent = '正在统计需要补的版本：' + fmtNum(planDone) + ' / ' + fmtNum(planTotal) + ' 个包'
+          + (d.current ? '（当前：' + d.current + '）' : '') + noteSuffix();
+        stat.textContent = '正在读取包元数据、检查本地缺哪些 tarball…（只读镜像数据，可以取消）· 已用时 '
+          + fmtDur(Math.round((d.elapsedMs || 0) / 1000));
+        runPane.paint(d.downloads || []);
+        return;
+      }
       bar.style.width = (d.percent || 0) + '%';
       note.textContent = '正在按「' + modeText + '」补 tarball · 并发 ' + d.concurrency + ' 个' + (scopeAll ? ' · 全部包' : '') + noteSuffix();
       var secs = Math.round((d.elapsedMs || 0) / 1000);
@@ -2297,8 +2311,57 @@
       lastPkgs = d.packages || [];
     }
 
+    /* 「无需补充」收尾：统计完发现一个 tarball 都不用补。同步响应（total=0）和后台任务（快照里 total=0）
+     * 都走这里，保证两种入口的面板、提示、按钮状态一致。 */
+    function showNoNeed(d) {
+      if (finished) return;
+      finished = true;
+      var noNeed = pick ? '无需补充：选中的版本都已缓存。'
+        : (scopeAll ? '无需补充：全部包的「' + modeText + '」都已缓存。' : '选中的包没有需要补的版本。');
+      note.textContent = noNeed + noteSuffix();
+      stat.textContent = '0 / 0 个';
+      bar.style.width = '100%';
+      var shown = 0;
+      (d.packages || []).forEach(function (p) {
+        if (scopeAll && shown >= 30) return;                // 全部包模式：没有缺失时最多列 30 行示例
+        var row = rows[p.name];
+        if (!row) {
+          if (!scopeAll) return;
+          row = mkRow(p.name); shown++;
+        }
+        row.className = 'taskrow tr-fillrow ' + (p.error ? 'err' : 'ok');
+        if (row.__fill) row.__fill.style.width = '100%';
+        row.__tv.textContent = p.error ? '✕ ' + p.error
+          : (Number(p.missing || 0) > 0
+            ? (mode === 'latest'
+              ? '✓ 最新版本已缓存（另有 ' + fmtNum(p.missing) + ' 个版本未缓存）'
+              : '✓ dist-tag 版本已齐（另有 ' + fmtNum(p.missing) + ' 个版本未缓存）')
+            : '✓ tarball 已齐全');
+      });
+      if (scopeAll && (d.packages || []).length > 30) {
+        list.appendChild(el('div', { class: 'taskrow tr-summary ok' }, [
+          el('span', { text: '其余 ' + fmtNum((d.packages || []).length - 30) + ' 个包也都已齐全' }),
+          el('span', { class: 'tv', text: '无需补下载' })
+        ]));
+      }
+      list.appendChild(el('div', { class: 'taskrow tr-summary ok' }, [
+        el('span', { text: '全部处理完毕' }),
+        el('span', { class: 'tv', text: '无需补下载 · 共 ' + fmtNum((d.packages || []).length) + ' 个包'
+          + (skippedLocal ? '（另有 ' + fmtNum(skippedLocal) + ' 个仅本地的包已跳过）' : '') })
+      ]));
+      taskFinishedButtons(m);          // 没有活干也算「跑完了」：取消/后台运行置灰，露出【关闭】
+      runPane.paint([], true);              // 右侧「正在下载」栏：没有在下的包
+      leftCol.scrollTop = leftCol.scrollHeight;   // 滚到最后，让「全部处理完毕」汇总行进视野
+      toast(pick ? '无需补充：选中的版本都已缓存'
+        : (scopeAll ? '无需补充：全部包都已经是最新状态' : '无需补充：选中的包没有缺失的 tarball'), 'ok', 6000);
+      setSideHint('READY');
+      return;
+    }
+
     function stop(d) {
       if (finished) return;           // 防止两次轮询都拿到终态，重复追加「全部处理完毕」行与 toast
+      // 后台统计任务（phase=plan）跑完发现一个 tarball 都不用补：走「无需补充」面板，而不是下载完成汇总
+      if (Number(d.total) === 0 && d.status !== 'canceled' && d.status !== 'error') { showNoNeed(d); return; }
       finished = true;
       if (timer) { clearInterval(timer); timer = null; }
       bar.style.width = (d.percent || 0) + '%';
@@ -2343,49 +2406,17 @@
       .then(function (d) {
         taskId = d.taskId;
         skippedLocal = Number(d.skippedLocal) || 0;
-        if (!d.total) {
-          finished = true;
-          var noNeed = pick ? '无需补充：选中的版本都已缓存。'
-            : (scopeAll ? '无需补充：全部包的「' + modeText + '」都已缓存。' : '选中的包没有需要补的版本。');
-          note.textContent = noNeed + noteSuffix();
-          stat.textContent = '0 / 0 个';
-          bar.style.width = '100%';
-          var shown = 0;
-          (d.packages || []).forEach(function (p) {
-            if (scopeAll && shown >= 30) return;                // 全部包模式：没有缺失时最多列 30 行示例
-            var row = rows[p.name];
-            if (!row) {
-              if (!scopeAll) return;
-              row = mkRow(p.name); shown++;
-            }
-            row.className = 'taskrow tr-fillrow ' + (p.error ? 'err' : 'ok');
-            if (row.__fill) row.__fill.style.width = '100%';
-            row.__tv.textContent = p.error ? '✕ ' + p.error
-              : (Number(p.missing || 0) > 0
-                ? (mode === 'latest'
-                  ? '✓ 最新版本已缓存（另有 ' + fmtNum(p.missing) + ' 个版本未缓存）'
-                  : '✓ dist-tag 版本已齐（另有 ' + fmtNum(p.missing) + ' 个版本未缓存）')
-                : '✓ tarball 已齐全');
-          });
-          if (scopeAll && (d.packages || []).length > 30) {
-            list.appendChild(el('div', { class: 'taskrow tr-summary ok' }, [
-              el('span', { text: '其余 ' + fmtNum((d.packages || []).length - 30) + ' 个包也都已齐全' }),
-              el('span', { class: 'tv', text: '无需补下载' })
-            ]));
-          }
-          list.appendChild(el('div', { class: 'taskrow tr-summary ok' }, [
-            el('span', { text: '全部处理完毕' }),
-            el('span', { class: 'tv', text: '无需补下载 · 共 ' + fmtNum((d.packages || []).length) + ' 个包'
-              + (skippedLocal ? '（另有 ' + fmtNum(skippedLocal) + ' 个仅本地的包已跳过）' : '') })
-          ]));
-          taskFinishedButtons(m);          // 没有活干也算「跑完了」：取消/后台运行置灰，露出【关闭】
-          runPane.paint([], true);              // 右侧「正在下载」栏：没有在下的包
-          leftCol.scrollTop = leftCol.scrollHeight;   // 滚到最后，让「全部处理完毕」汇总行进视野
-          toast(pick ? '无需补充：选中的版本都已缓存'
-            : (scopeAll ? '无需补充：全部包都已经是最新状态' : '无需补充：选中的包没有缺失的 tarball'), 'ok', 6000);
-          setSideHint('READY');
+        /* async:true 表示服务端把「统计要补哪些版本」放进了后台任务（全部包等大名单）。
+         * 先进入轮询：任务快照 phase='plan' 时 paint 会显示「已统计 N / M 个包」。 */
+        if (d.async) {
+          note.textContent = '已创建任务，正在统计需要补的版本：0 / ' + fmtNum(Number(d.planTotal) || names.length) + ' 个包' + noteSuffix();
+          stat.textContent = '正在读取包元数据、检查本地缺哪些 tarball…（只读镜像数据，可以取消）';
+          bar.style.width = '2%';
+          timer = setInterval(poll, 700);
+          poll();
           return;
         }
+        if (!d.total) { showNoNeed(d); return; }
         note.textContent = '已开始下载 · 并发 ' + d.concurrency + ' 个' + (scopeAll ? ' · 共 ' + fmtNum((d.packages || []).length) + ' 个包' : '') + noteSuffix();
         bar.style.width = '1%';
         timer = setInterval(poll, 700);
@@ -3074,18 +3105,43 @@
     setText('scan-meta', '正在扫描本机 npm 缓存目录，可能需要十几秒…');
     var tb = clear($('#scan-tbody'));
     tb.appendChild(el('tr', {}, [el('td', { colspan: '6' }, [el('div', { class: 'center-box', text: 'SCANNING NPM CACHE…' })])]));
-    api('/npmcache/scan?refresh=1', { timeout: 300000 }).then(function (d) {
-      state.mig.scan = d; state.mig.scanSel = {}; state.mig.scanPage = 1;
-      paintScan();
-      setSideHint('READY');
-      btnBusy(btn, false);
-      toast('扫描完成：' + fmtNum((d.packages || []).length) + ' 个候选包 / ' + fmtBytes(d.bytes), 'ok');
-    }, function (e) {
+    var timer = null, finished = false;
+    function fail(e) {
+      if (finished) return;
+      finished = true;
+      if (timer) { clearInterval(timer); timer = null; }
       btnBusy(btn, false); setSideHint('ERROR');
       setText('scan-meta', '扫描失败：' + (e.message || ''));
       clear(tb); tb.appendChild(el('tr', {}, [el('td', { colspan: '6', class: 'empty', text: '扫描失败：' + (e.message || '') })]));
       handleErr(e, true);
-    });
+    }
+    /* progress=1：服务端建后台任务扫描，前端轮询显示「已检查 N / M 个索引文件」和
+     * 「正在校验 tarball 完整性：N / M 个包」两段进度。大缓存扫描要几十秒，
+     * 以前是同步等 HTTP 返回，界面只显示一句静态「正在扫描…」，容易被误认为无响应。 */
+    api('/npmcache/scan?refresh=1&progress=1', { timeout: 60000 }).then(function (d) {
+      var taskId = d && d.taskId;
+      if (!taskId) throw new Error('服务端没有返回扫描任务编号');
+      timer = setInterval(function () {
+        if (finished) return;
+        api('/tasks/' + taskId).then(function (t) {
+          if (finished) return;
+          if (t.status === 'running') {
+            setText('scan-meta', (t.message || '正在扫描…') + ' · 已用时 ' + fmtDur(Math.round((t.elapsedMs || 0) / 1000)));
+            return;
+          }
+          if (t.status === 'error') { fail(new Error(t.message || '扫描失败')); return; }
+          finished = true;
+          if (timer) { clearInterval(timer); timer = null; }
+          var scan = (t.result && t.result.scan) || null;
+          if (!scan) { fail(new Error('扫描任务没有返回结果')); return; }
+          state.mig.scan = scan; state.mig.scanSel = {}; state.mig.scanPage = 1;
+          paintScan();
+          setSideHint('READY');
+          btnBusy(btn, false);
+          toast('扫描完成：' + fmtNum((scan.packages || []).length) + ' 个候选包 / ' + fmtBytes(scan.bytes), 'ok');
+        }, function (e) { if (!finished) fail(e); });
+      }, 400);
+    }, fail);
   }
 
   function paintScan() {
@@ -3602,6 +3658,10 @@
       if (opts.extractBar && (d.phase === 'extract' || d.phase === 'assemble')) {
         pct = d.bytesTotal ? Math.min(100, Math.round(((d.bytes || 0) / d.bytesTotal) * 100)) : 0;
       }
+      /* 解包完成后的「扫描包元数据」阶段：按已扫描包数显示百分比，避免停在 0% 像无响应 */
+      if (d.phase === 'scan' && Number(d.currentTotal) > 0) {
+        pct = Math.min(100, Math.round(((Number(d.currentDone) || 0) / Number(d.currentTotal)) * 100));
+      }
       /* 整体条不要把「压缩完但还在写盘」显示成 100%：打包只映射到 0~95%，拼接分片写最终文件补到 100% */
       if (opts.barPct) { var bp = Number(opts.barPct(d, pct)); if (isFinite(bp)) pct = bp; }
       setBar(pct);
@@ -3916,6 +3976,11 @@
         var ep = d.bytesTotal ? Math.min(100, Math.round(((d.bytes || 0) / d.bytesTotal) * 100)) : 0;
         return '正在解包备份文件：' + fmtBytes(d.bytes || 0) + (d.bytesTotal ? ' / ' + fmtBytes(d.bytesTotal) : '') + '（' + ep + '%） · 已用时 ' + fmtDur(secs);
       }
+      if (d.phase === 'scan') {
+        var sp = Number(d.currentTotal) > 0 ? Math.round(((Number(d.currentDone) || 0) / Number(d.currentTotal)) * 100) : 0;
+        return '正在统计备份里的包：' + fmtNum(d.currentDone || 0) + ' / ' + fmtNum(d.currentTotal || 0) + ' 个（' + sp + '%）'
+          + (d.current ? '（当前：' + d.current + '）' : '') + ' · 读取 packument / meta 并检查本地已有版本 · 已用时 ' + fmtDur(secs);
+      }
       if (d.phase !== 'import') {
         return '正在准备导入… · 已用时 ' + fmtDur(secs);
       }
@@ -3941,6 +4006,7 @@
       phaseNote: function (d) {
         if (d.phase === 'assemble') return '上传完成，正在把分片合并成完整备份文件…（可以取消）';
         if (d.phase === 'extract') return '正在解包备份文件…（可以取消，已解出的部分会清掉）';
+        if (d.phase === 'scan') return '正在读取备份里每个包的元数据（packument / meta），并和本地已有版本比对…（可以取消）';
         return '正在把包写入本地存储…（可以取消，已导入的部分会保留）';
       },
       onFinalize: function (d, ui) {
