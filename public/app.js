@@ -5100,7 +5100,7 @@
    * 恢复后 toast 提醒并刷新一次界面，让顶栏、列表、统计都回到最新状态。
    * 点「重启服务」后切到 250ms 快探测 30 秒：服务重启只需要一两秒，
    * 之前 4 秒一次的间隔很可能整段跳过「不可用窗口」，页面就永远看不到断开状态。
-   * 另外每 2 秒轮询一次 /session 的会话标记（pid + startedAt）：服务重启后标记必变，
+   * 另外每 1 秒（与心跳同频）轮询一次 /session 的会话标记（pid + startedAt）：服务重启后标记必变，
    * 就算心跳刚好错过了「不可用窗口」，也能发现重启并自动刷新页面。
    * 服务重启、电脑休眠唤醒、网络恢复都能自动接上。
    * ============================================================ */
@@ -5112,7 +5112,7 @@
   var CONN_POLL_MS = 1000;          // 常规探测间隔
   var CONN_FAST_MS = 250;           // 重启/唤醒等关键时刻的快探测间隔
   var CONN_FAST_WINDOW_MS = 20000;  // 快探测持续时间
-  var CONN_SESSION_POLL_MS = 2000;  // 服务实例标记（pid + startedAt）轮询间隔
+  var CONN_SESSION_POLL_MS = 1000;  // 服务实例标记（pid + startedAt）轮询间隔（与心跳同频，文案统一为「每 1 秒探测一次」）
   var connSessionTimer = null;
   var connSessionPending = false;
   var connMark = null;              // 上次看到的服务实例标记（pid@startedAt）
@@ -5128,7 +5128,7 @@
     var txt = $('#chip-conn-text');
     if (txt) txt.textContent = ok ? '已连接' : '连接断开';
     setTip(chip, ok
-      ? '与镜像源服务连接正常（每 1 秒探测一次；服务重启后自动刷新界面）'
+      ? '与镜像源服务连接正常（每 1 秒探测一次：心跳 + 服务实例标记；服务重启后自动刷新界面）'
       : '与镜像源服务的连接已断开，正在自动重试（每 1 秒一次，已重试 ' + fails + ' 次）；恢复连接后会自动刷新界面');
   }
 

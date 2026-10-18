@@ -1262,7 +1262,7 @@ async function get(p, { json = false } = {}) {
       '之前 4 秒一次，服务几秒就重启完了，页面根本看不到断开状态');
 
     check('服务重启检测：轮询 /session 的 pid + startedAt，重启后自动刷新（不依赖刚好探到断开窗口）',
-      /var CONN_SESSION_POLL_MS = 2000;/.test(jsConn)
+      /var CONN_SESSION_POLL_MS = 1000;/.test(jsConn)
         && /function serverMark\(d\) \{/.test(jsConn)
         && /function connSessionProbe\(\)/.test(jsConn)
         && /fetch\(API \+ '\/session', \{ cache: 'no-store', headers: headers \}\)/.test(jsConn)
