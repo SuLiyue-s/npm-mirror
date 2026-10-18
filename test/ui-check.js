@@ -904,6 +904,64 @@ async function get(p, { json = false } = {}) {
       '对勾两臂 5px/9px，浏览器整数取整后仍是清晰的 ✓；半选态画横杠');
   }
 
+  console.log('\x1b[1m九之五、并发异常点审计修复（内存预算 / 流式校验 / 路径与并发防护）\x1b[0m');
+  {
+    const pathAudit = require('node:path');
+    const fsAudit = require('node:fs');
+    const readAudit = (p) => fsAudit.readFileSync(pathAudit.join(__dirname, '..', p), 'utf8');
+    const utilAudit = readAudit('src/util.js');
+    const bundleAudit = readAudit('src/bundle.js');
+    const storeAudit = readAudit('src/store.js');
+    const cacheAudit = readAudit('src/npmcache.js');
+    const apiAudit = readAudit('src/api.js');
+    const cliAudit = readAudit('cli.js');
+
+    check('并发工具加固：mapLimit 对非法并发数兜底，新增按字节限流的 createByteBudget',
+      /const list = Array\.isArray\(items\) \? items : \[\];/.test(utilAudit)
+        && /Number\.isFinite\(n\) && n > 0 \? n : 1/.test(utilAudit)
+        && /function createByteBudget\(limitBytes\)/.test(utilAudit)
+        && /async acquire\(n\)/.test(utilAudit)
+        && /waiters\.push\(\{ need, resolve \}\)/.test(utilAudit));
+
+    check('离线包导入按字节预算读 tarball：64 路并发不再各自堆一整个 Buffer（改异步读、finally 释放）',
+      /IMPORT_BYTE_BUDGET = createByteBudget\(256 \* 1024 \* 1024\)/.test(bundleAudit)
+        && /IMPORT_BYTE_BUDGET\.acquire\(fileSize \|\| 1\)/.test(bundleAudit)
+        && /IMPORT_BYTE_BUDGET\.release\(cred\)/.test(bundleAudit)
+        && !/fs\.readFileSync\(task\.useFile\)/.test(bundleAudit));
+
+    check('mapLimit 的 {__error} 行不会再把整批任务带崩（导出收集 / 导入扫描 / 依赖闭包显式跳过）',
+      /row\.__error \|\| !Array\.isArray\(row\.list\)/.test(bundleAudit)
+        && /scanned\.filter\(\(row\) => row && !row\.__error && row\.pkgDir && row\.incomingPackument\)/.test(bundleAudit)
+        && /if \(!Array\.isArray\(found\)\) continue;/.test(bundleAudit));
+
+    check('离线包 meta.json 里的 tarball 文件名严格校验：拒绝 . 与 .. 以及非 .tgz 后缀（防路径拼接越界）',
+      /altName !== '\.' && altName !== '\.\.'/.test(bundleAudit)
+        && /altName === path\.basename\(altName\)/.test(bundleAudit));
+
+    check('新增流式写 tarball（边读边算 sha1/sha512，写临时文件后原子改名）+ 启动索引并发加载',
+      /async putTarballFromFileAsync\(name, version, srcFile\)/.test(storeAudit)
+        && /await fsp\.rename\(tmp, dest\)/.test(storeAudit)
+        && /crypto\.createHash\('sha512'\)/.test(storeAudit)
+        && /async initAsync\(\)/.test(storeAudit));
+
+    check('npm 缓存扫描/导入改为流式 integrity 校验，缓存路径限定在缓存目录内，导入用流式拷贝',
+      /async function verifyFileIntegrity\(file, integrity\)/.test(cacheAudit)
+        && /for await \(const chunk of fs\.createReadStream/.test(cacheAudit)
+        && /verifyFileIntegrity\(p, dist\.integrity\)/.test(cacheAudit)
+        && /isInside\(dir, info\.__contentPath\)/.test(cacheAudit)
+        && /await store\.putTarballFromFileAsync\(name, v, p\)/.test(cacheAudit));
+
+    check('并发任务整体异常不再静默丢结果：npm 缓存导入按输入下标把 {__error} 计入失败清单',
+      /if \(it\.__error\) \{/.test(cacheAudit)
+        && /result\.failed\.push\(\{ name: String\(wanted\[i\]\), error: it\.__error \}\)/.test(cacheAudit));
+
+    check('分片上传与补 tarball 的并发防护：同片并发写、合并期中止、规划异常行、启动初始化异常都有兜底',
+      /up\.writing && up\.writing\.has\(index\)/.test(apiAudit)
+        && /正在合并分片，无法取消/.test(apiAudit)
+        && /if \(!plan \|\| plan\.__error \|\| plan\.error\)/.test(apiAudit)
+        && /app = await createServer\(\{ cliOpts \}\)/.test(cliAudit));
+  }
+
   console.log('\x1b[1m十之五、概览页「上游与来源分布」条形图渲染\x1b[0m');
   {
     const jsBars = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');

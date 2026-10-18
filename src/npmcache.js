@@ -7,7 +7,7 @@ const crypto = require('node:crypto');
 const os = require('node:os');
 const {
   integrityToCachePath, ensureDir, readJson, writeJsonAtomic, rootPath, compareVersions,
-  isSafePkgName, isSafeVersion, mapLimit,
+  isSafePkgName, isSafeVersion, mapLimit, createByteBudget,
 } = require('./util');
 
 let scanState = null;                   // { cacheDir, registry, scannedAt, packages:[{...,__contentPath}] }
@@ -57,6 +57,48 @@ function verifyIntegrity(buf, integrity) {
   if (actual.length !== expected.length) return false;
   return crypto.timingSafeEqual(actual, expected);
 }
+
+/**
+ * 流式校验磁盘文件的 integrity：不把整个 tarball 读进内存（扫描阶段只关心「是否被篡改」，
+ * 大 tarball 在 64 路并发下若各自 readFile 会成倍放大内存峰值，极端情况直接 OOM）。
+ * 返回 { ok, sizeBytes }；文件读不了时 ok=false、sizeBytes=0。
+ */
+async function verifyFileIntegrity(file, integrity) {
+  const m = /^(sha512|sha256|sha1)-([A-Za-z0-9+/=]+)$/.exec(String(integrity || ''));
+  if (!m) {
+    // 没有可用 integrity 时退化为「读得到就算通过」，但仍用流扫描统计大小，避免整文件进内存
+    let sizeBytes = 0;
+    try {
+      for await (const chunk of fs.createReadStream(file, { highWaterMark: 1 << 20 })) sizeBytes += chunk.length;
+      return { ok: true, sizeBytes };
+    } catch { return { ok: false, sizeBytes: 0 }; }
+  }
+  let expected;
+  try { expected = Buffer.from(m[2], 'base64'); } catch { return { ok: false, sizeBytes: 0 }; }
+  if (!expected.length) return { ok: false, sizeBytes: 0 };
+  const hash = crypto.createHash(m[1]);
+  let sizeBytes = 0;
+  try {
+    for await (const chunk of fs.createReadStream(file, { highWaterMark: 1 << 20 })) { hash.update(chunk); sizeBytes += chunk.length; }
+  } catch { return { ok: false, sizeBytes: 0 }; }
+  const actual = hash.digest();
+  const ok = actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
+  return { ok, sizeBytes };
+}
+
+/** 判定 p 是否在 base 目录内（用于校验扫描结果里记录的缓存内容路径没被篡改/串目录） */
+function isInside(base, p) {
+  try {
+    const rel = path.relative(path.resolve(base), path.resolve(p));
+    return rel === '' || (!!rel && !rel.startsWith('..') && !path.isAbsolute(rel));
+  } catch { return false; }
+}
+
+/**
+ * 元数据整体读入内存的字节预算：导入时每个包都会把 packument（可达数 MB）整块读入校验/解析，
+ * 64 路并发时峰值可能到几百 MB，用预算把并发读总量压住。
+ */
+const META_BYTE_BUDGET = createByteBudget(128 * 1024 * 1024);
 
 /** 解析用户级 .npmrc 里的 cache 配置 */
 function readNpmrcCacheDir() {
@@ -181,8 +223,10 @@ async function scanCache({ cacheDir, registry, logger, anyRegistry = false, onPr
   /* 第一阶段（并发读索引）：原来是一个文件一个文件串行 await，npm 缓存大时（几万个索引文件）
    * 扫描要等很久。现在按 concurrency 路并发读索引文件并校验元数据内容，镜像服务在扫描期间仍可用。
    * 并发下同一个包可能被多个索引条目指向，所以先按文件顺序收候选、最后顺序去重，
-   * 保证「先扫到的为准」，扫描结果与串行版本一致、不会时快时慢。 */
-  const hits = await mapLimit(files, conc, async (f) => {
+   * 保证「先扫到的为准」，扫描结果与串行版本一致、不会时快时慢。
+   * 注意：这一步每个任务会把 packument（最大约 10MB）整块读入校验，所以把并发压到 8 路，
+   * 避免 64 路 × 大元数据把内存打爆；真正慢的 tarball 校验在第二阶段（流式，可高并发）。 */
+  const hits = await mapLimit(files, Math.min(conc, 8), async (f) => {
     let text = '';
     try { text = await fsp.readFile(f, 'utf8'); } catch { return null; }
     scanned++;
@@ -226,21 +270,29 @@ async function scanCache({ cacheDir, registry, logger, anyRegistry = false, onPr
       foundNow.add(data.name);
       out.push({ name: data.name, packument: data, contentPath, integrity: entry.integrity });
     }
-    if (onProgress && scanned % 2000 === 0) onProgress({ scanned, total: files.length, found: foundNow.size });
+    // 进度回调异常不能打断扫描：以前在并发任务里直接调用，回调一抛错该文件结果
+    // 就变成 mapLimit 的 {__error} 行，后面合并时 for...of 直接 TypeError 整次扫描失败。
+    if (onProgress && scanned % 2000 === 0) { try { onProgress({ scanned, total: files.length, found: foundNow.size }); } catch { /* 忽略 */ } }
     return out;
   });
   const found = new Map();
+  let failedFiles = 0;
   for (const list of hits) {
-    if (!list) continue;
+    // 并发阶段个别文件抛错时 mapLimit 会给出 {__error} 对象，这里必须跳过而不是当数组迭代
+    if (!Array.isArray(list)) { failedFiles++; continue; }
     for (const it of list) {
+      if (!it || !it.name) continue;
       if (found.has(it.name)) continue;
       found.set(it.name, it);
     }
   }
-  if (onProgress) onProgress({ scanned, total: files.length, found: found.size });
+  if (failedFiles && logger) logger.warn(`扫描 npm 缓存：${failedFiles} 个索引文件读取/解析失败，已跳过`);
+  if (onProgress) { try { onProgress({ scanned, total: files.length, found: found.size }); } catch { /* 忽略 */ } }
 
   /* 第二阶段（并发校验 tarball）：逐包读取本地缓存里的每个版本 tarball 并校验 integrity，
-   * 包与包之间并发执行（原来逐包逐版本全串行）。 */
+   * 包与包之间并发执行（原来逐包逐版本全串行）。
+   * 这里改成「流式」校验：只算哈希、不把 tarball 读进内存。以前 64 路并发时
+   * 同时最多有 64 个整包 Buffer 在内存里，遇到大 tarball 会直接把进程内存打满。 */
   const rows = await mapLimit(Array.from(found.entries()), conc, async ([name, rec]) => {
     const versions = Object.keys(rec.packument.versions || {});
     let avail = 0, size = 0, badTarballs = 0;
@@ -248,15 +300,14 @@ async function scanCache({ cacheDir, registry, logger, anyRegistry = false, onPr
       const dist = rec.packument.versions[v].dist || {};
       const p = integrityToCachePath(dir, dist.integrity);
       if (!p) continue;
-      let buf = null;
-      try { buf = await fsp.readFile(p); } catch { buf = null; }
       // 扫描阶段就校验 tarball 的 integrity：否则「扫描说有 N 个可导入」与「导入只成功 M 个」口径不一致
-      if (!buf || !verifyIntegrity(buf, dist.integrity)) {
+      const checked = await verifyFileIntegrity(p, dist.integrity);
+      if (!checked.ok) {
         badTarballs++;
         if (logger) logger.warn(`跳过完整性校验失败的 npm 缓存 tarball：${name}@${v}`);
         continue;
       }
-      size += buf.length;
+      size += checked.sizeBytes;
       avail++;
     }
     const latest = (rec.packument['dist-tags'] && rec.packument['dist-tags'].latest) || versions.sort(compareVersions).pop();
@@ -274,7 +325,12 @@ async function scanCache({ cacheDir, registry, logger, anyRegistry = false, onPr
       __integrity: rec.integrity,
     };
   });
-  const packages = rows.filter(Boolean);
+  // 并发阶段个别包抛异常时 mapLimit 会给出 {__error} 行：必须滤掉，否则下面排序
+  // 访问 a.name / a.sizeBytes 会 TypeError 整个扫描失败。
+  const packages = rows.filter((row) => row && !row.__error && row.name && Number.isFinite(row.sizeBytes));
+  if (packages.length < rows.length && logger) {
+    logger.warn(`扫描 npm 缓存：${rows.length - packages.length} 个包在校验阶段失败，已跳过`);
+  }
   packages.sort((a, b) => b.sizeBytes - a.sizeBytes || a.name.localeCompare(b.name));
   scanState = {
     version: SCAN_STATE_VERSION,
@@ -356,15 +412,28 @@ async function importFromCache({ store, cacheDir, names = [], all = false, overw
     try {
       outcome = await store.withLock(name, async () => {
         let packument = null;
-        if (info.__contentPath) {
+        // 扫描结果文件（data/npmcache-scan.json）是本地数据，也可能被手工改动/串目录：
+        // 只允许读取「当前缓存目录内」的内容文件，避免把任意路径当缓存内容读进来。
+        if (info.__contentPath && isInside(dir, info.__contentPath)) {
           // 元数据同样按扫描时记录的 integrity 校验，防止被篡改的缓存直接写进镜像
           let raw = null;
-          try { raw = await fsp.readFile(info.__contentPath); } catch { raw = null; }
-          if (raw && verifyIntegrity(raw, info.__integrity)) {
-            try { packument = JSON.parse(raw.toString('utf8')); } catch { packument = null; }
-          } else if (logger) {
-            logger.warn(`跳过完整性校验失败的缓存元数据：${name}`);
+          let cred = 0;
+          try {
+            const st = await fsp.stat(info.__contentPath);
+            cred = await META_BYTE_BUDGET.acquire((st && st.size) || 1);
+            raw = await fsp.readFile(info.__contentPath);
+          } catch { raw = null; }
+          try {
+            if (raw && verifyIntegrity(raw, info.__integrity)) {
+              try { packument = JSON.parse(raw.toString('utf8')); } catch { packument = null; }
+            } else if (logger) {
+              logger.warn(`跳过完整性校验失败的缓存元数据：${name}`);
+            }
+          } finally {
+            if (cred) META_BYTE_BUDGET.release(cred);
           }
+        } else if (logger) {
+          logger.warn(`缓存元数据路径不在缓存目录内，已拒绝读取：${name}`);
         }
         if (!packument) throw new Error('缓存中的元数据已失效或完整性校验失败，请重新扫描');
         const local = await store.getAsync(name);
@@ -373,27 +442,32 @@ async function importFromCache({ store, cacheDir, names = [], all = false, overw
         const files = {}; const sizes = {}; const origins = {};
         const versionTotal = Object.keys(packument.versions || {}).length;
         let added = 0, got = 0, seen = 0, lastEmit = 0;
+        let canceledMid = false;
         for (const [v, manifest] of Object.entries(packument.versions)) {
+          // 取消响应：包内版本可能很多（几千个），每 32 个检查一次，别让用户等整个包做完
+          if ((seen & 31) === 0 && isCanceled && isCanceled()) { canceledMid = true; break; }
           // 版本号会参与 tarball 文件名拼接，非法版本号直接跳过（不写盘）
           if (!isSafeVersion(v)) { invalidVersions++; continue; }
           const dist = manifest.dist || {};
           const p = integrityToCachePath(dir, dist.integrity);
-          let tarBuf = null;
+          /* 先流式校验 integrity，再用流式拷贝写入镜像：
+           * 不再 fsp.readFile 整块读进内存 —— 原来每路并发都 hold 一个完整 tarball Buffer，
+           * 64 路 × 大 tarball 时会直接把内存打爆。 */
+          let tarballOk = false;
           if (p) {
-            try { tarBuf = await fsp.readFile(p); } catch { tarBuf = null; }
-            if (tarBuf && !verifyIntegrity(tarBuf, dist.integrity)) {
+            const checked = await verifyFileIntegrity(p, dist.integrity);
+            if (!checked.ok) {
               invalidTarballs++;
               if (logger) logger.warn(`跳过完整性校验失败的缓存 tarball：${name}@${v}`);
-              tarBuf = null;
-            }
+            } else tarballOk = true;
           }
-          const hasFile = !!tarBuf;
+          const hasFile = tarballOk;
           seen++;
           if (onlyWithTarball && !hasFile) continue;
           if (target.versions[v] && !overwrite && store.hasTarball(name, v)) continue;
           target.versions[v] = manifest;
           if (hasFile) {
-            const info2 = store.putTarball(name, v, tarBuf);
+            const info2 = await store.putTarballFromFileAsync(name, v, p);
             files[v] = info2.file; sizes[v] = info2.sizeBytes; origins[v] = 'npm-cache';
             got++;
           }
@@ -401,6 +475,7 @@ async function importFromCache({ store, cacheDir, names = [], all = false, overw
           const now = Date.now();
           if (now - lastEmit >= 120) { lastEmit = now; emit({ phase: 'version', name, versionDone: seen, versionTotal }); }
         }
+        if (canceledMid) result.canceled = true;
         if (added === 0) {
           // 跳过原因要明确：是本地已全有、缓存里没 tarball，还是 tarball 校验失败（疑似被篡改）
           let reason;
@@ -429,8 +504,15 @@ async function importFromCache({ store, cacheDir, names = [], all = false, overw
     return Object.assign(base, { invalidVersions, invalidTarballs }, outcome);
   });
 
-  for (const it of settled) {
-    if (!it || it.canceled) continue;
+  // mapLimit 对「整包任务抛异常」会给 {__error} 行：按输入下标兜底包名，不能静默丢结果
+  for (let i = 0; i < settled.length; i++) {
+    const it = settled[i];
+    if (!it) continue;
+    if (it.__error) {
+      result.failed.push({ name: String(wanted[i]), error: it.__error });
+      continue;
+    }
+    if (it.canceled) continue;
     result.invalidVersions += it.invalidVersions || 0;
     result.invalidTarballs += it.invalidTarballs || 0;
     if (it.status === 'imported') result.imported.push({ name: it.name, versions: it.versions, tarballs: it.tarballs, sizeBytes: it.sizeBytes });

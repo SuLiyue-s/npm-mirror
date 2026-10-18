@@ -265,6 +265,8 @@ function cleanupStaleBundleUploadDirs() {
     const now = Date.now();
     for (const name of fs.readdirSync(tmpDir)) {
       if (!name.startsWith('upload-')) continue;
+      // 还活着的上传会话（可能刚传完分片、正在合并里拼临时文件）不能按 mtime 删
+      if (bundleUploads.has(name.slice('upload-'.length))) continue;
       const dir = path.join(tmpDir, name);
       try {
         const st = fs.statSync(dir);
@@ -281,6 +283,8 @@ function cleanupBundleUploads() {
   const now = Date.now();
   for (const [id, up] of bundleUploads) {
     if (now - up.createdAt <= BUNDLE_UPLOAD_TTL_MS) continue;
+    // 正在传分片/合并分片的会话不能按时间清掉，否则写到一半目录被删
+    if (up.assembling || (up.writing && up.writing.size > 0)) continue;
     bundleUploads.delete(id);
     try { fs.rmSync(up.dir, { recursive: true, force: true }); } catch { /* 忽略 */ }
   }
@@ -289,9 +293,9 @@ function cleanupBundleUploads() {
   while (bundleUploads.size >= BUNDLE_UPLOAD_MAX_SESSIONS) {
     let victim = null;
     for (const [id, up] of bundleUploads) {
-      if (!up.assembling) { victim = id; break; }
+      if (!up.assembling && !(up.writing && up.writing.size > 0)) { victim = id; break; }
     }
-    // 全都在合并：宁可暂时超出上限，也不破坏正在进行的上传
+    // 全都在合并/上传：宁可暂时超出上限，也不破坏正在进行的上传
     if (!victim) break;
     const up = bundleUploads.get(victim);
     bundleUploads.delete(victim);
@@ -582,7 +586,12 @@ async function handleAdmin(ctx) {
     });
     const jobs = [];
     for (const plan of plans) {
-      if (plan.error) { out.failed.push({ name: plan.name, error: plan.error }); continue; }
+      // mapLimit 对单个包的异常会给 {__error} 行：先兜住，否则下面 plan.targets.length 直接 TypeError
+      if (!plan || plan.__error || plan.error) {
+        out.failed.push({ name: (plan && plan.name) || '未知包', error: (plan && (plan.error || plan.__error)) || '规划失败' });
+        continue;
+      }
+      if (!Array.isArray(plan.targets)) continue;
       if (!plan.targets.length) {
         out.skipped.push({
           name: plan.name,
@@ -1261,7 +1270,7 @@ async function handleAdmin(ctx) {
     if (!/\.(tgz|tar\.gz)$/i.test(name)) return fail(res, 400, '只支持 .tgz / .tar.gz 格式的离线包', 'EBADREQ');
     const size = Number(body.size);
     if (!Number.isSafeInteger(size) || size <= 0) return fail(res, 400, 'size 必须是正整数（字节）', 'EBADREQ');
-    const maxMB = Math.max(1, Number(cfg.storage.maxBundleUploadMB || 4096));
+    const maxMB = Math.max(1, Math.floor(Number(cfg.storage.maxBundleUploadMB)) || 4096);
     const maxBytes = maxMB * 1024 * 1024;
     const tooLargeHint = '；更大的离线包请把 .tgz 拷贝到 data/bundles 目录后刷新列表，'
       + '点表格里的「导入」按钮（或运行 一键导入离线包.cmd），这条路不受网页上传上限限制';
@@ -1273,13 +1282,14 @@ async function handleAdmin(ctx) {
     // 分片大小与并发路数都可由配置调整：并发太高反而抢带宽、分片太小则请求开销大
     const chunkMB = clamp(Number(cfg.storage.bundleUploadChunkMB) || 8, 1, 64);
     const chunkSize = Math.floor(chunkMB * 1024 * 1024);
+    // chunkCount 上限由 maxBundleUploadMB 与最小分片 1MB 共同约束（最多 65536 片），远小于安全整数
     const chunkCount = Math.max(1, Math.ceil(size / chunkSize));
     const id = randomToken(16);
     const dir = path.join(rootPath('data', 'tmp'), `upload-${id}`);
     fs.mkdirSync(dir, { recursive: true });
     bundleUploads.set(id, {
       id, name, size, overwrite: body.overwrite === true, dir, chunkSize, chunkCount,
-      parts: new Set(), bytes: 0, createdAt: Date.now(), assembling: false,
+      parts: new Set(), bytes: 0, createdAt: Date.now(), assembling: false, writing: new Set(),
     });
     if (log) log.info(`开始分片上传离线包 ${name}（${formatBytes(size)}，${chunkCount} 片 × ${formatBytes(chunkSize)}）`);
     return ok(res, {
@@ -1303,6 +1313,11 @@ async function handleAdmin(ctx) {
       if (fs.statSync(part).size === expected) return ok(res, { index, size: expected, retried: true });
     } catch { /* 该分片还没传过 */ }
     if (up.assembling) return fail(res, 409, '上传已完成，正在合并分片', 'EBUSY');
+    // 同一分片被并发重传时只能有一个写者，否则两个 readBodyToFile 会同时写同一个 part 文件
+    if (up.writing && up.writing.has(index)) {
+      return fail(res, 409, `分片 ${index + 1}/${up.chunkCount} 正在上传，请稍后重试`, 'EBUSY');
+    }
+    if (up.writing) up.writing.add(index);
     try {
       const { size } = await readBodyToFile(req, part, { maxBytes: expected, idleMs: 60000, totalMs: 600000 });
       if (size !== expected) {
@@ -1315,6 +1330,8 @@ async function handleAdmin(ctx) {
       try { fs.unlinkSync(part); } catch { /* 忽略 */ }
       if (log) log.warn(`离线包分片 ${index + 1}/${up.chunkCount} 上传失败：${e.message}（${e.code || 'EUNKNOWN'}）`);
       return fail(res, e.status || 400, e.message, e.code || 'EBADCHUNK');
+    } finally {
+      if (up.writing) up.writing.delete(index);
     }
   }
 
@@ -1376,6 +1393,8 @@ async function handleAdmin(ctx) {
     const id = String(q.get('uploadId') || body.uploadId || '');
     const up = bundleUploads.get(id);
     if (up) {
+      // 合并分片期间不能删目录，否则正在跑的导入任务会读到一半少文件
+      if (up.assembling) return fail(res, 409, '正在合并分片，无法取消，请等合并完成', 'EBUSY');
       dropBundleUpload(up);
       if (log) log.warn(`已取消离线包上传：${up.name}`);
     }

@@ -293,20 +293,67 @@ function clamp(n, min, max) { return Math.min(max, Math.max(min, n)); }
 
 function toPosix(p) { return String(p).replace(/\\/g, '/'); }
 
-/** 简单并发上限映射 */
+/** 简单并发上限映射。
+ *  注意：单个任务抛错不会中断整批，而是把该下标收成 {__error}；调用方合并结果时
+ *  必须显式跳过这种行（本轮审计发现多处 mapLimit 结果直接 for...of / .length 会崩）。 */
 async function mapLimit(items, limit, fn) {
-  const out = new Array(items.length);
+  const list = Array.isArray(items) ? items : [];
+  const out = new Array(list.length);
+  const n = Math.floor(Number(limit));
+  // limit 非法（NaN/Infinity/0/负数）时兜底成 1：`new Array(NaN)` 会抛 RangeError
+  const workerCount = Math.max(1, Math.min(Number.isFinite(n) && n > 0 ? n : 1, list.length || 1));
   let i = 0;
-  const workers = new Array(Math.max(1, Math.min(limit, items.length))).fill(0).map(async () => {
+  const workers = new Array(workerCount).fill(0).map(async () => {
     while (true) {
       const idx = i++;
-      if (idx >= items.length) return;
-      try { out[idx] = await fn(items[idx], idx); }
+      if (idx >= list.length) return;
+      try { out[idx] = await fn(list[idx], idx); }
       catch (e) { out[idx] = { __error: e && e.message ? e.message : String(e) }; }
     }
   });
   await Promise.all(workers);
   return out;
+}
+
+/**
+ * 「同时在内存里的 Buffer 总量」预算闸门。
+ *
+ * 并发导入 / 校验 tarball 时，如果只看任务条数（比如 64 路），每路都可能把一整个
+ * tarball 读进内存（最大允许 512MB），峰值内存能到几十 GB 直接 OOM。这里按字节数
+ * 限流：每路先申请「这个文件有多大」的额度，额度不够就排队等待，用完释放。
+ * 单个文件大于总预算时允许独占运行（避免死等）。
+ */
+function createByteBudget(limitBytes) {
+  const cap = Math.max(1, Number(limitBytes) || 256 * 1024 * 1024);
+  let used = 0;
+  const waiters = [];   // { need, resolve }：按剩余额度唤醒，而不是「等全部归零」才唤醒
+
+  function tryWake() {
+    if (!waiters.length) return;
+    for (let i = 0; i < waiters.length;) {
+      const w = waiters[i];
+      // 单个超大文件（need 已按 cap 截断）必须等内存完全空出才放行；普通文件按剩余额度判断
+      const ok = w.need >= cap ? used === 0 : used + w.need <= cap;
+      if (ok) { waiters.splice(i, 1); try { w.resolve(); } catch { /* 忽略 */ } } else { i++; }
+    }
+  }
+
+  return {
+    /** 申请 n 字节额度，返回实际占用的额度（单文件超过上限时按上限算） */
+    async acquire(n) {
+      const need = Math.max(1, Math.min(Math.floor(Number(n) || 1), cap));
+      // 额度不够就排队；被唤醒后重新判断（别的等待者可能先占用了刚释放的额度）
+      while (!(need >= cap ? used === 0 : used + need <= cap)) {
+        await new Promise((resolve) => waiters.push({ need, resolve }));
+      }
+      used += need;
+      return need;
+    },
+    release(need) {
+      used = Math.max(0, used - Math.max(0, Math.floor(Number(need) || 0)));
+      tryWake();
+    },
+  };
 }
 
 function httpDate(d = new Date()) { return d.toUTCString(); }
@@ -318,5 +365,5 @@ module.exports = {
   safePkgDir, dirToPkg, pkgBaseName, sleep, isLoopback,
   isSafePkgName, isSafeVersion,
   parsePkgSpec, parseVersion, compareVersions, satisfies, maxSatisfying,
-  escapeRegExp, clamp, toPosix, mapLimit, httpDate,
+  escapeRegExp, clamp, toPosix, mapLimit, createByteBudget, httpDate,
 };

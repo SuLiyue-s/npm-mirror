@@ -304,8 +304,10 @@ commands.start = async function () {
   if (flags['no-open']) cliOpts['no-open'] = true;
 
   const { createServer } = require('./src/server');
-  const app = await createServer({ cliOpts });
+  let app = null;
   try {
+    // createServer 现在会做异步启动准备（并发加载包索引等），初始化异常也要给出中文提示而不是未捕获 rejection
+    app = await createServer({ cliOpts });
     await app.start();
   } catch (e) {
     process.stderr.write(`${C.red}${e.message}${C.reset}\n`);

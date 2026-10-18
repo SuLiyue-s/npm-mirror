@@ -4,6 +4,7 @@
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const {
   ensureDir, readJson, writeJsonAtomic, writeFileAtomic,
   safePkgDir, pkgBaseName, integrityOf, sha1hex, nowIso, compareVersions,
@@ -241,10 +242,55 @@ class Store {
     return { file, sizeBytes: buffer.length, shasum: sha1hex(buffer), integrity: integrityOf(buffer), path: dest };
   }
 
-  /** 从磁盘文件登记为某个版本的 tarball（拷贝） */
+  /** 从磁盘文件登记为某个版本的 tarball（拷贝）。
+   *  注意：这是同步全量读，只适合命令行/单次调用；并发批量导入请用 putTarballFromFileAsync（流式拷贝，不整块进内存）。 */
   putTarballFromFile(name, version, srcFile) {
     const buf = fs.readFileSync(srcFile);
     return this.putTarball(name, version, buf);
+  }
+
+  /**
+   * 流式把磁盘文件拷贝成某个版本的 tarball：边读边写临时文件、同时算 shasum/integrity，
+   * 成功后原子改名。不会把整个 tarball 读进内存，适合多路并发导入（每个文件再大内存也只占一个 chunk）。
+   * 返回 { file, sizeBytes, shasum, integrity, path }（与 putTarball 一致）。
+   */
+  async putTarballFromFileAsync(name, version, srcFile) {
+    if (!isSafeVersion(version)) {
+      const err = new Error(`不合法的版本号：${String(name)}@${String(version)}`);
+      err.code = 'EBADVERSION';
+      throw err;
+    }
+    const file = this.tarballFileName(name, version);
+    const dir = this.tarballDir(name);
+    const dest = path.join(dir, file);
+    if (!isInside(dir, dest)) {
+      const err = new Error(`tarball 路径越界：${String(name)}@${String(version)}`);
+      err.code = 'EBADPATH';
+      throw err;
+    }
+    fs.mkdirSync(dir, { recursive: true });
+    const tmp = `${dest}.part-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+    const sha1 = crypto.createHash('sha1');
+    const sha512 = crypto.createHash('sha512');
+    let sizeBytes = 0;
+    try {
+      await new Promise((resolve, reject) => {
+        const rs = fs.createReadStream(srcFile);
+        const ws = fs.createWriteStream(tmp);
+        let settled = false;
+        const fail = (e) => { if (settled) return; settled = true; try { rs.destroy(); } catch { /* 忽略 */ } try { ws.destroy(); } catch { /* 忽略 */ } reject(e); };
+        rs.on('error', fail);
+        ws.on('error', fail);
+        ws.on('finish', () => { if (settled) return; settled = true; resolve(); });
+        rs.on('data', (chunk) => { sha1.update(chunk); sha512.update(chunk); sizeBytes += chunk.length; });
+        rs.pipe(ws);
+      });
+      await fsp.rename(tmp, dest);
+    } catch (e) {
+      try { await fsp.unlink(tmp); } catch { /* 忽略 */ }
+      throw e;
+    }
+    return { file, sizeBytes, shasum: sha1.digest('hex'), integrity: `sha512-${sha512.digest('base64')}`, path: dest };
   }
 
   tarballFileName(name, version) {

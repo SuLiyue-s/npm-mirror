@@ -6,11 +6,16 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const {
   ensureDir, readJson, rootPath, stamp, safePkgDir, pkgBaseName, sha1hex, integrityOf, nowIso, compareVersions,
-  isSafePkgName, isSafeVersion, mapLimit, clamp,
+  isSafePkgName, isSafeVersion, mapLimit, clamp, createByteBudget,
 } = require('./util');
 const tar = require('./tar');
 const deps = require('./deps');
 const pull = require('./pull');
+
+/* 导入时「同时在内存里的 tarball 字节数」总预算（256MB）。并行 lane 默认最多 64 路，
+ * 每路都会把整个 tarball 读进内存做 integrity 校验；不设预算时遇到大 tarball 峰值会离谱。
+ * 用 util.createByteBudget 按字节发额度：超预算的任务排队，单个超大文件等内存空出来后独占。 */
+const IMPORT_BYTE_BUDGET = createByteBudget(256 * 1024 * 1024);
 
 const FORMAT = 'npm-private-mirror-bundle';
 const FORMAT_VERSION = 1;
@@ -511,7 +516,12 @@ async function exportBundle({
   });
   checkCancel();   // 统计期间按过取消：一个包都不打包，直接结束
   for (const row of collected) {
+    // mapLimit 把个别包的异常收成 {__error}：这种行不能当正常包用（没有 list/planRow），跳过并记一条告警
     if (!row) continue;
+    if (row.__error || !Array.isArray(row.list) || !row.planRow) {
+      if (logger) logger.warn(`统计离线包内容时有 1 个包读取失败：${(row && row.__error) || '结果为空'}`);
+      continue;
+    }
     pkgEntryLists.push(row.list);
     pkgPlan.push(row.planRow);
     manifestPackages.push(row.manifestPkg);
@@ -778,7 +788,10 @@ async function importBundle({
       if (!incomingPackument || !incomingPackument.versions) return null;
       return { dir, pkgDir, incomingPackument, name: incomingPackument.name || dir.replace(/__/g, '/') };
     });
-    const pkgDirs = scanned.filter(Boolean);
+    const pkgDirs = scanned.filter((row) => row && !row.__error && row.pkgDir && row.incomingPackument);
+    if (pkgDirs.length < dirs.length && logger) {
+      logger.warn(`导入离线包：${dirs.length - pkgDirs.length} 个包目录缺少/损坏 packument.json，已跳过`);
+    }
     const totalPkgs = pkgDirs.length;
 
     /* 并行路数：配置多少就用多少，不再被「包数」min 掉（原来 workerCount=min(并发,包数)，
@@ -865,8 +878,11 @@ async function importBundle({
           if (packument.versions[v] && !overwrite) { st.ps++; st.versionDone++; continue; }
           const srcFile = path.join(st.item.pkgDir, 'tarballs', `${pkgBaseName(name)}-${v}.tgz`);
           const altName = incomingMeta.files && typeof incomingMeta.files[v] === 'string' ? incomingMeta.files[v] : '';
-          // files 映射来自包内 meta.json，可能被构造成 ../ 路径；只接受纯文件名
-          const altFile = altName && altName === path.basename(altName) ? path.join(st.item.pkgDir, 'tarballs', altName) : null;
+          // files 映射来自包内 meta.json（离线包内容不可全信）：只接受「纯文件名 + .tgz」，
+          // 显式拒绝 '.' / '..'（path.basename('..') 仍是 '..'，仅靠 basename 判断会被绕过）。
+          const altOk = altName && altName !== '.' && altName !== '..' && /\.(tgz|tar\.gz)$/i.test(altName)
+            && altName === path.basename(altName);
+          const altFile = altOk ? path.join(st.item.pkgDir, 'tarballs', altName) : null;
           const useFile = fs.existsSync(srcFile) ? srcFile : (altFile && fs.existsSync(altFile) ? altFile : null);
           if (!useFile) {
             // 默认只导入带 tarball 的版本，否则会写出「元数据有、下载 tarball 404」的幻影版本。
@@ -898,9 +914,15 @@ async function importBundle({
       const name = st.name;
       const v = task.version;
       const manifestV = task.manifestV;
+      let cred = 0;   // 本次版本占用的「内存字节额度」，finally 里释放
       try {
-        // 篡改校验 1：tarball 实际字节必须与 packument 的 dist.integrity（缺失则 shasum）一致
-        const buf = fs.readFileSync(task.useFile);
+        // 篡改校验 1：tarball 实际字节必须与 packument 的 dist.integrity（缺失则 shasum）一致。
+        // 读盘顺序：先用 stat 申请字节额度，再异步整体读入（原来 readFileSync 同步读，
+        // 64 路 lane 一起跑时既阻塞事件循环、又可能同时堆住几十个大 Buffer）。
+        let fileSize = 0;
+        try { fileSize = (await fsp.stat(task.useFile)).size; } catch { fileSize = 0; }
+        cred = await IMPORT_BYTE_BUDGET.acquire(fileSize || 1);
+        const buf = await fsp.readFile(task.useFile);
         const badBytes = verifyTarballBytes(buf, manifestV && manifestV.dist);
         if (badBytes) {
           st.pf++;
@@ -957,6 +979,8 @@ async function importBundle({
         st.lastError = e.message;
         result.failed.push({ name, version: v, error: `${name}@${v}：${e.message}` });
         if (logger) logger.warn(`导入 ${name}@${v} 失败：${e.message}`);
+      } finally {
+        if (cred) IMPORT_BYTE_BUDGET.release(cred);
       }
     }
 
