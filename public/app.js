@@ -4673,8 +4673,8 @@
     var lm = /(debug|info|warn|warning|error|fatal)/i.exec(s);
     var lv = lm ? lm[1].toLowerCase().replace('warning', 'warn') : '';
     var row = el('span', { class: 'log-line' + (lv ? ' lv-' + lv : '') });
-    /* 时间戳前缀着色 */
-    var tm = /^(\[?[\d]{4}-[\d]{2}-[\d]{2}[T ][\d:.]+Z?\]?|\[?[\d]{2}:[\d]{2}:[\d]{2}\]?)\s*/.exec(s);
+    /* 时间戳前缀着色（兼容旧的 UTC Z 格式与新版本机时区 +08:00 格式） */
+    var tm = /^(\[?\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\]?|\[?\d{2}:\d{2}:\d{2}\]?)\s*/.exec(s);
     if (tm) {
       row.appendChild(el('span', { class: 'ts', text: tm[1] + ' ' }));
       s = s.slice(tm[0].length);

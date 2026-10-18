@@ -263,6 +263,20 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
     check('GET /logs 返回日志', r.status === 200 && r.json && Array.isArray(r.json.data.lines), `status=${r.status}`);
   }
   {
+    // 日志行首时间戳必须是「电脑本机时区」并带偏移（历史 bug：用 UTC 的 Z，日期/时间比本机差 8 小时）。
+    // 只校验最新一行：日志文件里可能还留着旧版本写下的 UTC 格式历史行（不回改历史日志）。
+    const r = await api('/__admin/api/logs?lines=20');
+    const lines = (r.json && r.json.data && r.json.data.lines) || [];
+    const off = -new Date().getTimezoneOffset();
+    const expectOff = (off >= 0 ? '+' : '-') + util.pad2(Math.floor(Math.abs(off) / 60)) + ':' + util.pad2(Math.abs(off) % 60);
+    const re = /^\[(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2}):(\d{2})\.(\d{3})([+-]\d{2}:\d{2})\] \[(DEBUG|INFO|WARN|ERROR)\] /;
+    const last = lines.length ? lines[lines.length - 1] : '';
+    const m = re.exec(last);
+    const ok = !!m && m[6] === expectOff && m[1] === util.dateOnly();
+    check('最新日志行的时间戳使用本机时区（带偏移，日期也是本机日期）', ok,
+      `期望偏移=${expectOff}，最新行=${last.slice(0, 70)}`);
+  }
+  {
     const r = await api('/__admin/api/search?text=ms');
     check('GET /search 返回结果数组', r.status === 200 && r.json && Array.isArray(r.json.data.items), `status=${r.status}`);
   }

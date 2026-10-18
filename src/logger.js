@@ -2,7 +2,7 @@
 /* 日志：按天写文件 + 内存环形缓冲（供界面查看）+ 控制台着色输出 */
 const fs = require('node:fs');
 const path = require('node:path');
-const { ensureDir, rootPath, dateOnly, nowIso } = require('./util');
+const { ensureDir, rootPath, dateOnly, nowLocalIso } = require('./util');
 
 const LEVELS = { debug: 10, info: 20, warn: 30, error: 40, silent: 99 };
 const COLORS = { debug: '\x1b[90m', info: '\x1b[36m', warn: '\x1b[33m', error: '\x1b[31m', reset: '\x1b[0m' };
@@ -45,7 +45,7 @@ class Logger {
   write(level, msg, extra) {
     if (LEVELS[level] === undefined) level = 'info';
     if (LEVELS[level] < LEVELS[this.level]) return;
-    const time = nowIso();
+    const time = nowLocalIso();
     // 转义换行，防止 msg 伪造出额外的日志行
     const safeMsg = String(msg).replace(/\r\n|\r|\n/g, '⏎');
     let line = `[${time}] [${level.toUpperCase()}] ${safeMsg}`;

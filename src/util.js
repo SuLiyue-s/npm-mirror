@@ -71,6 +71,16 @@ function dateOnly(d = new Date()) {
   return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
 }
 
+/** 日志时间戳：本机时区的 ISO 时间，带 +08:00 这类偏移（日期/时区与电脑本机一致；UTC 的 Z 会和本机差几小时） */
+function nowLocalIso(d = new Date()) {
+  const off = -d.getTimezoneOffset();
+  const sign = off >= 0 ? '+' : '-';
+  const abs = Math.abs(off);
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`
+    + `T${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}.${String(d.getMilliseconds()).padStart(3, '0')}`
+    + `${sign}${pad2(Math.floor(abs / 60))}:${pad2(abs % 60)}`;
+}
+
 function randomToken(bytes = 24) { return crypto.randomBytes(bytes).toString('hex'); }
 
 function sha1hex(buf) { return crypto.createHash('sha1').update(buf).digest('hex'); }
@@ -360,7 +370,7 @@ function httpDate(d = new Date()) { return d.toUTCString(); }
 
 module.exports = {
   ROOT, rootPath, ensureDir, readJson, writeFileAtomic, writeJsonAtomic,
-  formatBytes, nowIso, stamp, dateOnly, pad2, randomToken,
+  formatBytes, nowIso, nowLocalIso, stamp, dateOnly, pad2, randomToken,
   sha1hex, sha512base64, integrityOf, integrityToCachePath,
   safePkgDir, dirToPkg, pkgBaseName, sleep, isLoopback,
   isSafePkgName, isSafeVersion,
