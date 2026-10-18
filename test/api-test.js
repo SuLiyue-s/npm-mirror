@@ -122,7 +122,7 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
   // 清理上一轮遗留的「自检专用」数据（mirror-selftest-* 只可能由本脚本创建，删掉是安全的）。
   // 注意：不在开头删 ms / lodash 等真实公共包——它们是用户镜像里的真实数据，
   // 旧版本这里会误删用户缓存的 tarball。需要临时造前置条件的用例改为「先快照、收尾恢复」。
-  for (const n of [PRIVATE, PRIVATE2, 'mirror-selftest-upload', 'mirror-selftest-json', 'mirror-selftest-autodeps-fail', 'mirror-selftest-autodeps-ok']) {
+  for (const n of [PRIVATE, PRIVATE2, 'mirror-selftest-upload', 'mirror-selftest-json', 'mirror-selftest-autodeps-fail', 'mirror-selftest-autodeps-ok', 'mirror-selftest-chunkpkg-a', 'mirror-selftest-chunkpkg-b']) {
     try { await api(`/__admin/api/packages/${encodeURIComponent(n)}`, { method: 'DELETE' }); } catch { /* 忽略 */ }
   }
   // ms 是本脚本要用到的真实公共包：记录测试前是否已存在，收尾时只在「原本不存在」时才删掉自己加的。
@@ -1271,6 +1271,9 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
     rawUploadBundle = ((ex.json || {}).data || {}).file;
     const src = path.join(__dirname, '..', 'data', 'bundles', rawUploadBundle);
     const buf = fs.readFileSync(src);
+    // data\tmp 里可能本来就有其他临时文件，先快照，只判断本次上传有没有新增残留
+    const tmpDir = path.join(__dirname, '..', 'data', 'tmp');
+    const tmpBefore = new Set(fs.existsSync(tmpDir) ? fs.readdirSync(tmpDir) : []);
     const up = await rawReq(`/__admin/api/bundles/import?overwrite=1&token=${encodeURIComponent(TOKEN)}`, {
       method: 'POST', body: buf, timeoutMs: 180000,
       headers: {
@@ -1284,9 +1287,8 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
       up.status === 200 && uj && uj.ok && uj.data && uj.data.tarballs >= 1,
       `status=${up.status} bytes=${buf.length} ${String(up.text).slice(0, 120)}`);
     // 临时文件必须清干净（导入失败时也不能在 data\tmp 里留半截）
-    const tmpDir = path.join(__dirname, '..', 'data', 'tmp');
-    const left = fs.existsSync(tmpDir) ? fs.readdirSync(tmpDir) : [];
-    check('原始体上传后临时文件已清理（data\\tmp 无残留）', left.length === 0, `left=${left.join(',')}`);
+    const left = (fs.existsSync(tmpDir) ? fs.readdirSync(tmpDir) : []).filter((n) => !tmpBefore.has(n));
+    check('原始体上传后临时文件已清理（data\\tmp 无新增残留）', left.length === 0, `left=${left.join(',')}`);
     const delRaw = await api(`/__admin/api/bundles?file=${encodeURIComponent(rawUploadBundle)}`, { method: 'DELETE' });
     check('原始体上传用例收尾：删除测试 bundle', delRaw.status === 200, `status=${delRaw.status}`);
   }
@@ -1617,6 +1619,8 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
         }
 
         // C) 原始体上传 + ?progress=1：边收边落盘，收完立刻回 taskId（前端上传进度条 → 任务进度）
+        const tmpDir3 = path.join(__dirname, '..', 'data', 'tmp');
+        const tmpBefore3 = new Set(fs.existsSync(tmpDir3) ? fs.readdirSync(tmpDir3) : []);
         const upBuf = fs.readFileSync(path.join(bundleMod3.bundleDir(), madeBundles3[0]));
         const up = await api('/__admin/api/bundles/import?progress=1&overwrite=1', {
           method: 'POST', raw: upBuf, timeoutMs: 120000,
@@ -1647,10 +1651,9 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
             `cancel=${c.status} status=${ct && ct.status} msg=${ct && ct.message} result=${JSON.stringify(r2)}`);
         }
 
-        // E) 任务结束后临时目录不留残渣（原始体上传的临时文件必须删掉）
-        const tmpDir3 = path.join(__dirname, '..', 'data', 'tmp');
-        const residue3 = fs.existsSync(tmpDir3) ? fs.readdirSync(tmpDir3) : [];
-        check('进度任务（含原始体上传）结束后 data\\tmp 无残留', residue3.length === 0, `residue=${residue3.join(',')}`);
+        // E) 任务结束后临时目录不留残渣（原始体上传的临时文件必须删掉；只判断本次新增）
+        const residue3 = (fs.existsSync(tmpDir3) ? fs.readdirSync(tmpDir3) : []).filter((n) => !tmpBefore3.has(n));
+        check('进度任务（含原始体上传）结束后 data\\tmp 无新增残留', residue3.length === 0, `residue=${residue3.join(',')}`);
       }
     }
     for (const f of madeBundles3) await api(`/__admin/api/bundles?file=${encodeURIComponent(f)}`, { method: 'DELETE' });
@@ -1816,12 +1819,13 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
           `采样=${snaps.length} 有并行包快照=${ims5.length} 示例=${JSON.stringify((ims5[0] || {}).inFlight || [])}`);
         check('导入任务结束后 inFlight 清空', !!fin && Array.isArray(fin.inFlight) && fin.inFlight.length === 0,
           `status=${fin && fin.status} inFlight=${JSON.stringify(fin && fin.inFlight)}`);
-        /* 导入是「一个 worker 独占一个包」，每个在跑的包就是一路：行数 == 路数，
-         * 这里顺带确认它不会超过配置的导入并发数。 */
+        /* 并行导入是「版本级动态分配」：一行仍是一个包，行内 lanes 表示当前分给它的并行路数
+         * （剩余包数少于并发时，空闲路会一起导入同一个包的剩余版本），行数不超过配置并发数。 */
         const imMax5 = ims5.reduce((a, d) => Math.max(a, d.inFlight.length), 0);
-        check('导入 inFlight 一行一个包（一包一路），行数不超过配置并发数',
-          imMax5 >= 1 && imMax5 <= imConc5,
-          `maxRows=${imMax5} 配置并发=${imConc5}`);
+        check('导入 inFlight 一行一个包（行内带 lanes 并行路数），行数不超过配置并发数',
+          imMax5 >= 1 && imMax5 <= imConc5
+            && ims5.every((d) => d.inFlight.every((x) => Number.isFinite(Number(x.lanes)) && Number(x.lanes) >= 0)),
+          `maxRows=${imMax5} 配置并发=${imConc5} 示例=${JSON.stringify((ims5[0] || {}).inFlight || [])}`);
         check('导入任务的并发数来自配置（bundleImportConcurrency）', fin && Number(fin.concurrency) === imConc5,
           `concurrency=${fin && fin.concurrency} 期望=${imConc5}`);
       }
@@ -2344,6 +2348,281 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
         },
       },
     });
+  }
+
+  // ---------------------------------------------------------------- 分片并发上传 + 多并发解包 + 并行路数
+  section('六之六、分片并发上传 / 多并发解包 / 每个包的并行路数（新）');
+  {
+    const crypto = require('node:crypto');
+    const bundleModNew = require('../src/bundle');
+    const cfgModNew = require('../src/config');
+    const quietLogNew = { info() {}, warn() {}, error() {}, debug() {} };
+    const { Store: StoreNew } = require('../src/store');
+    const workNew = path.join(os.tmpdir(), `mirror-selftest-new-${util.stamp()}`);
+    util.ensureDir(workNew);
+    const PKG_A = 'mirror-selftest-chunkpkg-a';
+    const PKG_B = 'mirror-selftest-chunkpkg-b';
+    const VERS = ['1.0.0', '1.1.0', '1.2.0', '1.3.0'];
+
+    // 1) 造「多包多版本」合成离线包：每个版本带 600KB 不可压缩填充，保证分片上传能真切成多片
+    const entriesNew = [];
+    let tarballBytesNew = 0;
+    for (const name of [PKG_A, PKG_B]) {
+      const versionsNew = {};
+      const filesNew = {};
+      const sizesNew = {};
+      for (const ver of VERS) {
+        const rootNew = path.join(workNew, `inner-${name}-${ver}`);
+        util.ensureDir(path.join(rootNew, 'package'));
+        fs.writeFileSync(path.join(rootNew, 'package', 'package.json'), JSON.stringify({ name, version: ver }));
+        fs.writeFileSync(path.join(rootNew, 'package', 'index.js'), `module.exports = ${JSON.stringify(name + '@' + ver)};\n`);
+        fs.writeFileSync(path.join(rootNew, 'package', 'pad.bin'), crypto.randomBytes(600 * 1024));
+        const tgzNew = path.join(workNew, `${name}-${ver}.tgz`);
+        await tar.packTarGz(tgzNew, [
+          { name: 'package/package.json', source: path.join(rootNew, 'package', 'package.json') },
+          { name: 'package/index.js', source: path.join(rootNew, 'package', 'index.js') },
+          { name: 'package/pad.bin', source: path.join(rootNew, 'package', 'pad.bin') },
+        ], {});
+        const bufNew = fs.readFileSync(tgzNew);
+        tarballBytesNew += bufNew.length;
+        const fileNew = `${name}-${ver}.tgz`;
+        versionsNew[ver] = {
+          name, version: ver,
+          dist: {
+            tarball: `${name}/-/${fileNew}`,
+            integrity: `sha512-${crypto.createHash('sha512').update(bufNew).digest('base64')}`,
+            shasum: crypto.createHash('sha1').update(bufNew).digest('hex'),
+          },
+        };
+        filesNew[ver] = fileNew;
+        sizesNew[ver] = bufNew.length;
+        entriesNew.push({ name: `storage/${name}/tarballs/${fileNew}`, source: tgzNew });
+      }
+      entriesNew.unshift({ name: `storage/${name}/packument.json`, data: Buffer.from(JSON.stringify({ name, 'dist-tags': { latest: VERS[VERS.length - 1] }, versions: versionsNew })) });
+      entriesNew.unshift({ name: `storage/${name}/meta.json`, data: Buffer.from(JSON.stringify({ files: filesNew, sizes: sizesNew, deprecated: {} })) });
+    }
+    const bundlePathNew = path.join(workNew, `new-bundle-${util.stamp()}.tgz`);
+    await tar.packTarGz(bundlePathNew, [
+      {
+        name: 'manifest.json',
+        data: Buffer.from(JSON.stringify({
+          format: bundleModNew.FORMAT, formatVersion: bundleModNew.FORMAT_VERSION,
+          createdAt: new Date().toISOString(), tool: 'api-test', scope: 'selected',
+          stats: { packages: 2, versions: VERS.length * 2, tarballs: VERS.length * 2, tarballBytes: tarballBytesNew, depsAdded: 0, depsMissing: [] },
+        })),
+      },
+      ...entriesNew,
+    ], {});
+    const bundleBufNew = fs.readFileSync(bundlePathNew);
+    check('合成离线包可用于分片上传（体积 > 3MB，能切成多片）', bundleBufNew.length > 3 * 1024 * 1024, `bytes=${bundleBufNew.length}`);
+
+    // 2) 新配置项：默认值 / 合法范围 / 非法值
+    const cfgNow = await api('/__admin/api/config');
+    const stBeforeNew = (((cfgNow.json || {}).data || {}).config || {}).storage || {};
+    const dfltNew = cfgModNew.defaults().storage;
+    const inRangeNew = (v, lo, hi) => Number.isFinite(Number(v)) && Number(v) >= lo && Number(v) <= hi;
+    check('GET /config 暴露分片上传/解包并发新配置（1~64 / 1~16，代码默认 8/4/8）',
+      inRangeNew(stBeforeNew.bundleUploadChunkMB, 1, 64) && inRangeNew(stBeforeNew.bundleUploadConcurrency, 1, 16)
+        && inRangeNew(stBeforeNew.bundleImportExtractConcurrency, 1, 16)
+        && Number(dfltNew.bundleUploadChunkMB) === 8 && Number(dfltNew.bundleUploadConcurrency) === 4
+        && Number(dfltNew.bundleImportExtractConcurrency) === 8,
+      JSON.stringify(stBeforeNew));
+    const badNew1 = await api('/__admin/api/config', { method: 'PUT', body: { storage: { bundleUploadChunkMB: 0 } } });
+    const badNew2 = await api('/__admin/api/config', { method: 'PUT', body: { storage: { bundleUploadChunkMB: 65 } } });
+    check('PUT /config storage.bundleUploadChunkMB=0 或 65 → 400', badNew1.status === 400 && badNew2.status === 400,
+      `0→${badNew1.status} 65→${badNew2.status}`);
+    const badNew3 = await api('/__admin/api/config', { method: 'PUT', body: { storage: { bundleUploadConcurrency: 17 } } });
+    const badNew4 = await api('/__admin/api/config', { method: 'PUT', body: { storage: { bundleImportExtractConcurrency: 0 } } });
+    check('PUT /config storage.bundleUploadConcurrency=17 / bundleImportExtractConcurrency=0 → 400',
+      badNew3.status === 400 && badNew4.status === 400, `17→${badNew3.status} 0→${badNew4.status}`);
+
+    try {
+      const putNew = await api('/__admin/api/config', {
+        method: 'PUT',
+        body: { storage: { bundleUploadChunkMB: 1, bundleUploadConcurrency: 3, bundleImportExtractConcurrency: 4 } },
+      });
+      const stPutNew = ((((putNew.json || {}).data || {}).config || {}).storage) || {};
+      check('PUT /config 把分片大小改成 1MB、分片并发 3、解包并发 4',
+        putNew.status === 200 && Number(stPutNew.bundleUploadChunkMB) === 1
+          && Number(stPutNew.bundleUploadConcurrency) === 3 && Number(stPutNew.bundleImportExtractConcurrency) === 4,
+        `status=${putNew.status} storage=${JSON.stringify(stPutNew)}`);
+
+      // 3) 分片上传接口：错误分支
+      const e1 = await api('/__admin/api/bundles/upload/init', { method: 'POST', body: { file: 'not-a-bundle.zip', size: 1024 } });
+      check('分片上传 init：非 .tgz 文件名 → 400', e1.status === 400 && /tgz/i.test(e1.text),
+        `status=${e1.status} ${e1.text.slice(0, 120)}`);
+      const maxMBNew = Number(stBeforeNew.maxBundleUploadMB) || 4096;
+      const e2 = await api('/__admin/api/bundles/upload/init', { method: 'POST', body: { file: 'too-big.tgz', size: (maxMBNew + 16) * 1024 * 1024 } });
+      let e2j = null; try { e2j = JSON.parse(e2.text); } catch { /* 非 JSON */ }
+      check('分片上传 init：声明体积超 maxBundleUploadMB → 413 ETOOLARGE 且提示 data\\bundles 本地通路',
+        e2.status === 413 && !!e2j && e2j.code === 'ETOOLARGE' && /data[\\/]bundles/.test(String(e2j.error || '')),
+        `status=${e2.status} ${e2.text.slice(0, 140)}`);
+
+      const initNew = await api('/__admin/api/bundles/upload/init', {
+        method: 'POST', body: { file: `selftest-chunk-${util.stamp()}.tgz`, size: bundleBufNew.length, overwrite: true },
+      });
+      const initData = (initNew.json && initNew.json.data) || {};
+      const chunkSizeNew = Number(initData.chunkSize) || 0;
+      const chunkCountNew = Number(initData.chunkCount) || 0;
+      check('分片上传 init 返回 uploadId / 分片大小 / 分片数 / 并发数',
+        initNew.status === 200 && !!initData.uploadId && chunkSizeNew === 1024 * 1024
+          && chunkCountNew === Math.ceil(bundleBufNew.length / chunkSizeNew) && Number(initData.concurrency) === 3,
+        `status=${initNew.status} data=${JSON.stringify(initData)}`);
+      check('分片上传 init：大包被切成多片（>=3 片）', chunkCountNew >= 3,
+        `chunkCount=${chunkCountNew} size=${bundleBufNew.length}`);
+      const uploadIdNew = initData.uploadId;
+      const putChunkNew = (i, buf) => rawReq(
+        `/__admin/api/bundles/upload/chunk?uploadId=${encodeURIComponent(uploadIdNew)}&index=${i}`,
+        {
+          method: 'POST', body: buf, timeoutMs: 120000,
+          headers: { 'Content-Type': 'application/octet-stream', 'X-Mirror-Token': TOKEN, 'Content-Length': String(buf.length) },
+        },
+      );
+
+      const wrongNew = await putChunkNew(0, Buffer.from('short'));
+      let wrongJ = null; try { wrongJ = JSON.parse(wrongNew.text); } catch { /* 非 JSON */ }
+      check('分片上传 chunk：分片大小不符 → 400 EBADCHUNK（不留半截分片）',
+        wrongNew.status === 400 && !!wrongJ && wrongJ.code === 'EBADCHUNK', `status=${wrongNew.status} ${wrongNew.text.slice(0, 140)}`);
+
+      const missNew = await api('/__admin/api/bundles/upload/complete', { method: 'POST', body: { uploadId: uploadIdNew } });
+      let missJ = null; try { missJ = JSON.parse(missNew.text); } catch { /* 非 JSON */ }
+      check('分片上传 complete：缺片 → 400 EINCOMPLETE 且指明第几片',
+        missNew.status === 400 && !!missJ && missJ.code === 'EINCOMPLETE' && /第 \d+/.test(String(missJ.error || '')),
+        `status=${missNew.status} ${missNew.text.slice(0, 140)}`);
+
+      // 3 路并发上传全部分片（模拟网页多路并行上传）
+      const tUpNew = Date.now();
+      const statusesNew = new Array(chunkCountNew).fill(0);
+      let nextChunkNew = 0;
+      const laneNew = async () => {
+        for (;;) {
+          const i = nextChunkNew++;
+          if (i >= chunkCountNew) return;
+          const start = i * chunkSizeNew;
+          const part = bundleBufNew.subarray(start, Math.min(bundleBufNew.length, start + chunkSizeNew));
+          let r = null;
+          // 每片最多重试 2 次，覆盖网络抖动/服务端临时失败（与前端行为一致）
+          for (let attempt = 0; attempt < 3; attempt++) {
+            r = await putChunkNew(i, part);
+            if (r.status === 200) break;
+          }
+          statusesNew[i] = r.status;
+        }
+      };
+      await Promise.all([laneNew(), laneNew(), laneNew()]);
+      const uploadMsNew = Math.max(1, Date.now() - tUpNew);
+      check('分片上传：3 路并发把所有分片都传成功', statusesNew.every((st) => st === 200), `statuses=${statusesNew.join(',')}`);
+      check('分片上传：多路并发确有吞吐（> 1MB/s，回环应远高于此）',
+        (bundleBufNew.length / 1024 / 1024) / (uploadMsNew / 1000) > 1,
+        `${chunkCountNew} 片 / 3 路 / ${uploadMsNew}ms / ${(bundleBufNew.length / 1024 / 1024).toFixed(2)}MB`);
+
+      const againNew = await putChunkNew(0, bundleBufNew.subarray(0, chunkSizeNew));
+      let againJ = null; try { againJ = JSON.parse(againNew.text); } catch { /* 非 JSON */ }
+      check('分片上传：重复上传同一分片幂等（retried=true）',
+        againNew.status === 200 && !!againJ && againJ.ok && againJ.data && againJ.data.retried === true,
+        `status=${againNew.status} ${againNew.text.slice(0, 140)}`);
+
+      const compNew = await api('/__admin/api/bundles/upload/complete', {
+        method: 'POST', body: { uploadId: uploadIdNew, overwrite: true }, timeoutMs: 180000,
+      });
+      const compData = (compNew.json && compNew.json.data) || {};
+      check('分片上传 complete：合并分片后导入成功（2 包 / 8 版本 / 8 tarball）',
+        compNew.status === 200 && Number(compData.packages) === 2 && Number(compData.versions) === VERS.length * 2
+          && Number(compData.tarballs) === VERS.length * 2 && (compData.failed || []).length === 0,
+        `status=${compNew.status} data=${JSON.stringify(compData).slice(0, 300)}`);
+      const gotA = await api('/' + PKG_A);
+      check('分片上传导入后的包能从镜像读到（含全部版本）',
+        gotA.status === 200 && !!(gotA.json && gotA.json.versions && gotA.json.versions[VERS[0]]), `status=${gotA.status}`);
+
+      // 4) abort：init 后取消，会话立即失效
+      const initAbort = await api('/__admin/api/bundles/upload/init', { method: 'POST', body: { file: 'abort-test.tgz', size: 12 * 1024 * 1024 } });
+      const abortId = ((initAbort.json || {}).data || {}).uploadId;
+      const ab = await api('/__admin/api/bundles/upload/abort', { method: 'POST', body: { uploadId: abortId } });
+      const abComp = await api('/__admin/api/bundles/upload/complete', { method: 'POST', body: { uploadId: abortId } });
+      check('分片上传 abort：会话取消后 complete 报 404 ENOUP', ab.status === 200 && abComp.status === 404 && /ENOUP/.test(abComp.text),
+        `abort=${ab.status} complete=${abComp.status} ${abComp.text.slice(0, 120)}`);
+
+      // 上传结束后 data\tmp 不留分片目录/合并临时文件
+      const tmpDirNew = path.join(__dirname, '..', 'data', 'tmp');
+      const leftNew = fs.existsSync(tmpDirNew) ? fs.readdirSync(tmpDirNew).filter((n) => /selftest-chunk|^upload-/.test(n)) : [];
+      check('分片上传结束后 data\\tmp 无残留分片/合并文件', leftNew.length === 0, `left=${leftNew.join(',')}`);
+
+      // 5) 直接调模块：版本级并行路数（需求 2）+ 多并发解包（需求 1b）
+      const storeNew = new StoreNew({ dir: path.join(workNew, 'store'), logger: quietLogNew });
+      await storeNew.init();
+      const evNew = [];
+      const rNew = await bundleModNew.importBundle({
+        store: storeNew, file: bundlePathNew, overwrite: true, concurrency: 6, extractConcurrency: 4,
+        logger: quietLogNew, onProgress: (e) => evNew.push(e),
+      });
+      await storeNew.close();
+      check('importBundle 直接调用：结果计数正确（2 包 / 8 版本 / 8 tarball）',
+        Number(rNew.packages) === 2 && Number(rNew.versions) === VERS.length * 2
+          && Number(rNew.tarballs) === VERS.length * 2 && (rNew.failed || []).length === 0,
+        `packages=${rNew.packages} versions=${rNew.versions} tarballs=${rNew.tarballs}`);
+      let maxLanesNew = 0;
+      for (const e of evNew) {
+        for (const it of (e.inFlight || [])) maxLanesNew = Math.max(maxLanesNew, Number(it.lanes) || 0);
+      }
+      check('版本级并行：剩余包数少于并发时，同一个包也被多路并行导入（inFlight lanes > 1）',
+        maxLanesNew >= 2, `maxLanes=${maxLanesNew} 并发=6 包数=2`);
+      check('inFlight 每项都带 lanes 字段（进度弹窗右栏「N 路」的数据源）',
+        evNew.length > 0 && evNew.every((e) => (e.inFlight || []).every((it) => Number.isFinite(Number(it.lanes)) && Number(it.lanes) >= 0)),
+        JSON.stringify((evNew.find((e) => (e.inFlight || []).length > 0) || {}).inFlight || []));
+
+      // 6) 解包并发：同一批文件分别用并发 1 / 8 解，结果必须完全一致
+      const filesBench = Array.from({ length: 600 }, (_, i) => ({ name: `d${i % 20}/f${i}.txt`, data: Buffer.alloc(4096, i % 251) }));
+      const benchTar = path.join(workNew, 'bench.tar.gz');
+      await tar.packTarGz(benchTar, filesBench, {});
+      const t1New = Date.now();
+      const ex1 = await tar.extractTarGz(benchTar, path.join(workNew, 'ex1'), { concurrency: 1 });
+      const ms1 = Date.now() - t1New;
+      const t8New = Date.now();
+      const ex8 = await tar.extractTarGz(benchTar, path.join(workNew, 'ex8'), { concurrency: 8 });
+      const ms8 = Date.now() - t8New;
+      const f1New = fs.readFileSync(path.join(workNew, 'ex1', 'd3', 'f3.txt'));
+      const f8New = fs.readFileSync(path.join(workNew, 'ex8', 'd3', 'f3.txt'));
+      check('多并发解包：并发 1 与并发 8 都解出 600 个文件且总字节一致',
+        ex1.entries === 600 && ex8.entries === 600 && ex8.bytes === ex1.bytes,
+        `并发1=${ms1}ms 并发8=${ms8}ms entries=${ex1.entries}/${ex8.entries}`);
+      check('多并发解包：并发写出的文件内容正确（与并发 1 逐字节一致）',
+        f1New.length === 4096 && f8New.length === 4096 && f1New.equals(f8New), `ms1=${ms1} ms8=${ms8}`);
+    } finally {
+      // 恢复进入本小节前的配置，并删掉导入的测试包
+      await api('/__admin/api/config', {
+        method: 'PUT',
+        body: {
+          storage: {
+            bundleUploadChunkMB: Number(stBeforeNew.bundleUploadChunkMB) || 8,
+            bundleUploadConcurrency: Number(stBeforeNew.bundleUploadConcurrency) || 4,
+            bundleImportExtractConcurrency: Number(stBeforeNew.bundleImportExtractConcurrency) || 8,
+          },
+        },
+      });
+      for (const n of [PKG_A, PKG_B]) await api(`/__admin/api/packages/${encodeURIComponent(n)}`, { method: 'DELETE' });
+      try { fs.rmSync(workNew, { recursive: true, force: true }); } catch { /* 忽略 */ }
+    }
+  }
+
+  // ---------------------------------------------------------------- 过期上传目录清理
+  section('六之六之二、进程重启后遗留的分片上传目录会被清理（审计修复）');
+  {
+    const tmpRoot = path.join(__dirname, '..', 'data', 'tmp');
+    const staleDir = path.join(tmpRoot, 'upload-stale-' + Date.now());
+    let made = false;
+    try {
+      fs.mkdirSync(staleDir, { recursive: true });
+      made = true;
+      // 模拟「上一个进程留下的 5 小时前目录」（TTL 2 小时，超过 2×TTL 就会被清理）
+      const old = new Date(Date.now() - 5 * 60 * 60 * 1000);
+      fs.utimesSync(staleDir, old, old);
+    } catch { /* 忽略 */ }
+    const initRes = await api('/__admin/api/bundles/upload/init', { method: 'POST', body: { file: 'stale-check.tgz', size: 1024 } });
+    const initStale = initRes.json && initRes.json.ok ? initRes.json.data : null;
+    check('分片上传：init 时清理进程重启遗留的过期上传目录', !!made && !!initStale && !fs.existsSync(staleDir), { made: made, init: initStale, exists: fs.existsSync(staleDir) });
+    check('分片上传：清理后仍能正常创建新上传会话', !!initStale && !!initStale.uploadId && initStale.chunkCount === 1, initStale || initRes.text);
+    if (initStale && initStale.uploadId) await api('/__admin/api/bundles/upload/abort', { method: 'POST', body: { uploadId: initStale.uploadId } });
+    if (made && fs.existsSync(staleDir)) { try { fs.rmSync(staleDir, { recursive: true, force: true }); } catch { /* 忽略 */ } }
   }
 
   // ---------------------------------------------------------------- 版本删除

@@ -575,6 +575,7 @@ function makeReader(stream) {
  *   filter(relPath, {size, mtime}) -> boolean   是否解出
  *   onEntry(relPath, writtenBytes)              每个文件解出后的回调
  *   maxTotalBytes / maxEntries / maxEntryBytes / maxPaxBytes  覆盖默认上限
+ *   concurrency                                 并发写盘的文件数（默认 1，建议 4~16；tar 流仍是单流顺序读）
  */
 async function extractTarGz(file, destDir, opts = {}) {
   const {
@@ -583,6 +584,7 @@ async function extractTarGz(file, destDir, opts = {}) {
     maxEntries = DEFAULT_MAX_ENTRIES,
     maxEntryBytes = DEFAULT_MAX_ENTRY_BYTES,
     maxPaxBytes = DEFAULT_MAX_PAX_BYTES,
+    concurrency = 1,
   } = opts;
   if (!(maxTotalBytes > 0) || !(maxEntries > 0) || !(maxEntryBytes > 0) || !(maxPaxBytes > 0)) {
     throw badTar('解包上限配置非法', 'EBADSIZE');
@@ -596,8 +598,47 @@ async function extractTarGz(file, destDir, opts = {}) {
   let consumed = 0;
   let headers = 0;
   let zeroRun = 0;          // 连续全零块计数：两个即归档结束
-  let currentOut = null;    // 正在写入的文件流
-  let currentTarget = null; // 正在写入的文件路径
+
+  /* 多并发写盘：tar.gz 的 gzip 解压是单流顺序读，但「open/write/close 每个条目」可以流水化。
+   * 单文件写流收尾（close）期间不阻塞主循环继续读下一条目，最多同时保留 concurrency 个未收尾写流，
+   * 小文件很多的离线包（几万个 tarball）在这里能省掉大量串行等待。 */
+  const writeConc = Math.max(1, Math.min(32, Math.floor(Number(concurrency)) || 1));
+  const writeSlots = new Set();  // { out, target, done: Promise<{err}> }
+  let pendingWriteErr = null;
+  const dirCache = new Set([destDir]);
+  /** 目录创建缓存：同目录只 mkdir 一次（几万个条目时省掉大量重复的 mkdir/stat 系统调用） */
+  function ensureDirCached(dir) {
+    if (dirCache.has(dir)) return;
+    ensureDir(dir);
+    dirCache.add(dir);
+  }
+  /** 登记一个写流：resolve 于 close/error，不阻塞主循环；错误先记录，由主循环/收尾统一抛出 */
+  function trackWrite(out, target) {
+    const slot = { out, target, done: null };
+    slot.done = new Promise((resolve) => {
+      let settled = false;
+      const finish = (err) => {
+        if (settled) return;
+        settled = true;
+        writeSlots.delete(slot);
+        if (err && !pendingWriteErr) pendingWriteErr = err;
+        resolve({ err: err || null });
+      };
+      out.once('close', () => finish(null));
+      out.once('error', (e) => finish(e));
+    });
+    writeSlots.add(slot);
+    return slot;
+  }
+  /** 等任意一个写流收尾；有写错误则立即抛出（中断解包） */
+  async function reapOneWrite() {
+    if (!writeSlots.size) return;
+    await Promise.race(Array.from(writeSlots, (s) => s.done));
+    if (pendingWriteErr) throw pendingWriteErr;
+  }
+  async function drainWrites() {
+    while (writeSlots.size) await reapOneWrite();
+  }
 
   function addConsumed(n) {
     consumed += n;
@@ -658,14 +699,6 @@ async function extractTarGz(file, destDir, opts = {}) {
     for (const rel of dirs) {
       try { fs.rmdirSync(path.join(destDir, rel)); } catch { /* 忽略 */ }
     }
-  }
-  async function abortStream(out) {
-    if (!out || out.destroyed || out.closed) return;
-    await new Promise((res) => {
-      out.once('close', res);
-      out.once('error', () => { /* 由 close 收尾 */ });
-      out.destroy();
-    });
   }
 
   try {
@@ -730,7 +763,7 @@ async function extractTarGz(file, destDir, opts = {}) {
       const target = path.join(destDir, rel);
 
       if (type === '5') {
-        ensureDir(target);
+        ensureDirCached(target);
         result.dirs.push(rel);
         result.entries++;
         // 目录条目只建目录，不写数据；但 size>0 时同样必须消费掉，保持流对齐
@@ -748,16 +781,15 @@ async function extractTarGz(file, destDir, opts = {}) {
         continue;
       }
 
-      ensureDir(path.dirname(target));
-      currentTarget = target;
-      const out = fs.createWriteStream(target);
-      currentOut = out;
-      let writeErr = null;
-      out.on('error', (e) => { if (!writeErr) writeErr = e; });
+      ensureDirCached(path.dirname(target));
+      // 控制同时「未收尾」的写流数量：达到并发上限就先等一个收尾
+      if (writeSlots.size >= writeConc) await reapOneWrite();
+      const out = fs.createWriteStream(target, { highWaterMark: 256 * 1024 });
+      trackWrite(out, target);
       let written = 0;
       let remaining = size;
       while (remaining > 0) {
-        if (writeErr) throw writeErr;
+        if (pendingWriteErr) throw pendingWriteErr;
         if (avail() === 0) {
           if (!(await need(Math.min(remaining, 1 << 20)))) throw truncated('文件内容');
         }
@@ -766,8 +798,9 @@ async function extractTarGz(file, destDir, opts = {}) {
         remaining -= cnt;
         written += cnt;
         addConsumed(cnt);
+        // 单块写入：write 返回 false 时等 drain（背压），不阻塞其它写流
         await new Promise((res, rej) => {
-          if (writeErr) return rej(writeErr);
+          if (pendingWriteErr) return rej(pendingWriteErr);
           let done = false;
           const onDrain = () => { if (done) return; done = true; cleanup(); res(); };
           const onErr = (e) => { if (done) return; done = true; cleanup(); rej(e); };
@@ -778,17 +811,8 @@ async function extractTarGz(file, destDir, opts = {}) {
       }
       // 关键校验：声明大小必须与实际写入字节数一致，避免「静默成功但内容被截断」
       if (written !== size) throw badTar(`条目 ${rel} 实际写入 ${written} 字节，声明为 ${size} 字节`, 'ETRUNCATED');
-      if (writeErr) throw writeErr;
-      await new Promise((res, rej) => {
-        const onClose = () => { cleanup(); res(); };
-        const onErr = (e) => { cleanup(); rej(e); };
-        const cleanup = () => { out.removeListener('close', onClose); out.removeListener('error', onErr); };
-        out.once('close', onClose);
-        out.once('error', onErr);
-        out.end();
-      });
-      currentOut = null;
-      currentTarget = null;
+      out.end();
+      // 先记账：写流稍后收尾（由 writeSlots 统一等待），失败清理时也能按 result.files 删除半截文件
       result.files.push(rel);
       result.entries++;
       result.bytes += written;
@@ -802,13 +826,14 @@ async function extractTarGz(file, destDir, opts = {}) {
       }
     }
     if (avail() > 0) throw truncated('归档尾部不完整');
+    // 等所有写流真正落盘关闭，保证调用方拿到的目录内容完整
+    await drainWrites();
     return result;
   } catch (e) {
-    if (currentOut) { await abortStream(currentOut); currentOut = null; }
-    if (currentTarget) {
-      try { fs.unlinkSync(currentTarget); } catch { /* 忽略 */ }
-      currentTarget = null;
-    }
+    // 中断所有还没收尾的写流，等句柄关闭后再清理已写出的文件（Windows 上句柄未关无法删除）
+    const slots = Array.from(writeSlots);
+    for (const slot of slots) { try { slot.out.destroy(); } catch { /* 忽略 */ } }
+    await Promise.all(slots.map((s) => s.done.catch(() => { /* 忽略 */ })));
     cleanupExtracted();
     throw e;
   } finally {

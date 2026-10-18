@@ -457,10 +457,11 @@ async function get(p, { json = false } = {}) {
     check('逐包明细行区分 已打包 / 已导入 / 失败 / 跳过（左栏数据源）',
       /function bundlePkgRow\s*\(/.test(js.text) && /✓ 已打包/.test(js.text) && /✓ 新增 /.test(js.text)
         && /· 跳过：/.test(js.text) && /✕ /.test(js.text));
-    check('网页上传用 XHR 的 upload.onprogress 显示上传字节进度（fetch 拿不到上传进度）',
-      /function uploadBundleXhr\s*\(/.test(js.text) && /new XMLHttpRequest\(\)/.test(js.text)
+    check('网页上传是分片 + 多路并发，XHR 的 upload.onprogress 显示合计上传字节进度（fetch 拿不到上传进度）',
+      /function uploadBundleChunked\s*\(/.test(js.text) && /new XMLHttpRequest\(\)/.test(js.text)
         && /xhr\.upload\.onprogress/.test(js.text) && /kind: 'upload'/.test(js.text)
-        && /\/bundles\/import\?progress=1/.test(js.text));
+        && /\/bundles\/upload\/init/.test(js.text) && /\/bundles\/upload\/chunk\?uploadId=/.test(js.text)
+        && /\/bundles\/upload\/complete\?progress=1/.test(js.text) && /\/bundles\/upload\/abort/.test(js.text));
     check('上传完成后切到任务进度：轮询 /tasks/<id>（500ms，连续失败重试 2 次再放弃）',
       /api\('\/tasks\/' \+ taskId\)/.test(js.text) && /setInterval\(poll, 500\)/.test(js.text)
         && /pollFails <= 2/.test(js.text));
@@ -547,10 +548,10 @@ async function get(p, { json = false } = {}) {
         && /\.p\$\{idx\}\.tar\.gz/.test(tarSrc));
     check('导出逐包明细改用 onEntryDone 的条目下标映射（并行下顺序不固定）',
       /onEntryDone/.test(tarSrc) && /entryPkg/.test(bundleSrc) && /pkgSeen/.test(bundleSrc));
-    check('导入按配置并发处理不同包（worker 池 + 每包只锁自己，包内版本仍顺序）',
-      /bundleImportConcurrency/.test(apiSrc) && /async function importOneDir/.test(bundleSrc)
-        && /const worker = async \(\)/.test(bundleSrc) && /withLock\(name/.test(bundleSrc)
-        && /concurrency: Math\.max\(1, Number\(cfg\.storage\.bundleImportConcurrency\)/.test(apiSrc));
+    check('导入按配置并发：版本级 lane 调度（每包只锁自己，空闲路会抢同一个包里还没导的版本）',
+      /bundleImportConcurrency\) \|\| 4/.test(apiSrc) && /const laneCount = Math\.max\(/.test(bundleSrc)
+        && /function stealTask\s*\(/.test(bundleSrc) && /async function runVersionTask\s*\(/.test(bundleSrc)
+        && /function laneLoop\s*\(/.test(bundleSrc) && /withLock\(name/.test(bundleSrc));
     check('并行导入的包进度按「已完成包数」推进（不再用包的起始序号）',
       /done: pkgs\.length/.test(apiSrc) && !/done: Number\(ev\.index\) \|\| pkgs\.length/.test(apiSrc));
     check('任务快照带并发度（tasks.create 收 concurrency，前端显示「并行 N 路」）',
@@ -564,15 +565,60 @@ async function get(p, { json = false } = {}) {
         && /async function readRootPackageJson/.test(tarSrc)
         && /wanted instanceof RegExp/.test(tarSrc));
     check('导入校验与 .tgz 上传都改用根级 package.json，找不到时按兼容方式处理（不再整包丢弃）',
-      /tar\.readRootPackageJson\(useFile\)/.test(bundleSrc) && /tar\.readRootPackageJson\(file\)/.test(bundleSrc)
+      /tar\.readRootPackageJson\(task\.useFile\)/.test(bundleSrc) && /tar\.readRootPackageJson\(file\)/.test(bundleSrc)
         && /按兼容方式导入/.test(bundleSrc));
     check('跳过原因写清楚（bundle 内缺少 tarball / 版本已存在），界面不再只显示一句含糊的「已存在或不可导入」',
-      /bundle 内缺少 \$\{metadataOnlySkipped\} 个版本的 tarball/.test(bundleSrc)
+      /bundle 内缺少 \$\{st\.metadataOnlySkipped\} 个版本的 tarball/.test(bundleSrc)
         && /'版本已存在'/.test(bundleSrc));
 
     // ④ 命令行也走并发配置（保持与服务端一致的默认行为）
     check('命令行 export/import 读取配置里的并发度',
       /bundleExportConcurrency\) \|\| 4/.test(cliSrc) && /bundleImportConcurrency\) \|\| 4/.test(cliSrc));
+  }
+
+  console.log('\x1b[1m九之二、导入备份：分片并发上传 / 多并发解包 / 每个包的并行路数\x1b[0m');
+  {
+    const bundleSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'bundle.js'), 'utf8');
+    const tarSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'tar.js'), 'utf8');
+    const apiSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'api.js'), 'utf8');
+    const configSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'config.js'), 'utf8');
+
+    // ① 分片并发上传：后端四个接口 + 配置项 + 前端并发池
+    check('后端有分片上传四接口（init / chunk / complete / abort），分片按序落盘、缺片/大小不符会拒绝',
+      /rel === '\/bundles\/upload\/init'/.test(apiSrc) && /rel === '\/bundles\/upload\/chunk'/.test(apiSrc)
+        && /rel === '\/bundles\/upload\/complete'/.test(apiSrc) && /rel === '\/bundles\/upload\/abort'/.test(apiSrc)
+        && /function assembleBundleUpload\s*\(/.test(apiSrc) && /function bundleUploadFirstMissing\s*\(/.test(apiSrc)
+        && /EINCOMPLETE/.test(apiSrc) && /EBADCHUNK/.test(apiSrc));
+    check('分片上传配置项（每片默认 8MB / 1-64，并发默认 4 / 1-16）与 PUT 校验',
+      /bundleUploadChunkMB:\s*8/.test(configSrc) && /bundleUploadConcurrency:\s*4/.test(configSrc)
+        && /clampInt\(st\.bundleUploadChunkMB, 1, 64, 8\)/.test(configSrc)
+        && /clampInt\(st\.bundleUploadConcurrency, 1, 16, 4\)/.test(configSrc)
+        && /m < 1 \|\| m > 64/.test(apiSrc)
+        && js.text.includes("k: 'storage.bundleUploadChunkMB'") && js.text.includes("k: 'storage.bundleUploadConcurrency'"));
+    check('前端分片上传按 init 返回的并发数开固定 lane 池，全部传完才 complete；失败重试并 abort 清理',
+      /for \(var k = 0; k < Math\.min\(concurrency, chunkCount\); k\+\+\) lanes\.push\(lane\(\)\)/.test(js.text)
+        && /function sendChunk/.test(js.text) && /\/bundles\/upload\/complete\?progress=1/.test(js.text)
+        && /\/bundles\/upload\/abort/.test(js.text) && /分片 ' \+/.test(js.text));
+
+    // ② 多并发解包：extractTarGz 的写入器池
+    check('解包支持多并发：写入器池（最多 N 个未收尾的写流同时写）+ 目录缓存 + 结束统一等待收尾',
+      /concurrency = 1,/.test(tarSrc) && /const writeConc = Math\.max\(1, Math\.min\(32/.test(tarSrc)
+        && /async function drainWrites\s*\(/.test(tarSrc) && /const dirCache = new Set/.test(tarSrc)
+        && /if \(writeSlots\.size >= writeConc\) await reapOneWrite\(\)/.test(tarSrc));
+    check('导入把配置里的解包并发传给 extractTarGz（默认 8，1-16）',
+      /extractConcurrency = 4,/.test(bundleSrc) && /concurrency: Math\.max\(1, Math\.min\(32/.test(bundleSrc)
+        && /extractConcurrency: Math\.max\(1, Number\(cfg\.storage\.bundleImportExtractConcurrency\) \|\| 8\)/.test(apiSrc)
+        && /bundleImportExtractConcurrency:\s*8/.test(configSrc)
+        && /clampInt\(st\.bundleImportExtractConcurrency, 1, 16, 8\)/.test(configSrc));
+
+    // ③ 每个包的并行路数：调度器 lane 计数 → inFlight.lanes → 右栏「· N 路」
+    check('每个在跑的包带上「当前分到几路」（调度器 lanes 计数随 inFlight 上报）',
+      /lanes: Number\(st\.lanes\) \|\| 0/.test(bundleSrc) && /st\.lanes\+\+/.test(bundleSrc) && /st\.lanes--/.test(bundleSrc));
+    check('进度弹窗右栏每行显示「· N 路」（导出条目不带 lanes；导入 feed 透传任务快照 lanes）',
+      js.text.includes("var nameTxt = p.name + (lanes > 0 ? ' · ' + lanes + ' 路' : '');")
+        && /lanes: Number\(p\.lanes\) \|\| 0/.test(js.text) && /d\.phase === 'assemble'/.test(js.text));
+    check('上传完成后先「合并分片」再解包导入：任务 phase=assemble，界面统计行有合并分片阶段',
+      /phase: 'assemble'/.test(apiSrc) && /正在合并上传分片/.test(js.text) && /正在把分片合并成完整备份文件/.test(js.text));
   }
 
   console.log('\x1b[1m十、导入备份结束后的「失败 / 跳过详情」（整理在弹窗最下方，可一键复制）\x1b[0m');

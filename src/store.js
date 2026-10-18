@@ -16,6 +16,9 @@ function isInside(base, child) {
   return c === b || c.startsWith(b.endsWith(path.sep) ? b : b + path.sep);
 }
 
+/** tarball 文件名 → 版本号 的内存反查缓存：键是 meta 对象（save() 换新对象后旧缓存自动释放） */
+const tarballRevCache = new WeakMap();
+
 class Store {
   constructor({ dir, logger }) {
     this.dir = dir;
@@ -83,6 +86,16 @@ class Store {
   }
 
   has(name) { return isSafePkgName(name) && fs.existsSync(this.packumentPath(name)); }
+
+  /**
+   * 只读内存索引里的 meta（不读盘）。
+   * 给「早期 304」「tarball 文件名反查版本」这类只需要少量元信息的快速路径用，
+   * 避免为了一个字节判断去 readFile + JSON.parse 几十 MB 的 packument.json。
+   */
+  metaOf(name) {
+    if (!isSafePkgName(name)) return null;
+    return this.index.get(name) || null;
+  }
 
   get(name) {
     if (!isSafePkgName(name)) return null;
@@ -198,6 +211,27 @@ class Store {
     // 只接受「纯文件名」：meta 里的记录也可能来自不可信元数据，必须再校验一次
     if (known && path.basename(known) === known && !known.includes('\\') && !known.includes('/')) return known;
     return `${pkgBaseName(name)}-${version}.tgz`;
+  }
+
+  /**
+   * tarball 文件名 → 版本号 的反查表（内存缓存）。
+   * registry 的 tarball 路由需要从 URL 里的文件名反推版本，以前遍历 packument.versions，
+   * 等于每下载一个 tarball 就要读一次完整 packument.json（大包 10MB+）。
+   * 这里用内存 meta.files（save() 时维护）建表，键用 meta 对象本身：save() 会生成新 meta，旧表随 GC 释放。
+   */
+  tarballVersionMap(name) {
+    const meta = this.metaOf(name);
+    if (!meta) return null;
+    const cached = tarballRevCache.get(meta);
+    if (cached) return cached;
+    const map = new Map();
+    for (const [v, f] of Object.entries(meta.files || {})) {
+      if (typeof f !== 'string' || !f) continue;
+      if (path.basename(f) !== f || f.includes('\\') || f.includes('/')) continue;
+      if (!map.has(f)) map.set(f, v);
+    }
+    tarballRevCache.set(meta, map);
+    return map;
   }
 
   tarballPath(name, version) {

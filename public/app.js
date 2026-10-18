@@ -2021,20 +2021,25 @@
           it = map[p.name] = { row: row, fill: fill, tv: tv, nameEl: nameEl };
           box.appendChild(row);
         }
+        /* 每行显示「被分配了几路并行」：导入时同一个包可能被多个 worker（lane）一起处理，
+         * 右侧进度详情要能直接看出这个包分到了几路（lane 数随任务快照的 inFlight 一起下来）。 */
+        var lanes = Math.max(0, Number(p.lanes) || 0);
+        var nameTxt = p.name + (lanes > 0 ? ' · ' + lanes + ' 路' : '');
         if (p.spin) {
           /* 并行打包：一个正在压缩的文件一行，显示文件大小 + 「压缩中…」（完成后由左栏逐包列表接管） */
-          it.nameEl.textContent = p.name;
+          it.nameEl.textContent = nameTxt;
           it.fill.style.width = '0';
           it.tv.textContent = (p.size ? fmtBytes(p.size) + ' · ' : '') + '压缩中…';
           return;
         }
         if (p.text) {
           /* 任意文本行：导出收尾「拼接分片写入最终文件」等没有「条目数」概念的阶段用它显示字节进度 */
-          it.nameEl.textContent = p.name;
+          it.nameEl.textContent = nameTxt;
           it.fill.style.width = Math.max(0, Math.min(100, Number(p.pct) || 0)) + '%';
           it.tv.textContent = p.text;
           return;
         }
+        it.nameEl.textContent = nameTxt;
         var pct = Math.round(Number(p.done) / Number(p.target) * 100);
         it.fill.style.width = Math.max(0, Math.min(100, pct)) + '%';
         it.tv.textContent = p.done + ' / ' + p.target + ' ' + unit + '（' + pct + '%）' + (showBytes ? ' · ' + fmtBytes(p.bytes || 0) : '');
@@ -3379,37 +3384,141 @@
    * 这里轮询 /tasks/<id> 画「整体进度条 + 统计行 + 逐包明细 + 当前包进度条」。
    * ============================================================ */
 
-  /* 网页上传离线包（用 XHR 而不是 fetch：只有 XHR 的 upload.onprogress 能给出上传字节进度） */
-  function uploadBundleXhr(file, overwrite, onProgress) {
-    return new Promise(function (resolve, reject) {
-      var xhr = new XMLHttpRequest();
-      xhr.open('POST', API + '/bundles/import?progress=1' + (overwrite ? '&overwrite=1' : ''), true);
-      xhr.setRequestHeader('X-Filename', encodeURIComponent(file.name));
-      xhr.setRequestHeader('Content-Type', 'application/octet-stream');
-      var tk = getToken();
-      if (tk) xhr.setRequestHeader('X-Mirror-Token', tk);
-      xhr.upload.onprogress = function (ev) {
-        if (!ev.lengthComputable) return;
-        onProgress({ kind: 'upload', name: file.name, loaded: ev.loaded, total: ev.total });
-      };
-      xhr.onload = function () {
-        var j = null;
-        try { j = JSON.parse(xhr.responseText || 'null'); } catch (e) { j = null; }
-        if (xhr.status >= 200 && xhr.status < 300 && j && j.ok) { resolve(j.data); return; }
-        var err = new Error((j && j.error) || ('HTTP ' + xhr.status));
-        err.status = xhr.status;
-        err.code = j && j.code;
-        reject(err);
-      };
-      xhr.onerror = function () {
-        reject(new Error('上传中断（网络错误）：请确认镜像源服务还在运行；大离线包也可以放进 data\\bundles 目录后用「导入」按钮'));
-      };
-      xhr.ontimeout = function () {
-        reject(new Error('上传超时（30 分钟内没传完）：建议把 .tgz 放进 data\\bundles 目录后用「导入」按钮'));
-      };
-      xhr.timeout = 1800000;
-      xhr.send(file);
-    });
+  /* 网页上传离线包：分片 + 多路并发。
+   * 单个 XHR 传几个 GB 只能占一条连接、串行推进，浏览器一断就前功尽弃。
+   * 这里先 POST /bundles/upload/init 拿分片参数，再把文件切成 N 片用固定并发池同时上传
+   * （每片一条 XHR，能拿到该片的字节进度），收齐后 POST /bundles/upload/complete，
+   * 服务端在后台任务里合并分片并开始导入，立即返回 taskId。
+   * onProgress({kind:'upload',...}) 的 loaded/total 是所有分片合计的字节，弹窗按整体百分比画条。
+   * ctl 用于「取消上传」：设置 ctl.abort 后会中止未完成的分片并让服务端清理已落盘分片。 */
+  function uploadBundleChunked(file, overwrite, onProgress, ctl) {
+    ctl = ctl || {};
+    var tk = getToken();
+    var activeXhrs = [];
+    var aborted = false;
+
+    function reportProgress(chunkIndex, chunkCount, loadedByIndex, totalSize) {
+      if (!onProgress) return;
+      var loaded = 0;
+      for (var i = 0; i < loadedByIndex.length; i++) loaded += Number(loadedByIndex[i]) || 0;
+      onProgress({
+        kind: 'upload', name: file.name, loaded: loaded, total: totalSize,
+        chunk: chunkIndex, chunks: chunkCount,
+      });
+    }
+
+    function postJson(path, body) {
+      return api(path, { method: 'POST', body: body, timeout: 120000 });
+    }
+
+    /* 上传单个分片：XHR 才有 upload.onprogress，能精确回报这一片传了多少字节 */
+    function sendChunkOnce(uploadId, index, blob, loadedByIndex, totalSize) {
+      return new Promise(function (resolve, reject) {
+        var xhr = new XMLHttpRequest();
+        activeXhrs.push(xhr);
+        xhr.open('POST', API + '/bundles/upload/chunk?uploadId=' + encodeURIComponent(uploadId) + '&index=' + index, true);
+        xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+        if (tk) xhr.setRequestHeader('X-Mirror-Token', tk);
+        xhr.upload.onprogress = function (ev) {
+          if (!ev.lengthComputable) return;
+          loadedByIndex[index] = ev.loaded;
+          reportProgress(index + 1, loadedByIndex.length, loadedByIndex, totalSize);
+        };
+        xhr.onload = function () {
+          var at = activeXhrs.indexOf(xhr);
+          if (at >= 0) activeXhrs.splice(at, 1);
+          var j = null;
+          try { j = JSON.parse(xhr.responseText || 'null'); } catch (e) { j = null; }
+          if (xhr.status >= 200 && xhr.status < 300 && j && j.ok) {
+            loadedByIndex[index] = blob.size;
+            resolve(j.data);
+            return;
+          }
+          var err = new Error((j && j.error) || ('HTTP ' + xhr.status));
+          err.status = xhr.status;
+          err.code = j && j.code;
+          reject(err);
+        };
+        xhr.onerror = function () {
+          var at = activeXhrs.indexOf(xhr);
+          if (at >= 0) activeXhrs.splice(at, 1);
+          var err = new Error('第 ' + (index + 1) + '/' + loadedByIndex.length + ' 片上传中断（网络错误）：请确认镜像源服务还在运行');
+          err.network = true;
+          reject(err);
+        };
+        xhr.ontimeout = function () {
+          var at = activeXhrs.indexOf(xhr);
+          if (at >= 0) activeXhrs.splice(at, 1);
+          var err = new Error('第 ' + (index + 1) + '/' + loadedByIndex.length + ' 片上传超时');
+          err.network = true;
+          reject(err);
+        };
+        /* 用户点「取消」时 XHR 走 onabort（既不是 onload 也不是 onerror），必须显式拒绝，
+         * 否则这个分片的 Promise 永远不落地，上传 lane 会一直挂着。 */
+        xhr.onabort = function () {
+          var at = activeXhrs.indexOf(xhr);
+          if (at >= 0) activeXhrs.splice(at, 1);
+          var err = new Error('已取消上传');
+          err.canceled = true;
+          reject(err);
+        };
+        xhr.timeout = 600000;
+        xhr.send(blob);
+      });
+    }
+
+    /* 分片失败自动重试（网络抖动、服务端临时错误）：每片最多重试 2 次；
+     * 用户主动取消（xhr.onabort -> err.canceled）要立刻抛出，不能当成可重试的失败。 */
+    function sendChunk(uploadId, index, blob, loadedByIndex, totalSize, attempt) {
+      if (aborted || ctl.aborted) return Promise.reject(new Error('已取消上传'));
+      return sendChunkOnce(uploadId, index, blob, loadedByIndex, totalSize).catch(function (e) {
+        if (e.canceled || aborted || ctl.aborted) throw e;
+        var retriable = e.network || !e.status || e.status === 408 || e.status === 429 || e.status >= 500;
+        if (attempt >= 2 || !retriable) throw e;
+        return new Promise(function (r) { setTimeout(r, 500 * (attempt + 1)); }).then(function () {
+          return sendChunk(uploadId, index, blob, loadedByIndex, totalSize, attempt + 1);
+        });
+      });
+    }
+
+    ctl.abort = function () {
+      aborted = true;
+      ctl.aborted = true;
+      activeXhrs.forEach(function (x) { try { x.abort(); } catch (e) { /* 忽略 */ } });
+      activeXhrs = [];
+      if (ctl.uploadId) postJson('/bundles/upload/abort', { uploadId: ctl.uploadId }).catch(function () { /* 忽略 */ });
+    };
+
+    return postJson('/bundles/upload/init', { file: file.name, size: file.size, overwrite: !!overwrite })
+      .then(function (init) {
+        if (aborted) throw new Error('已取消上传');
+        ctl.uploadId = init.uploadId;
+        var chunkSize = Number(init.chunkSize) || file.size;
+        var chunkCount = Math.max(1, Number(init.chunkCount) || 1);
+        var concurrency = Math.max(1, Math.min(16, Number(init.concurrency) || 4));
+        var loadedByIndex = new Array(chunkCount);
+        var next = 0;
+        reportProgress(0, chunkCount, loadedByIndex, file.size);
+        function lane() {
+          if (next >= chunkCount) return Promise.resolve();
+          var i = next++;
+          var start = i * chunkSize;
+          var blob = file.slice(start, Math.min(file.size, start + chunkSize));
+          return sendChunk(init.uploadId, i, blob, loadedByIndex, file.size, 0).then(lane);
+        }
+        var lanes = [];
+        for (var k = 0; k < Math.min(concurrency, chunkCount); k++) lanes.push(lane());
+        return Promise.all(lanes).then(function () {
+          if (aborted) throw new Error('已取消上传');
+          reportProgress(chunkCount, chunkCount, loadedByIndex, file.size);
+          // complete 立即返回 taskId：服务端在后台任务里先合并分片，再解包导入
+          return postJson('/bundles/upload/complete?progress=1', { uploadId: init.uploadId, overwrite: !!overwrite });
+        });
+      })
+      .catch(function (e) {
+        if (ctl.uploadId) postJson('/bundles/upload/abort', { uploadId: ctl.uploadId }).catch(function () { /* 忽略 */ });
+        throw e;
+      });
   }
 
   /* 离线包里一个包的明细行：打包（packed）/导入（imported）/失败/跳过 共用 */
@@ -3469,7 +3578,12 @@
       actions: [
         {
           label: opts.cancelLabel || '取消', kind: 'btn-ghost', onClick: function (c) {
-            if (finished || !taskId) return c.close();
+            if (finished) return c.close();
+            if (!taskId) {
+              // 任务还没创建（正在分片上传/初始化）：先让调用方中止上传，再关掉弹窗
+              if (opts.abortStart) { try { opts.abortStart(); } catch (e) { /* 忽略 */ } }
+              return c.close();
+            }
             requestTaskCancel(c.btn, taskId, {
               waitText: '正在取消…', okText: '已请求停止：当前包处理完就停',
               isFinished: function () { return finished; }
@@ -3485,7 +3599,7 @@
     function paint(d) {
       if (!d) return;
       var pct = Number(d.percent) || 0;
-      if (opts.extractBar && d.phase === 'extract') {
+      if (opts.extractBar && (d.phase === 'extract' || d.phase === 'assemble')) {
         pct = d.bytesTotal ? Math.min(100, Math.round(((d.bytes || 0) / d.bytesTotal) * 100)) : 0;
       }
       /* 整体条不要把「压缩完但还在写盘」显示成 100%：打包只映射到 0~95%，拼接分片写最终文件补到 100% */
@@ -3518,7 +3632,8 @@
             feed.push({ name: p.name + ' · ' + p.file, status: 'running', target: 0, spin: true, size: Number(p.size) || 0 });
             return;
           }
-          feed.push({ name: p.name, status: 'running', target: Number(p.total) || 0, done: Number(p.done) || 0 });
+          /* lanes：这个包当前分到了几路并行导入（右栏每条进度详情要显示被分配的并行路数） */
+          feed.push({ name: p.name, status: 'running', target: Number(p.total) || 0, done: Number(p.done) || 0, lanes: Number(p.lanes) || 0 });
         });
         lastCur = null;
       } else if (d.current && !isWritePhase) {
@@ -3592,8 +3707,9 @@
       if (!info || info.kind !== 'upload') return;
       var pct = info.total ? Math.round((info.loaded / info.total) * 100) : 0;
       setBar(pct);
-      note.textContent = '正在上传 ' + info.name + '：' + fmtBytes(info.loaded) + ' / ' + fmtBytes(info.total) + '（' + pct + '%）';
-      stat.textContent = '上传完成后自动开始导入，期间请勿关闭页面';
+      var chunkTxt = info.chunks ? ' · 分片 ' + (info.chunk || 0) + '/' + info.chunks : '';
+      note.textContent = '正在分片并发上传 ' + info.name + '：' + fmtBytes(info.loaded) + ' / ' + fmtBytes(info.total) + '（' + pct + '%）' + chunkTxt;
+      stat.textContent = '多路并发上传分片，全部传完后自动合并、解包并导入，期间请勿关闭页面';
     }).then(function (d) {
       taskId = d && d.taskId;
       if (!taskId) throw new Error('服务端没有返回任务编号');
@@ -3788,9 +3904,14 @@
   function runBundleImport(opts) {
     var isUpload = !!opts.file;
     var label = isUpload ? opts.file.name : opts.name;
+    var uploadCtl = null;
     setText('imp-status', (isUpload ? '正在上传并导入 ' : '正在导入 ') + label + ' …');
     function statText(d, pct) {
       var secs = Math.round((d.elapsedMs || 0) / 1000);
+      if (d.phase === 'assemble') {
+        var ap = d.bytesTotal ? Math.min(100, Math.round(((d.bytes || 0) / d.bytesTotal) * 100)) : 0;
+        return '正在合并上传分片：' + fmtBytes(d.bytes || 0) + (d.bytesTotal ? ' / ' + fmtBytes(d.bytesTotal) : '') + '（' + ap + '%） · 合并完自动解包导入 · 已用时 ' + fmtDur(secs);
+      }
       if (d.phase === 'extract') {
         var ep = d.bytesTotal ? Math.min(100, Math.round(((d.bytes || 0) / d.bytesTotal) * 100)) : 0;
         return '正在解包备份文件：' + fmtBytes(d.bytes || 0) + (d.bytesTotal ? ' / ' + fmtBytes(d.bytesTotal) : '') + '（' + ep + '%） · 已用时 ' + fmtDur(secs);
@@ -3809,7 +3930,7 @@
     var m = bundleProgressModal({
       title: isUpload ? '上传并导入离线包' : '导入离线包', sub: 'IMPORT BUNDLE',
       intro: isUpload
-        ? '正在上传 ' + opts.file.name + '（' + fmtBytes(opts.file.size) + '）…'
+        ? '正在分片并发上传 ' + opts.file.name + '（' + fmtBytes(opts.file.size) + '）…'
         : '正在读取 ' + opts.name + ' …',
       busyText: '导入中…', sideHint: 'IMPORTING…', waitText: '正在解包…',
       paneHead: '正在导入 · 并行包', paneUnit: '个版本', paneCountUnit: '个包',
@@ -3818,6 +3939,7 @@
       statText: statText,
       rowEl: bundlePkgRow,
       phaseNote: function (d) {
+        if (d.phase === 'assemble') return '上传完成，正在把分片合并成完整备份文件…（可以取消）';
         if (d.phase === 'extract') return '正在解包备份文件…（可以取消，已解出的部分会清掉）';
         return '正在把包写入本地存储…（可以取消，已导入的部分会保留）';
       },
@@ -3826,8 +3948,15 @@
         var box = bundleImportFailPanel(d);
         if (box) ui.body.appendChild(box);
       },
+      // 分片上传还没创建任务时点「取消」：中止上传，并让服务端清掉已落盘的分片
+      abortStart: function () {
+        if (uploadCtl && uploadCtl.abort) uploadCtl.abort();
+      },
       start: function (onProgress) {
-        if (isUpload) return uploadBundleXhr(opts.file, opts.overwrite, onProgress);
+        if (isUpload) {
+          uploadCtl = {};
+          return uploadBundleChunked(opts.file, opts.overwrite, onProgress, uploadCtl);
+        }
         return api('/bundles/import', {
           method: 'POST',
           body: { file: opts.name, overwrite: !!opts.overwrite, progress: true },
@@ -3899,7 +4028,10 @@
         { k: 'storage.maxUploadMB', label: '单包上传上限（MB）', type: 'number', hint: '网页上传单个 .tgz 安装包的上限，1-4096。' },
         { k: 'storage.maxBundleUploadMB', label: '离线包上传上限（MB）', type: 'number', hint: '网页上传整机备份（离线包）的上限，1-65536；服务端流式落盘，不占内存。更大的包建议直接放进 data/bundles 目录后再用「导入」按钮。' },
         { k: 'storage.bundleExportConcurrency', label: '离线包导出并发', type: 'number', hint: '导出整机备份时并行压缩的线程数，1-16，默认 4。设 1 回到单线程；机器核数多时可调大。' },
-        { k: 'storage.bundleImportConcurrency', label: '离线包导入并发', type: 'number', hint: '导入整机备份时同时处理的包数，1-16，默认 4。设 1 回到串行；机械硬盘或 CPU 较忙时调小更稳。' }
+        { k: 'storage.bundleImportConcurrency', label: '离线包导入并发', type: 'number', hint: '导入整机备份时同时处理的包数，1-16，默认 4。设 1 回到串行；机械硬盘或 CPU 较忙时调小更稳。' },
+        { k: 'storage.bundleImportExtractConcurrency', label: '离线包解包并发', type: 'number', hint: '解压并把文件写盘的并发路数，1-16，默认 8。机械硬盘上并发太高反而慢，可调低到 2-4。' },
+        { k: 'storage.bundleUploadChunkMB', label: '分片上传 · 每片大小（MB）', type: 'number', hint: '网页上传离线包时每片的大小，1-64，默认 8。片越小进度越细，但请求次数变多。' },
+        { k: 'storage.bundleUploadConcurrency', label: '分片上传 · 并发数', type: 'number', hint: '同时上传几个分片，1-16，默认 4。浏览器对同一域名通常最多 6 条连接，设太大反而排队。' }
       ]
     },
     {

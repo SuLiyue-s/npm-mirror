@@ -6,6 +6,7 @@ const {
   ok, fail, readJson, readBody, sendJson, streamFile, baseFor, hostAllowed,
 } = require('./http-util');
 const { nowIso, compareVersions, maxSatisfying, pkgBaseName, rootPath, isSafeVersion } = require('./util');
+const packumentView = require('./packument');
 
 const NAME_RE = /^(?:@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/i;
 
@@ -64,7 +65,12 @@ function parseLevelLine(line) {
 
 /** 元数据是否超过 TTL（proxy 模式下用来决定是否回源刷新） */
 function isStale(rec, ttlMs) {
-  const last = rec && rec.meta && rec.meta.lastFetchAt ? Date.parse(rec.meta.lastFetchAt) : 0;
+  return isStaleMeta(rec && rec.meta, ttlMs);
+}
+
+/** 同上，但直接收 meta 对象：早期 304 快路径只有内存 meta，不需要读盘 */
+function isStaleMeta(meta, ttlMs) {
+  const last = meta && meta.lastFetchAt ? Date.parse(meta.lastFetchAt) : 0;
   if (!last) return true;
   return (Date.now() - last) > ttlMs;
 }
@@ -427,9 +433,56 @@ function revisionOf(name, meta) {
   return `1-${digits.slice(-13) || '0'}`;
 }
 
+/** 统一写 packument 响应头（含 content-encoding / vary / etag） */
+function writePackument(res, payload, { head = false } = {}) {
+  const headers = {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': payload.body.length,
+    'cache-control': 'no-cache',
+    vary: 'accept, accept-encoding',
+  };
+  if (payload.encoding) headers['content-encoding'] = payload.encoding;
+  res.writeHead(200, headers);
+  return res.end(head ? undefined : payload.body);
+}
+
 async function servePackument(ctx, name, { head = false } = {}) {
   const { req, res, url } = ctx;
   if (!ctx.auth.canRead(req, url)) return fail(res, 401, '读取需要访问令牌', 'EAUTH');
+  const cfg = ctx.cfg();
+  const mode = cfg.mode || 'cache';
+  const store = ctx.store;
+  /* npm 安装时带 `Accept: application/vnd.npm.install-v1+json`：返回精简格式（只含安装字段）。
+   * 完整格式保留给网页/调试等其它客户端。两种格式的缓存与 ETag 相互独立。 */
+  const variant = packumentView.wantsAbbreviated(req) ? 'abbrev' : 'full';
+  const base = baseFor(req, ctx.registryUrl);
+
+  /* 无回源需求时的快路径（npm install 的绝大多数请求都走这里）：
+   *  1) If-None-Match 命中 → 直接 304，连 packument.json 都不读；
+   *  2) 内存里已有相同 updatedAt 的序列化结果 → 直接回 Buffer（大包省掉 readFile+JSON.parse+stringify 的 60ms+）。
+   * 以前这两种情况都要先 ensurePackument（读盘+解析几十 MB）再序列化，命中 304 也要白算一遍。 */
+  const localMeta = store.metaOf(name);
+  if (localMeta && !head && fs.existsSync(store.packumentPath(name))) {
+    const ttlMs = Math.max(0, Number(cfg.upstream.metadataTtlSec || 300) * 1000);
+    const localPrivate = localMeta.source === 'private' || !!localMeta.private;
+    // 与 ensurePackument 的 wantFetch 判断保持一致：cache/offline 模式不会自动回源
+    const fetchNeeded = mode !== 'offline' && !localPrivate
+      && (mode === 'proxy' && isStaleMeta(localMeta, ttlMs));
+    if (!fetchNeeded) {
+      const fastEtag = packumentView.etagFor(name, localMeta.updatedAt, variant);
+      if (packumentView.etagMatches(req.headers['if-none-match'], fastEtag)) {
+        res.writeHead(304, { etag: fastEtag, 'cache-control': 'no-cache', vary: 'accept, accept-encoding' });
+        return res.end();
+      }
+      const cachedEntry = packumentView.lookup({ name, updatedAt: localMeta.updatedAt, variant, base });
+      if (cachedEntry) {
+        res.setHeader && res.setHeader('etag', fastEtag);
+        const payload = await packumentView.encode(cachedEntry, req);
+        return writePackument(res, payload, { head: false });
+      }
+    }
+  }
+
   let rec = null;
   try { rec = await ensurePackument(ctx, name); }
   catch (e) {
@@ -439,28 +492,28 @@ async function servePackument(ctx, name, { head = false } = {}) {
       offline ? 'ENOTFOUND' : 'EUPSTREAM');
   }
   if (!rec) {
-    const offline = (ctx.cfg().mode || 'cache') === 'offline';
+    const offline = (mode || 'cache') === 'offline';
     return fail(res, 404, offline
       ? `离线模式下本地没有包 ${name}（请先用「添加公共包」或在有网环境下导入）`
       : `包 ${name} 不存在（上游也没有找到）`, 'ENOTFOUND');
   }
-  const base = baseFor(req, ctx.registryUrl);
-  const packument = ctx.store.rewriteTarballs(name, rec.packument, base);
-  // 回填 _rev：npm 取消发布（unpublish）会把它原样回传，服务端不校验内容
-  packument._id = packument._id || name;
-  packument._rev = revisionOf(name, rec.meta);
+  const meta = rec.meta || {};
+  const rev = revisionOf(name, meta);
+  const etag = packumentView.etagFor(name, meta.updatedAt, variant);
   if (!head) {
-    const etag = `W/"${name}-${rec.meta.updatedAt || ''}"`;
-    if (req.headers['if-none-match'] === etag) { res.writeHead(304, { etag }); return res.end(); }
+    if (packumentView.etagMatches(req.headers['if-none-match'], etag)) {
+      res.writeHead(304, { etag, 'cache-control': 'no-cache', vary: 'accept, accept-encoding' });
+      return res.end();
+    }
     res.setHeader && res.setHeader('etag', etag);
   }
-  const body = Buffer.from(JSON.stringify(packument), 'utf8');
-  res.writeHead(200, {
-    'content-type': 'application/json; charset=utf-8',
-    'content-length': body.length,
-    'cache-control': 'no-cache',
-  });
-  res.end(body);
+  let payload;
+  try {
+    payload = await packumentView.render({ name, rec, base, variant, store, rev, req });
+  } catch (e) {
+    return fail(res, 500, `元数据序列化失败：${e.message}`, 'EMETA');
+  }
+  return writePackument(res, payload, { head });
 }
 
 async function handleRegistry(ctx) {
@@ -612,16 +665,27 @@ async function handleRegistry(ctx) {
     if (typeof file !== 'string' || !file || file.includes('/') || file.includes('\\') || file.includes('..')) {
       return fail(res, 400, `不合法的 tarball 文件名：${file}`, 'EPATH');
     }
-    const rec = store.get(name);
+    /* 快路径：文件名 → 版本 用内存 meta.files 反查（不读 packument）。
+     * 以前每下载一个 tarball 都要先读一次完整 packument.json 来找版本，大包 10MB+，
+     * 安装大量包时这部分纯属浪费：meta.files 里本来就记着 tarball 文件名。 */
     let version = null;
-    if (rec) {
-      for (const v of Object.keys(rec.packument.versions || {})) {
-        if (store.tarballFileName(name, v) === file) { version = v; break; }
-      }
+    const meta = store.metaOf(name);
+    if (meta) {
+      const revMap = store.tarballVersionMap(name);
+      if (revMap && revMap.has(file)) version = revMap.get(file);
     }
     if (!version) {
-      const m = new RegExp(`^${pkgBaseName(name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}-([0-9A-Za-z][0-9A-Za-z.+-]*)\\.tgz$`, 'i').exec(file);
-      if (m) version = m[1];
+      // 兜底：历史数据里 meta.files 可能缺少记录，仍按旧逻辑读一次 packument 逐个比对
+      const rec = meta ? store.get(name) : null;
+      if (rec) {
+        for (const v of Object.keys(rec.packument.versions || {})) {
+          if (store.tarballFileName(name, v) === file) { version = v; break; }
+        }
+      }
+      if (!version) {
+        const m = new RegExp(`^${pkgBaseName(name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}-([0-9A-Za-z][0-9A-Za-z.+-]*)\\.tgz$`, 'i').exec(file);
+        if (m) version = m[1];
+      }
     }
     if (!version || !isSafeVersion(version)) {
       return fail(res, 404, `本地未缓存该 tarball：${name}/${file}`, 'ENOTFOUND');

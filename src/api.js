@@ -21,7 +21,7 @@ const pull = require('./pull');
 const deps = require('./deps');
 const {
   nowIso, parsePkgSpec, satisfies, compareVersions, maxSatisfying,
-  rootPath, stamp, formatBytes, clamp,
+  rootPath, stamp, formatBytes, clamp, randomToken,
 } = require('./util');
 
 const API = '/__admin/api';
@@ -94,6 +94,267 @@ function startBundleTask({ type, title, phase = '', total = 0, concurrency = 1, 
     }
   })();
   return task.id;
+}
+
+/* ---------------- 离线包导入：进度映射与任务封装 ----------------
+ * 导入离线包有三个入口：本机 data/bundles 里的文件、旧版整包单请求上传、新的分片并发上传。
+ * 这里把「进度事件 → 任务快照字段」和「真正执行导入」抽成公共函数，
+ * 三个入口共用同一套统计口径，界面左右栏才不会出现两套逻辑。 */
+
+/** 把 bundle.importBundle 的进度事件映射成任务快照字段，返回 onProgress 回调 */
+function makeImportProgressHandler(update) {
+  const pkgs = [];
+  let curTotal = 0;
+  let pkgTotal = 0;
+  return (ev) => {
+    if (ev.phase === 'extract') {
+      update({
+        phase: 'extract',
+        bytes: Number(ev.bytes) || 0,
+        bytesTotal: Number(ev.totalBytes) || 0,
+        total: Number(ev.packages) || 0,
+        current: ev.current || '',
+      });
+      return;
+    }
+    if (ev.phase === 'extract-done') {
+      update({
+        phase: 'import',
+        total: Number(ev.packages) || 0,
+        done: 0,
+        bytes: Number(ev.bytes) || 0,
+        bytesTotal: Number(ev.bytes) || 0,
+        current: '', currentDone: 0, currentTotal: 0,
+        inFlight: [],
+        message: '',
+      });
+      return;
+    }
+    if (ev.phase === 'package-start') {
+      pkgTotal = Number(ev.total) || pkgTotal;
+      curTotal = Number(ev.versionTotal) || 0;
+      update({
+        phase: 'import',
+        total: pkgTotal,
+        // 并行导入时包是同时开始的，进度按「已完成的包数」算（pkgs.length），不能用包的起始序号
+        done: pkgs.length,
+        current: ev.name,
+        currentDone: 0,
+        currentTotal: curTotal,
+        inFlight: Array.isArray(ev.inFlight) ? ev.inFlight.slice(0, 64) : [],
+      });
+      return;
+    }
+    if (ev.phase === 'version') {
+      curTotal = Number(ev.versionTotal) || curTotal;
+      update({
+        current: ev.name, currentDone: Number(ev.versionDone) || 0, currentTotal: curTotal,
+        inFlight: Array.isArray(ev.inFlight) ? ev.inFlight.slice(0, 64) : [],
+      });
+      return;
+    }
+    if (ev.phase === 'package') {
+      pkgs.push({
+        name: ev.name,
+        status: ev.status,
+        versions: Number(ev.versions) || 0,
+        tarballs: Number(ev.tarballs) || 0,
+        skipped: Number(ev.skipped) || 0,
+        failed: Number(ev.failed) || 0,
+        reason: ev.reason || '',
+      });
+      update({
+        done: pkgs.length,
+        total: Math.max(pkgTotal, pkgs.length),
+        ok: pkgs.filter(p => p.status === 'imported').length,
+        failed: pkgs.filter(p => p.status === 'failed').length,
+        skipped: pkgs.filter(p => p.status === 'skipped').length,
+        packages: pkgs.slice(-2000),
+        versions: pkgs.reduce((a, p) => a + p.versions, 0),
+        tarballs: pkgs.reduce((a, p) => a + p.tarballs, 0),
+        current: ev.name,
+        currentDone: curTotal,
+        currentTotal: curTotal,
+        inFlight: Array.isArray(ev.inFlight) ? ev.inFlight.slice(0, 64) : [],
+        errors: pkgs.filter(p => p.status === 'failed').slice(-50).map(p => ({ name: p.name, error: p.reason })),
+      });
+    }
+  };
+}
+
+/** 真正执行一次离线包导入（调用方负责任务生命周期、临时文件清理与错误收敛） */
+async function runBundleImportJob(ctx, { file, overwrite, update, isCanceled }) {
+  const cfg = ctx.cfg();
+  const r = await ctx.bundle.importBundle({
+    store: ctx.store,
+    file,
+    overwrite,
+    logger: ctx.log,
+    isCanceled,
+    concurrency: Math.max(1, Number(cfg.storage.bundleImportConcurrency) || 4),
+    // 解包（解压+写盘）的并发路数：与「导入包」的并发分开，机械硬盘和小宝塔盘都能调
+    extractConcurrency: Math.max(1, Number(cfg.storage.bundleImportExtractConcurrency) || 8),
+    onProgress: makeImportProgressHandler(update),
+  });
+  return { ...r, total: r.packages, failedCount: r.failed.length };
+}
+
+/** 按 progress 参数决定：后台任务（立即返回 taskId）或同步执行，统一收敛错误与临时文件清理 */
+async function startOrRunBundleImport(ctx, { res, file, overwrite, tempFile, wantProgress, title }) {
+  const cfg = ctx.cfg();
+  const conc = Math.max(1, Number(cfg.storage.bundleImportConcurrency) || 4);
+  const doImport = async ({ update, isCanceled }) => {
+    try {
+      return await runBundleImportJob(ctx, { file, overwrite, update, isCanceled });
+    } finally {
+      // 临时文件的生命周期交给实际执行导入的那段代码：progress 模式下响应已先返回，
+      // 绝不能提前删掉还在读的文件；同步模式下导入结束才删。
+      if (tempFile) { try { fs.unlinkSync(tempFile); } catch { /* 忽略 */ } }
+    }
+  };
+  if (wantProgress) {
+    const taskId = startBundleTask({
+      type: 'bundle-import',
+      title: title || `导入离线包 · ${path.basename(file)}`,
+      phase: 'extract',
+      total: 0,
+      concurrency: conc,
+      log: ctx.log,
+      run: async (o) => {
+        try {
+          return await doImport(o);
+        } finally {
+          // 收尾（成功/取消/失败）都清空「并行导入的包」，右栏不留残行
+          o.update({ inFlight: [] });
+        }
+      },
+    });
+    return ok(res, { taskId, async: true });
+  }
+  try {
+    const r = await doImport({ update: () => {}, isCanceled: () => false });
+    return ok(res, r);
+  } catch (e) {
+    return fail(res, 400, `导入失败：${e.message}`, e.code || 'EIMPORT');
+  }
+}
+
+/* ---------------- 大离线包分片并发上传 ----------------
+ * 一个请求上传几个 GB 只能占用一条连接、串行推进，浏览器一断就前功尽弃。
+ * 这里拆成固定大小的分片：网页端多路并发 POST 分片，服务端逐片落盘（data/tmp/upload-<id>/），
+ * 收齐后在后台任务里按顺序拼成一个临时 .tgz 再交给导入流程，导入结束删临时文件。
+ * 会话只存在内存里（进程重启即中断，前端会重新上传）；超过 2 小时的残留会被清理。 */
+const BUNDLE_UPLOAD_TTL_MS = 2 * 60 * 60 * 1000;
+const BUNDLE_UPLOAD_MAX_SESSIONS = 8;
+const bundleUploads = new Map(); // uploadId -> { id, name, size, overwrite, dir, chunkSize, chunkCount, parts, bytes, createdAt, assembling }
+
+/** 进程重启后内存会话表是空的，但 data/tmp 里的 upload-* 残留目录还在。
+ *  每次 init 都顺手扫一遍（开销只是一次 readdir），超过 2×TTL 的删掉，避免长期占盘。 */
+function cleanupStaleBundleUploadDirs() {
+  try {
+    const tmpDir = rootPath('data', 'tmp');
+    const now = Date.now();
+    for (const name of fs.readdirSync(tmpDir)) {
+      if (!name.startsWith('upload-')) continue;
+      const dir = path.join(tmpDir, name);
+      try {
+        const st = fs.statSync(dir);
+        if (st.isDirectory() && now - st.mtimeMs > BUNDLE_UPLOAD_TTL_MS * 2) {
+          fs.rmSync(dir, { recursive: true, force: true });
+        }
+      } catch { /* 忽略单个目录 */ }
+    }
+  } catch { /* data/tmp 不存在等情况直接忽略 */ }
+}
+
+function cleanupBundleUploads() {
+  cleanupStaleBundleUploadDirs();
+  const now = Date.now();
+  for (const [id, up] of bundleUploads) {
+    if (now - up.createdAt <= BUNDLE_UPLOAD_TTL_MS) continue;
+    bundleUploads.delete(id);
+    try { fs.rmSync(up.dir, { recursive: true, force: true }); } catch { /* 忽略 */ }
+  }
+  // 会话数超上限时踢掉最老的，防止反复 init 把磁盘占满；
+  // 正在合并（assembling）的会话不能踢，否则正在拼的文件会被删掉。
+  while (bundleUploads.size >= BUNDLE_UPLOAD_MAX_SESSIONS) {
+    let victim = null;
+    for (const [id, up] of bundleUploads) {
+      if (!up.assembling) { victim = id; break; }
+    }
+    // 全都在合并：宁可暂时超出上限，也不破坏正在进行的上传
+    if (!victim) break;
+    const up = bundleUploads.get(victim);
+    bundleUploads.delete(victim);
+    if (up) { try { fs.rmSync(up.dir, { recursive: true, force: true }); } catch { /* 忽略 */ } }
+  }
+}
+
+function bundleUploadPartPath(up, index) {
+  return path.join(up.dir, `part-${String(index).padStart(6, '0')}.bin`);
+}
+
+function bundleUploadPartSize(up, index) {
+  if (index < up.chunkCount - 1) return up.chunkSize;
+  return up.size - up.chunkSize * (up.chunkCount - 1);
+}
+
+/** 返回第一个缺失/大小不对的分片序号；全部分片完整时返回 -1 */
+function bundleUploadFirstMissing(up) {
+  for (let i = 0; i < up.chunkCount; i++) {
+    try {
+      if (fs.statSync(bundleUploadPartPath(up, i)).size !== bundleUploadPartSize(up, i)) return i;
+    } catch {
+      return i;
+    }
+  }
+  return -1;
+}
+
+/** 把分片按顺序拼成 targetFile；onProgress(copied) 约每 16MB 回调一次；isCanceled() 为真时中止 */
+async function assembleBundleUpload(up, targetFile, onProgress, isCanceled) {
+  const ws = fs.createWriteStream(targetFile, { highWaterMark: 1024 * 1024 });
+  const finished = new Promise((resolve, reject) => {
+    ws.once('error', reject);
+    ws.once('finish', resolve);
+  });
+  finished.catch(() => { /* 由下面的 await 统一处理 */ });
+  let copied = 0;
+  let lastReport = 0;
+  const abortError = () => {
+    const e = new Error('已取消');
+    e.code = 'ECANCELED';
+    return e;
+  };
+  try {
+    for (let i = 0; i < up.chunkCount; i++) {
+      // 几十 GB 的包合并要几分钟，取消要能立刻生效
+      if (typeof isCanceled === 'function' && isCanceled()) throw abortError();
+      const buf = await fsp.readFile(bundleUploadPartPath(up, i));
+      copied += buf.length;
+      if (!ws.write(buf)) {
+        await new Promise((resolve, reject) => { ws.once('drain', resolve); ws.once('error', reject); });
+      }
+      if (onProgress && copied - lastReport >= 16 * 1024 * 1024) {
+        lastReport = copied;
+        try { onProgress(copied); } catch { /* 忽略 */ }
+      }
+    }
+    if (typeof isCanceled === 'function' && isCanceled()) throw abortError();
+    ws.end();
+    await finished;
+    if (onProgress) { try { onProgress(copied); } catch { /* 忽略 */ } }
+    return copied;
+  } catch (e) {
+    try { ws.destroy(); } catch { /* 忽略 */ }
+    throw e;
+  }
+}
+
+function dropBundleUpload(up) {
+  if (!up) return;
+  bundleUploads.delete(up.id);
+  try { fs.rmSync(up.dir, { recursive: true, force: true }); } catch { /* 忽略 */ }
 }
 
 async function handleAdmin(ctx) {
@@ -956,6 +1217,137 @@ async function handleAdmin(ctx) {
     }
   }
 
+  // ---------------- 离线包：分片并发上传 ----------------
+  // 网页上传几个 GB 的整机备份时，单个请求只能占用一条连接：这里让前端把文件切片、
+  // 多路并发上传分片，服务端先逐片落盘，complete 时再在后台任务里顺序拼包并导入。
+  if (rel === '/bundles/upload/init' && method === 'POST') {
+    const body = await readJson(req);
+    const name = path.basename(String(body.file || body.name || ''));
+    if (!name) return fail(res, 400, '请提供 file 字段（离线包文件名）', 'EBADREQ');
+    if (!/\.(tgz|tar\.gz)$/i.test(name)) return fail(res, 400, '只支持 .tgz / .tar.gz 格式的离线包', 'EBADREQ');
+    const size = Number(body.size);
+    if (!Number.isSafeInteger(size) || size <= 0) return fail(res, 400, 'size 必须是正整数（字节）', 'EBADREQ');
+    const maxMB = Math.max(1, Number(cfg.storage.maxBundleUploadMB || 4096));
+    const maxBytes = maxMB * 1024 * 1024;
+    const tooLargeHint = '；更大的离线包请把 .tgz 拷贝到 data/bundles 目录后刷新列表，'
+      + '点表格里的「导入」按钮（或运行 一键导入离线包.cmd），这条路不受网页上传上限限制';
+    if (size > maxBytes) {
+      if (log) log.warn(`拒绝分片上传离线包：声明体积 ${formatBytes(size)} 超过上限 ${maxMB} MB`);
+      return fail(res, 413, `离线包 ${formatBytes(size)} 超过网页上传上限 ${maxMB} MB${tooLargeHint}`, 'ETOOLARGE');
+    }
+    cleanupBundleUploads();
+    // 分片大小与并发路数都可由配置调整：并发太高反而抢带宽、分片太小则请求开销大
+    const chunkMB = clamp(Number(cfg.storage.bundleUploadChunkMB) || 8, 1, 64);
+    const chunkSize = Math.floor(chunkMB * 1024 * 1024);
+    const chunkCount = Math.max(1, Math.ceil(size / chunkSize));
+    const id = randomToken(16);
+    const dir = path.join(rootPath('data', 'tmp'), `upload-${id}`);
+    fs.mkdirSync(dir, { recursive: true });
+    bundleUploads.set(id, {
+      id, name, size, overwrite: body.overwrite === true, dir, chunkSize, chunkCount,
+      parts: new Set(), bytes: 0, createdAt: Date.now(), assembling: false,
+    });
+    if (log) log.info(`开始分片上传离线包 ${name}（${formatBytes(size)}，${chunkCount} 片 × ${formatBytes(chunkSize)}）`);
+    return ok(res, {
+      uploadId: id, name, size, chunkSize, chunkCount,
+      concurrency: clamp(Number(cfg.storage.bundleUploadConcurrency) || 4, 1, 16),
+      maxSizeMB: maxMB,
+    });
+  }
+
+  if (rel === '/bundles/upload/chunk' && method === 'POST') {
+    const up = bundleUploads.get(String(q.get('uploadId') || ''));
+    if (!up) return fail(res, 404, '上传会话不存在或已过期，请重新上传', 'ENOUP');
+    const index = Number(q.get('index'));
+    if (!Number.isInteger(index) || index < 0 || index >= up.chunkCount) {
+      return fail(res, 400, `分片序号不合法（应为 0-${up.chunkCount - 1}）`, 'EBADCHUNK');
+    }
+    const expected = bundleUploadPartSize(up, index);
+    const part = bundleUploadPartPath(up, index);
+    // 网络抖动后浏览器会重试同一分片：已经完整落盘的直接成功，避免重复传输
+    try {
+      if (fs.statSync(part).size === expected) return ok(res, { index, size: expected, retried: true });
+    } catch { /* 该分片还没传过 */ }
+    if (up.assembling) return fail(res, 409, '上传已完成，正在合并分片', 'EBUSY');
+    try {
+      const { size } = await readBodyToFile(req, part, { maxBytes: expected, idleMs: 60000, totalMs: 600000 });
+      if (size !== expected) {
+        try { fs.unlinkSync(part); } catch { /* 忽略 */ }
+        return fail(res, 400, `分片 ${index + 1}/${up.chunkCount} 大小不正确（收到 ${size} 字节，应为 ${expected} 字节）`, 'EBADCHUNK');
+      }
+      if (!up.parts.has(index)) { up.parts.add(index); up.bytes += expected; }
+      return ok(res, { index, size, received: up.parts.size, total: up.chunkCount });
+    } catch (e) {
+      try { fs.unlinkSync(part); } catch { /* 忽略 */ }
+      if (log) log.warn(`离线包分片 ${index + 1}/${up.chunkCount} 上传失败：${e.message}（${e.code || 'EUNKNOWN'}）`);
+      return fail(res, e.status || 400, e.message, e.code || 'EBADCHUNK');
+    }
+  }
+
+  if (rel === '/bundles/upload/complete' && method === 'POST') {
+    const body = await readJson(req).catch(() => ({}));
+    const id = String(q.get('uploadId') || body.uploadId || '');
+    const up = bundleUploads.get(id);
+    if (!up) return fail(res, 404, '上传会话不存在或已过期，请重新上传', 'ENOUP');
+    if (up.assembling) return fail(res, 409, '该上传已在合并分片', 'EBUSY');
+    const missing = bundleUploadFirstMissing(up);
+    if (missing >= 0) {
+      return fail(res, 400, `分片不完整：缺少第 ${missing + 1}/${up.chunkCount} 片，请重试该分片`, 'EINCOMPLETE');
+    }
+    up.assembling = true;
+    const overwrite = body.overwrite === true || up.overwrite;
+    const wantProgress = q.get('progress') === '1' || q.get('progress') === 'true' || body.progress === true;
+    const tempFile = tempFilePath(rootPath('data', 'tmp'), up.name);
+    const cleanup = () => { try { fs.unlinkSync(tempFile); } catch { /* 忽略 */ } dropBundleUpload(up); };
+    const assemble = async (update, isCanceled) => {
+      update({ phase: 'assemble', bytes: 0, bytesTotal: up.size, current: up.name, message: `正在合并 ${up.chunkCount} 个上传分片…` });
+      await assembleBundleUpload(up, tempFile, (copied) => update({ bytes: copied, bytesTotal: up.size }), isCanceled);
+      update({ bytes: up.size, bytesTotal: up.size });
+    };
+    if (wantProgress) {
+      const conc = Math.max(1, Number(cfg.storage.bundleImportConcurrency) || 4);
+      const taskId = startBundleTask({
+        type: 'bundle-import',
+        title: `上传并导入离线包 · ${up.name}`,
+        phase: 'assemble',
+        total: 0,
+        concurrency: conc,
+        log,
+        run: async (o) => {
+          try {
+            // 先合并分片（这一步也能取消），再把合并出的临时 .tgz 交给统一的导入流程
+            await assemble(o.update, o.isCanceled);
+            return await runBundleImportJob(ctx, { file: tempFile, overwrite, update: o.update, isCanceled: o.isCanceled });
+          } finally {
+            o.update({ inFlight: [] });
+            cleanup();
+          }
+        },
+      });
+      return ok(res, { taskId, async: true, uploadId: id, name: up.name, size: up.size });
+    }
+    try {
+      await assemble(() => {});
+      const r = await runBundleImportJob(ctx, { file: tempFile, overwrite, update: () => {}, isCanceled: () => false });
+      return ok(res, r);
+    } catch (e) {
+      return fail(res, 400, `导入失败：${e.message}`, e.code || 'EIMPORT');
+    } finally {
+      cleanup();
+    }
+  }
+
+  if (rel === '/bundles/upload/abort' && method === 'POST') {
+    const body = await readJson(req).catch(() => ({}));
+    const id = String(q.get('uploadId') || body.uploadId || '');
+    const up = bundleUploads.get(id);
+    if (up) {
+      dropBundleUpload(up);
+      if (log) log.warn(`已取消离线包上传：${up.name}`);
+    }
+    return ok(res, { uploadId: id, aborted: true });
+  }
+
   if (rel === '/bundles/import' && method === 'POST') {
     let overwrite = q.get('overwrite') === '1' || q.get('overwrite') === 'true';
     let file = '';
@@ -1005,127 +1397,15 @@ async function handleAdmin(ctx) {
         return fail(res, e.status || 400, `${e.message}${hint}`, e.code || 'EBADREQ');
       }
     }
-    // 临时文件的生命周期交给实际执行导入的那段代码（同步或后台任务都一样）：
-    // progress 模式下响应已经先返回，绝不能在这里提前删掉还在读的文件。
-    const tempFile = temp;
-    temp = null;
-    const doImport = async ({ update, isCanceled }) => {
-      const pkgs = [];
-      let curTotal = 0;
-      let pkgTotal = 0;
-      try {
-        const r = await ctx.bundle.importBundle({
-          store,
-          file,
-          overwrite,
-          logger: log,
-          isCanceled,
-          concurrency: Math.max(1, Number(cfg.storage.bundleImportConcurrency) || 4),
-          onProgress: (ev) => {
-            if (ev.phase === 'extract') {
-              update({
-                phase: 'extract',
-                bytes: Number(ev.bytes) || 0,
-                bytesTotal: Number(ev.totalBytes) || 0,
-                total: Number(ev.packages) || 0,
-                current: ev.current || '',
-              });
-              return;
-            }
-            if (ev.phase === 'extract-done') {
-              update({
-                phase: 'import',
-                total: Number(ev.packages) || 0,
-                done: 0,
-                bytes: Number(ev.bytes) || 0,
-                bytesTotal: Number(ev.bytes) || 0,
-                current: '', currentDone: 0, currentTotal: 0,
-                inFlight: [],
-                message: '',
-              });
-              return;
-            }
-            if (ev.phase === 'package-start') {
-              pkgTotal = Number(ev.total) || pkgTotal;
-              curTotal = Number(ev.versionTotal) || 0;
-              update({
-                phase: 'import',
-                total: pkgTotal,
-                // 并行导入时包是同时开始的，进度按「已完成的包数」算（pkgs.length），不能再用包的起始序号
-                done: pkgs.length,
-                current: ev.name,
-                currentDone: 0,
-                currentTotal: curTotal,
-                inFlight: Array.isArray(ev.inFlight) ? ev.inFlight.slice(0, 64) : [],
-              });
-              return;
-            }
-            if (ev.phase === 'version') {
-              curTotal = Number(ev.versionTotal) || curTotal;
-              update({
-                current: ev.name, currentDone: Number(ev.versionDone) || 0, currentTotal: curTotal,
-                inFlight: Array.isArray(ev.inFlight) ? ev.inFlight.slice(0, 64) : [],
-              });
-              return;
-            }
-            if (ev.phase === 'package') {
-              pkgs.push({
-                name: ev.name,
-                status: ev.status,
-                versions: Number(ev.versions) || 0,
-                tarballs: Number(ev.tarballs) || 0,
-                skipped: Number(ev.skipped) || 0,
-                failed: Number(ev.failed) || 0,
-                reason: ev.reason || '',
-              });
-              update({
-                done: pkgs.length,
-                total: Math.max(pkgTotal, pkgs.length),
-                ok: pkgs.filter(p => p.status === 'imported').length,
-                failed: pkgs.filter(p => p.status === 'failed').length,
-                skipped: pkgs.filter(p => p.status === 'skipped').length,
-                packages: pkgs.slice(-2000),
-                versions: pkgs.reduce((a, p) => a + p.versions, 0),
-                tarballs: pkgs.reduce((a, p) => a + p.tarballs, 0),
-                current: ev.name,
-                currentDone: curTotal,
-                currentTotal: curTotal,
-                inFlight: Array.isArray(ev.inFlight) ? ev.inFlight.slice(0, 64) : [],
-                errors: pkgs.filter(p => p.status === 'failed').slice(-50).map(p => ({ name: p.name, error: p.reason })),
-              });
-            }
-          },
-        });
-        return { ...r, total: r.packages, failedCount: r.failed.length };
-      } finally {
-        if (tempFile) { try { fs.unlinkSync(tempFile); } catch { /* 忽略 */ } }
-      }
-    };
-    if (wantProgress) {
-      const taskId = startBundleTask({
-        type: 'bundle-import',
-        title: `导入离线包 · ${path.basename(file)}`,
-        phase: 'extract',
-        total: 0,
-        concurrency: Math.max(1, Number(cfg.storage.bundleImportConcurrency) || 4),
-        log,
-        run: async (o) => {
-          try {
-            return await doImport(o);
-          } finally {
-            // 收尾（成功/取消/失败）都清空「并行导入的包」，右栏不留残行
-            o.update({ inFlight: [] });
-          }
-        },
-      });
-      return ok(res, { taskId, async: true });
-    }
-    try {
-      const r = await doImport({ update: () => {}, isCanceled: () => false });
-      return ok(res, r);
-    } catch (e) {
-      return fail(res, 400, `导入失败：${e.message}`, e.code || 'EIMPORT');
-    }
+    // 临时文件与任务收敛统一交给 startOrRunBundleImport：同步/后台任务删文件时机一致
+    return startOrRunBundleImport(ctx, {
+      res,
+      file,
+      overwrite,
+      tempFile: temp,
+      wantProgress,
+      title: `导入离线包 · ${path.basename(file)}`,
+    });
   }
 
   if (rel === '/bundles/download' && method === 'GET') {
@@ -1210,7 +1490,12 @@ async function handleAdmin(ctx) {
         const m = Number(st.maxBundleUploadMB);
         if (!Number.isInteger(m) || m < 1 || m > 65536) return bad('storage.maxBundleUploadMB 必须是 1-65536 的整数');
       }
-      for (const k of ['bundleExportConcurrency', 'bundleImportConcurrency']) {
+      // 分片上传：每片大小（MB）单独限制 1-64，其余并发路数统一 1-16
+      if (st.bundleUploadChunkMB !== undefined) {
+        const m = Number(st.bundleUploadChunkMB);
+        if (!Number.isInteger(m) || m < 1 || m > 64) return bad('storage.bundleUploadChunkMB 必须是 1-64 的整数（每片 MB 数）');
+      }
+      for (const k of ['bundleExportConcurrency', 'bundleImportConcurrency', 'bundleImportExtractConcurrency', 'bundleUploadConcurrency']) {
         if (st[k] !== undefined) {
           const n = Number(st[k]);
           if (!Number.isInteger(n) || n < 1 || n > 16) return bad(`storage.${k} 必须是 1-16 的整数`);

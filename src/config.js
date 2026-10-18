@@ -36,6 +36,10 @@ function defaults() {
       dir: 'data/storage', maxUploadMB: 500, maxBundleUploadMB: 4096,
       // 离线包导出 / 导入的包级并发（1 = 串行）：导出并行压缩、导入并行处理不同包，默认 4。
       bundleExportConcurrency: 4, bundleImportConcurrency: 4,
+      // 网页上传大离线包时走「分片并发上传」：每片大小（MB）与同时上传的分片数。
+      bundleUploadChunkMB: 8, bundleUploadConcurrency: 4,
+      // 解包（解压 + 写盘）的并发路数：与「导入包」的并发分开，默认 8。
+      bundleImportExtractConcurrency: 8,
     },
     log: { level: 'info', maxDays: 7 },
     ui: { title: '私人 npm 镜像源' },
@@ -135,6 +139,11 @@ function sanitize(input) {
       // 导入时多个包同时写（每个包只锁自己，包内版本仍按顺序），太大反而抢磁盘/CPU，所以上限 16。
       bundleExportConcurrency: clampInt(st.bundleExportConcurrency, 1, 16, 4),
       bundleImportConcurrency: clampInt(st.bundleImportConcurrency, 1, 16, 4),
+      // 分片并发上传：每片大小 1-64MB、同时上传的分片数 1-16。片太大进度反馈粗、片太小请求开销大。
+      bundleUploadChunkMB: clampInt(st.bundleUploadChunkMB, 1, 64, 8),
+      bundleUploadConcurrency: clampInt(st.bundleUploadConcurrency, 1, 16, 4),
+      // 解包（解压 + 写盘）的并发路数：1-16，默认 8；机械硬盘上写并发过高反而慢，可调低。
+      bundleImportExtractConcurrency: clampInt(st.bundleImportExtractConcurrency, 1, 16, 8),
     },
     log: {
       level: LOG_LEVELS.includes(level) ? level : 'info',
