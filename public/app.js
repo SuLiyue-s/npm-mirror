@@ -3428,6 +3428,7 @@
         var bits = [];
         if (p.versions) bits.push(fmtNum(p.versions) + ' 个版本');
         if (p.tarballs) bits.push(fmtNum(p.tarballs) + ' 个 tarball');
+        if (p.metadataVersions) bits.push(fmtNum(p.metadataVersions) + ' 个仅补元数据');
         if (p.sizeBytes) bits.push(fmtBytes(p.sizeBytes));
         tv.textContent = '✓ 新增 ' + (bits.length ? bits.join(' · ') : '（没有新内容）');
       } else if (p.status === 'failed') {

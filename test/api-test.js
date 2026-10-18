@@ -914,6 +914,91 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
       `unresolved=${JSON.stringify((ep.unresolved || []).slice(0, 4))} 别名=${JSON.stringify(epAlias.map(p => p.alias.name + '→' + p.name + '@' + p.version))}`);
     if (typeof roStore.close === 'function') roStore.close();
 
+    // ⑥之二：本地元数据残缺（例如以前从 npm 缓存只导入了「带 tarball 的版本」）时，
+    //        解析不到满足范围的版本应强制回源补全一次再重试，而不是直接报「没有满足的版本」
+    {
+      const partialDoc = {
+        name: 'mirror-heal-demo',
+        'dist-tags': { latest: '1.0.0' },
+        versions: { '1.0.0': { name: 'mirror-heal-demo', version: '1.0.0', dependencies: {} } },
+      };
+      const fullDoc = {
+        name: 'mirror-heal-demo',
+        'dist-tags': { latest: '2.1.0' },
+        versions: {
+          '1.0.0': { name: 'mirror-heal-demo', version: '1.0.0', dependencies: {} },
+          '2.1.0': { name: 'mirror-heal-demo', version: '2.1.0', dependencies: {} },
+        },
+      };
+      let forceCalls = 0;
+      const healCtx = {
+        cfg: () => ({ mode: 'cache' }),
+        log: quiet,
+        store: {
+          async getAsync() { return { packument: partialDoc, meta: { source: 'cache' } }; },
+          hasTarball() { return false; },
+        },
+        upstream: {},
+        registry: {
+          async ensurePackument(c2, name, opts) {
+            if (opts && opts.force === true) { forceCalls++; return { packument: fullDoc, meta: {} }; }
+            return { packument: partialDoc, meta: { source: 'cache' } };
+          },
+        },
+      };
+      const healed = await deps.resolveClosure(healCtx, ['mirror-heal-demo@^2.1.0'], { depth: 0, persist: true });
+      check('本地元数据残缺时自动强制回源补全后解析成功（^2.1.0 → 2.1.0）',
+        forceCalls === 1 && healed.unresolved.length === 0 && healed.picks.length === 1 && healed.picks[0].version === '2.1.0',
+        `forceCalls=${forceCalls} picks=${healed.picks.map((p) => p.name + '@' + p.version).join(' ')} unresolved=${JSON.stringify(healed.unresolved)}`);
+      // 范围本身就能满足时不该做多余的回源
+      const noHeal = await deps.resolveClosure(healCtx, ['mirror-heal-demo@^1.0.0'], { depth: 0, persist: true });
+      check('范围本身就能满足时不做多余回源（仍只 force 过一次）',
+        forceCalls === 1 && noHeal.picks.length === 1 && noHeal.picks[0].version === '1.0.0',
+        `forceCalls=${forceCalls} picks=${noHeal.picks.map((p) => p.name + '@' + p.version).join(' ')}`);
+
+      // 并发同名多范围：两个范围在同一批里同时触发回源时只能回源一次，
+      // 且后到的请求要拿到同一次回源的结果（不能因为「已经回源过」直接返回 null 而误报没有版本）。
+      let forceCalls2 = 0;
+      const fullDoc2 = {
+        name: 'mirror-heal-demo2',
+        'dist-tags': { latest: '3.1.0' },
+        versions: {
+          '1.0.0': { name: 'mirror-heal-demo2', version: '1.0.0', dependencies: {} },
+          '2.1.0': { name: 'mirror-heal-demo2', version: '2.1.0', dependencies: {} },
+          '3.1.0': { name: 'mirror-heal-demo2', version: '3.1.0', dependencies: {} },
+        },
+      };
+      const partialDoc2 = {
+        name: 'mirror-heal-demo2',
+        'dist-tags': { latest: '1.0.0' },
+        versions: { '1.0.0': { name: 'mirror-heal-demo2', version: '1.0.0', dependencies: {} } },
+      };
+      const healCtx2 = {
+        cfg: () => ({ mode: 'cache' }),
+        log: quiet,
+        store: {
+          async getAsync() { return { packument: partialDoc2, meta: { source: 'cache' } }; },
+          hasTarball() { return false; },
+        },
+        upstream: {},
+        registry: {
+          async ensurePackument(c2, name, opts) {
+            if (opts && opts.force === true) {
+              forceCalls2++;
+              await new Promise((r) => setTimeout(r, 30)); // 模拟回源网络延迟，制造两个范围并发等待的窗口
+              return { packument: fullDoc2, meta: {} };
+            }
+            return { packument: partialDoc2, meta: { source: 'cache' } };
+          },
+        },
+      };
+      const both = await deps.resolveClosure(healCtx2, ['mirror-heal-demo2@^2.1.0', 'mirror-heal-demo2@^3.0.0'], { depth: 0, persist: true });
+      check('同一包多个范围并发触发回源时只回源一次，且每个范围都能解析',
+        forceCalls2 === 1 && both.unresolved.length === 0 && both.picks.length === 2
+        && both.picks.some((p) => p.version === '2.1.0') && both.picks.some((p) => p.version === '3.1.0'),
+        `forceCalls=${forceCalls2} picks=${both.picks.map((p) => p.name + '@' + p.version).join(' ')} unresolved=${JSON.stringify(both.unresolved)}`);
+    }
+
     // ⑦ 走一遍真接口：别名当根 spec → 把真实包的 tarball 缓存下来
     //    （npm 客户端装别名依赖时，去镜像里取的就是真实包的 packument 和 tarball）
     const aliasAdd = await depsAdd({ names: ['@popperjs/core@npm:@sxzz/popperjs-es@^2.11.8'], depth: 0, prefetch: true });
@@ -2951,6 +3036,88 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
     } else {
       // 显式 SKIP：以前这里用 check(..., true) 恒真，缓存为空时看起来也「通过」，属于假通过
       skip('从本机 npm 缓存导入（八）', '本机 npm 缓存为空，没有可导入的包');
+    }
+  }
+
+  // 八之二：npm 缓存导入要保留「只有元数据、没有缓存 tarball」的版本号。
+  // 旧实现只存带 tarball 的版本，导入后 packument 残缺（例如 make-dir 只剩 4.0.0），
+  // 依赖解析就会报「没有满足 ^2.1.0 的版本」。这里造一个合成 npm 缓存目录直接测 importFromCache。
+  {
+    const npmcacheMod = require('../src/npmcache');
+    const crypto = require('node:crypto');
+    const quietLog = { info() {}, warn() {}, error() {}, debug() {} };
+    const cacheRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'mirror-cache-fixture-'));
+    const statePath = npmcacheMod.stateFile ? npmcacheMod.stateFile() : null;
+    const stateBackup = statePath && fs.existsSync(statePath) ? fs.readFileSync(statePath) : null;
+    const pkgName = 'mirror-cache-meta-' + util.stamp().replace(/[^a-zA-Z0-9]/g, '');
+    try {
+      const contentDir = path.join(cacheRoot, '_cacache', 'content-v2', 'sha512');
+      fs.mkdirSync(contentDir, { recursive: true });
+      // 按 cacache 的内容寻址规则（sha512 hex：前 2 / 3-4 / 其余）写 blob，返回 sha512-<base64> integrity
+      const putContent = (buf) => {
+        const hex = crypto.createHash('sha512').update(buf).digest('hex');
+        const full = path.join(contentDir, hex.slice(0, 2), hex.slice(2, 4), hex.slice(4));
+        fs.mkdirSync(path.dirname(full), { recursive: true });
+        fs.writeFileSync(full, buf);
+        return 'sha512-' + crypto.createHash('sha512').update(buf).digest('base64');
+      };
+      const packument = {
+        name: pkgName,
+        'dist-tags': { latest: '2.1.0' },
+        versions: {
+          '1.0.0': { name: pkgName, version: '1.0.0', dependencies: {} },
+          '2.1.0': { name: pkgName, version: '2.1.0', dependencies: {} },
+        },
+      };
+      const tarballBuf = Buffer.from('fake tgz for ' + pkgName + '@1.0.0');
+      const tarInteg = putContent(tarballBuf);
+      packument.versions['1.0.0'].dist = {
+        integrity: tarInteg,
+        shasum: crypto.createHash('sha1').update(tarballBuf).digest('hex'),
+      };
+      const docInteg = putContent(Buffer.from(JSON.stringify(packument)));
+      const indexDir = path.join(cacheRoot, '_cacache', 'index-v5', 'aa');
+      fs.mkdirSync(indexDir, { recursive: true });
+      const indexKey = 'make-fetch-happen:request-cache:https://registry.npmjs.org/' + pkgName;
+      fs.writeFileSync(path.join(indexDir, 'bb'), `${crypto.createHash('sha1').update(indexKey).digest('hex')}\t${JSON.stringify({ key: indexKey, integrity: docInteg, time: Date.now(), size: 1 })}\n`);
+      const fakeStore = {
+        saved: null,
+        async getAsync() { return null; },
+        hasTarball() { return false; },
+        async withLock(n, fn) { return fn(); },
+        async putTarballFromFileAsync(name, version, src) {
+          const b = fs.readFileSync(src);
+          return { file: `${name}-${version}.tgz`, sizeBytes: b.length };
+        },
+        save(name, packument2, meta) {
+          this.saved = { name, packument: JSON.parse(JSON.stringify(packument2)), meta: JSON.parse(JSON.stringify(meta)) };
+        },
+      };
+      const imp = await npmcacheMod.importFromCache({
+        store: fakeStore,
+        cacheDir: cacheRoot,
+        names: [pkgName],
+        logger: quietLog,
+        concurrency: 2,
+      });
+      const saved = fakeStore.saved && fakeStore.saved.packument;
+      const savedMeta = fakeStore.saved && fakeStore.saved.meta;
+      check('npm 缓存导入保留「仅有元数据、没有缓存 tarball」的版本（1.0.0 有 tarball + 2.1.0 仅元数据）',
+        imp.imported.length === 1 && !!saved && !!saved.versions['1.0.0'] && !!saved.versions['2.1.0']
+          && Object.keys(saved.versions).length === 2 && imp.imported[0].metadataVersions === 1,
+        `imported=${JSON.stringify(imp.imported)} versions=${saved ? Object.keys(saved.versions).join(',') : 'null'}`);
+      check('npm 缓存导入后的 packument 标记「元数据已完整」，dist-tags 不再悬空',
+        !!saved && savedMeta.source === 'cache' && savedMeta.metadataComplete === true
+          && saved['dist-tags'].latest === '2.1.0'
+          && Object.keys(savedMeta.files || {}).join(',') === '1.0.0',
+        `meta=${JSON.stringify(savedMeta && { source: savedMeta.source, complete: savedMeta.metadataComplete, files: savedMeta.files })}`);
+    } finally {
+      // 扫描状态文件是真实的 data/npmcache-scan.json：测试前后还原，避免影响用户页面的扫描结果
+      try {
+        if (statePath && stateBackup) fs.writeFileSync(statePath, stateBackup);
+        else if (statePath && fs.existsSync(statePath)) fs.unlinkSync(statePath);
+      } catch { /* 忽略 */ }
+      try { fs.rmSync(cacheRoot, { recursive: true, force: true }); } catch { /* 忽略 */ }
     }
   }
 

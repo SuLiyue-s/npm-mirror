@@ -708,6 +708,9 @@ async function handleAdmin(ctx) {
       const parts = [`成功 ${r.ok} 个`];
       if (r.failed) parts.push(`失败 ${r.failed} 个`);
       if (r.canceled) parts.push('已取消');
+      /* 收尾时清空「正在下载」清单：极小概率最后一个版本的进度更新与收尾同 tick，
+       * 任务结束后快照里不应该再残留任何「正在下载」行（测试与界面都按空数组断言） */
+      tasks.update(task.id, { downloads: [], inFlight: [] });
       tasks.finish(task.id, {
         status,
         message: `${parts.join('、')}，共 ${r.done}/${r.total} 个，下载 ${formatBytes(r.bytes)}`,
@@ -1808,6 +1811,7 @@ async function handleAdmin(ctx) {
           name: info.name,
           status: info.status,
           versions: info.versions || 0,
+          metadataVersions: info.metadataVersions || 0,
           tarballs: info.tarballs || 0,
           sizeBytes: info.sizeBytes || 0,
           reason: info.reason || '',

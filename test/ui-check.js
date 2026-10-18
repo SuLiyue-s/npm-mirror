@@ -1056,6 +1056,42 @@ async function get(p, { json = false } = {}) {
         && /if \(na\) return 1;/.test(appDet));
   }
 
+  console.log('\x1b[1m九之八、残缺元数据自愈：npm 缓存导入保留完整版本 + 依赖解析回源补全\x1b[0m');
+  {
+    const pMic = require('node:path');
+    const fMic = require('node:fs');
+    const npmcacheSrc = fMic.readFileSync(pMic.join(__dirname, '..', 'src', 'npmcache.js'), 'utf8');
+    const depsSrc = fMic.readFileSync(pMic.join(__dirname, '..', 'src', 'deps.js'), 'utf8');
+    const apiSrcMic = fMic.readFileSync(pMic.join(__dirname, '..', 'src', 'api.js'), 'utf8');
+    const appMic = fMic.readFileSync(pMic.join(__dirname, '..', 'public', 'app.js'), 'utf8');
+
+    check('npm 缓存导入把「没有缓存 tarball 的版本」也作为仅元数据版本写入 packument',
+      /const metaOnly = \{\};/.test(npmcacheSrc)
+        && /if \(!target\.versions\[v\] \|\| overwrite\) metaOnly\[v\] = manifest;/.test(npmcacheSrc)
+        && /if \(!onlyWithTarball \|\| got > 0 \|\| local\) \{/.test(npmcacheSrc)
+        && /metadataVersions\+\+;/.test(npmcacheSrc)
+        && /status: 'imported', versions: added, metadataVersions, tarballs: got,/.test(npmcacheSrc),
+      '旧实现只写带 tarball 的版本，导入后 packument 残缺（make-dir 只剩 4.0.0），依赖解析才会报没有满足范围的版本');
+
+    check('导入结果标记元数据已完整（meta.metadataComplete）并回传 metadataVersions 计数',
+      /metadataComplete: true,/.test(npmcacheSrc)
+        && /versions: added, metadataVersions, tarballs: got,/.test(npmcacheSrc)
+        && /metadataVersions: info\.metadataVersions \|\| 0,/.test(apiSrcMic));
+
+    check('依赖解析在本地 packument 缺版本 / 解答不出范围时强制回源补全一次（每个包只试一次，并发同名范围共享同一次回源）',
+      /const refreshed = new Map\(\);/i.test(depsSrc)
+        && /function refreshPackument\(name\) \{/.test(depsSrc)
+        && /if \(refreshed\.has\(name\)\) return refreshed\.get\(name\);/.test(depsSrc)
+        && /refreshed\.set\(name, job\);/.test(depsSrc)
+        && /ensurePackument\(ctx, name, \{ force: true, publishTime: false \}\)/.test(depsSrc)
+        && /if \(!version && hadPkg\) \{/.test(depsSrc)
+        && /const fresh = await refreshPackument\(realName\);/.test(depsSrc),
+      'persist 模式把上游完整元数据合并落盘，之后 npm 协议请求也能拿到完整 packument；offline 模式不联网；同一批里同名的多个范围只回源一次且都能拿到结果');
+
+    check('进度弹窗逐包明细展示「N 个仅补元数据」（让用户看得出补了元数据没收 tarball）',
+      /if \(p\.metadataVersions\) bits\.push\(fmtNum\(p\.metadataVersions\) \+ ' 个仅补元数据'\);/.test(appMic));
+  }
+
   console.log('\x1b[1m十之五、概览页「上游与来源分布」条形图渲染\x1b[0m');
   {
     const jsBars = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');

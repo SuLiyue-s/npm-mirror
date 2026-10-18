@@ -359,13 +359,17 @@ async function scanCache({ cacheDir, registry, logger, anyRegistry = false, onPr
 }
 
 /**
- * 从缓存导入指定包；默认只导入本地确实有 tarball 的版本。
+ * 从缓存导入指定包。
+ *
+ * 默认只把「缓存里确实有 tarball」的版本写入镜像；但**版本元数据始终保留**：
+ * 以前只保存带 tarball 的版本，导致导入后的 packument 残缺（例如只留 4.0.0），
+ * 依赖解析（^2.1.0）和 npm install 都会误报「没有满足的版本」。
  *
  * 进度回调 onProgress（可选）会收到三类事件，界面据此展示「正在导入的包」和逐包导入详情：
  *   { phase:'start',   name, versionTotal, done, total }      开始处理某个包
  *   { phase:'version', name, versionDone, versionTotal }      包内版本进度（约 120ms 节流一次）
  *   { phase:'done',    name, status:'imported'|'skipped'|'failed',
- *                      versions, tarballs, sizeBytes, reason, error, done, total }
+ *                      versions, metadataVersions, tarballs, sizeBytes, reason, error, done, total }
  * 传 isCanceled 后，每处理一个包前都会检查一次；返回 true 则停下，并把 result.canceled 置为 true。
  */
 async function importFromCache({ store, cacheDir, names = [], all = false, overwrite = false, onlyWithTarball = true, logger, onProgress, isCanceled, concurrency = 8 }) {
@@ -378,7 +382,7 @@ async function importFromCache({ store, cacheDir, names = [], all = false, overw
   }
   const wanted = all ? state.packages.map(p => p.name) : names;
   const result = {
-    imported: [], failed: [], skipped: [], tarballs: 0, total: wanted.length, canceled: false,
+    imported: [], failed: [], skipped: [], tarballs: 0, metadataVersions: 0, total: wanted.length, canceled: false,
     invalidVersions: 0, invalidTarballs: 0,
   };
   const emit = (e) => {
@@ -448,6 +452,8 @@ async function importFromCache({ store, cacheDir, names = [], all = false, overw
         const target = local ? local.packument : { ...packument, versions: {}, 'dist-tags': {} };
         const files = {}; const sizes = {}; const origins = {};
         const versionTotal = Object.keys(packument.versions || {}).length;
+        // 缓存里没有可用 tarball 的版本：tarball 不导入，但版本元数据必须保留（见下面的合并逻辑）
+        const metaOnly = {};
         let added = 0, got = 0, seen = 0, lastEmit = 0;
         let canceledMid = false;
         for (const [v, manifest] of Object.entries(packument.versions)) {
@@ -470,17 +476,35 @@ async function importFromCache({ store, cacheDir, names = [], all = false, overw
           }
           const hasFile = tarballOk;
           seen++;
-          if (onlyWithTarball && !hasFile) continue;
+          if (!hasFile) {
+            /* 缓存里没有这个版本的 tarball（缓存可能只下过部分版本）：以前直接 continue，
+             * 导致导入后的 packument 只剩「带 tarball 的版本」，依赖解析（^1.0.0 等范围）
+             * 和 npm install 都会误报「没有满足的版本」。这里先记下元数据，稍后按规则合并。 */
+            if (!target.versions[v] || overwrite) metaOnly[v] = manifest;
+            continue;
+          }
           if (target.versions[v] && !overwrite && store.hasTarball(name, v)) continue;
           target.versions[v] = manifest;
-          if (hasFile) {
-            const info2 = await store.putTarballFromFileAsync(name, v, p);
-            files[v] = info2.file; sizes[v] = info2.sizeBytes; origins[v] = 'npm-cache';
-            got++;
-          }
+          const info2 = await store.putTarballFromFileAsync(name, v, p);
+          files[v] = info2.file; sizes[v] = info2.sizeBytes; origins[v] = 'npm-cache';
+          got++;
           added++;
           const now = Date.now();
           if (now - lastEmit >= 120) { lastEmit = now; emit({ phase: 'version', name, versionDone: seen, versionTotal }); }
+        }
+        /* 合并「只有元数据」的版本：
+         * - onlyWithTarball=false：这些版本本来就要导入；
+         * - onlyWithTarball=true：只要这个包已经导入了内容（got>0）或本地本来就有该包，
+         *   就把版本元数据补齐（修复旧的残缺 packument）；
+         * - 本地没有、缓存里又没任何可用 tarball：默认不新建「只有元数据」的包（与以前一致）。 */
+        let metadataVersions = 0;
+        if (!onlyWithTarball || got > 0 || local) {
+          for (const [v, manifest] of Object.entries(metaOnly)) {
+            if (target.versions[v] && !overwrite) continue;
+            target.versions[v] = manifest;
+            metadataVersions++;
+          }
+          added += metadataVersions;
         }
         if (canceledMid) result.canceled = true;
         if (added === 0) {
@@ -500,8 +524,13 @@ async function importFromCache({ store, cacheDir, names = [], all = false, overw
           source: (local && local.meta && local.meta.source) || 'cache',
           description: target.description || packument.description || '',
           files, sizes, origins,
+          // 版本列表来自 npm 缓存里的完整 registry 元数据，标记一下便于以后识别「元数据完整」
+          metadataComplete: true,
         });
-        return { status: 'imported', versions: added, tarballs: got, sizeBytes: Object.values(sizes).reduce((a, b) => a + b, 0) };
+        return {
+          status: 'imported', versions: added, metadataVersions, tarballs: got,
+          sizeBytes: Object.values(sizes).reduce((a, b) => a + b, 0),
+        };
       });
     } catch (e) {
       outcome = { status: 'failed', versions: 0, tarballs: 0, sizeBytes: 0, error: e.message };
@@ -522,15 +551,17 @@ async function importFromCache({ store, cacheDir, names = [], all = false, overw
     if (it.canceled) continue;
     result.invalidVersions += it.invalidVersions || 0;
     result.invalidTarballs += it.invalidTarballs || 0;
-    if (it.status === 'imported') result.imported.push({ name: it.name, versions: it.versions, tarballs: it.tarballs, sizeBytes: it.sizeBytes });
+    if (it.status === 'imported') result.imported.push({ name: it.name, versions: it.versions, metadataVersions: it.metadataVersions || 0, tarballs: it.tarballs, sizeBytes: it.sizeBytes });
     else if (it.status === 'failed') result.failed.push({ name: it.name, error: it.error });
     else if (it.status === 'skipped') result.skipped.push({ name: it.name, reason: it.reason });
     result.tarballs += it.tarballs || 0;
+    result.metadataVersions += it.metadataVersions || 0;
   }
   if (logger) {
     const extra = [
       result.invalidVersions ? `跳过 ${result.invalidVersions} 个非法版本号` : '',
       result.invalidTarballs ? `跳过 ${result.invalidTarballs} 个完整性校验失败的 tarball` : '',
+      result.metadataVersions ? `补全 ${result.metadataVersions} 个仅元数据的版本` : '',
     ].filter(Boolean).join('，');
     logger.info(`从 npm 缓存导入完成：成功 ${result.imported.length} 个包 / ${result.tarballs} 个 tarball，失败 ${result.failed.length}${extra ? `，${extra}` : ''}${result.canceled ? '（已取消）' : ''}`);
   }

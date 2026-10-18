@@ -243,6 +243,38 @@ async function resolveClosure(ctx, roots, opts = {}) {
     try { onProgress({ picks, unresolved, errors, bad, stats: snapshotStats() }); } catch (e) { /* 进度回调异常不影响解析 */ }
   }
 
+  const refreshed = new Map(); // 包名 → Promise<packument|null>：并发请求共享同一次回源（同一次解析里每个包只回源一次）
+
+  /**
+   * 本地 packument 可能残缺：从 npm 缓存导入的包以前只保存了「带 tarball 的版本」，
+   * 依赖范围（如 ^2.1.0）就解析不出来。这里强制回源一次，把上游完整版本元数据合并回本地
+   * （persist 模式经 registry.ensurePackument 落盘，之后 npm 协议请求也能拿到完整元数据）。
+   * 只对「本地已存在该包」的情况触发：本地没有时会正常回源，不需要再补。
+   */
+  function refreshPackument(name) {
+    if (refreshed.has(name)) return refreshed.get(name);
+    const c = typeof ctx.cfg === 'function' ? ctx.cfg() : (ctx.cfg || {});
+    if ((c.mode || 'cache') === 'offline') return Promise.resolve(null);
+    const job = (async () => {
+      try {
+        if (persist && ctx.registry && typeof ctx.registry.ensurePackument === 'function') {
+          const rec = await ctx.registry.ensurePackument(ctx, name, { force: true, publishTime: false });
+          return (rec && rec.packument) || null;
+        }
+        if (ctx.upstream && typeof ctx.upstream.getPackument === 'function') {
+          const doc = await ctx.upstream.getPackument(name);
+          if (doc) cache.set(name, doc);
+          return doc || null;
+        }
+      } catch (e) {
+        if (ctx.log && typeof ctx.log.debug === 'function') ctx.log.debug(`强制回源补全元数据失败 ${name}：${(e && e.message) || e}`);
+      }
+      return null;
+    })();
+    refreshed.set(name, job);
+    return job;
+  }
+
   for (const raw of (Array.isArray(roots) ? roots : [])) {
     const spec = String(raw == null ? '' : raw).trim();
     if (!spec) continue;
@@ -282,11 +314,18 @@ async function resolveClosure(ctx, roots, opts = {}) {
         return;
       }
       if (!doc || !doc.versions || !Object.keys(doc.versions).length) {
-        errors.push({
-          name: label, range: req.range, parent: req.parent, aliasOf: alias ? realName : undefined,
-          error: alias ? `别名指向的包 ${realName} 在上游没有找到` : '上游没有找到这个包',
-        });
-        return;
+        // 本地有包但元数据为空/损坏：强制回源补全一次再判断
+        if (hadPkg) {
+          const fresh = await refreshPackument(realName);
+          if (fresh) doc = fresh;
+        }
+        if (!doc || !doc.versions || !Object.keys(doc.versions).length) {
+          errors.push({
+            name: label, range: req.range, parent: req.parent, aliasOf: alias ? realName : undefined,
+            error: alias ? `别名指向的包 ${realName} 在上游没有找到` : '上游没有找到这个包',
+          });
+          return;
+        }
       }
       fetched++;
 
@@ -304,6 +343,14 @@ async function resolveClosure(ctx, roots, opts = {}) {
         if (pick && alias && !pick.alias) pick.alias = { name: req.name, spec: req.range };
       } else {
         version = pickVersion(doc, realRange);
+        if (!version && hadPkg) {
+          // 本地元数据残缺（常见于从 npm 缓存导入的包）→ 强制回源补全后再试一次
+          const fresh = await refreshPackument(realName);
+          if (fresh && fresh.versions && Object.keys(fresh.versions).length) {
+            doc = fresh;
+            version = pickVersion(doc, realRange);
+          }
+        }
         if (!version) {
           unresolved.push({
             name: label, range: realRange || 'latest', parent: req.parent, aliasOf: alias ? realName : undefined,
