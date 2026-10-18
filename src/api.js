@@ -61,6 +61,91 @@ function allPackageNames(store) {
   return kept.length ? { names: kept, skipped: all.length - kept.length } : { names: all, skipped: 0 };
 }
 
+/* ---------------- 加速镜像源连通性测试 ----------------
+ * 配置页「测试连通性」按钮走这里：对每个候选加速源并发探测
+ *   ① GET  <base>/ms —— 是否像 npm registry（能返回元数据）
+ *   ② HEAD <base>/ms/-/ms-2.1.3.tgz（HEAD 被拒绝时用 Range GET 兜底）—— 能否真正下到 tarball
+ * 只用 ms 这个到处都有的小包做只读探测，不下载整包、不修改任何配置；结果逐源返回给界面。
+ * 说明：加速源本来就是用户自己填的（可能在局域网），这里与下载逻辑一样允许私网地址；
+ *       admin 接口本身已要求令牌（见 server.js 的鉴权），不额外加 SSRF 限制。 */
+const ACCEL_TEST_TIMEOUT_MS = 6000;
+const ACCEL_TEST_PKG = 'ms';
+const ACCEL_TEST_VER = '2.1.3';
+
+/** 探测用 fetch：带总超时（AbortController），到点中止 */
+async function accelFetch(url, opts = {}) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), ACCEL_TEST_TIMEOUT_MS);
+  try {
+    return await fetch(url, {
+      method: opts.method || 'GET',
+      headers: opts.headers || {},
+      redirect: 'follow',
+      signal: ctl.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** 把 fetch / DNS / TLS 的网络错误翻译成中文原因（界面直接展示） */
+function accelErrorText(e) {
+  const code = (e && e.cause && e.cause.code) || (e && e.code) || '';
+  const name = (e && e.name) || '';
+  if (name === 'AbortError' || name === 'TimeoutError' || code === 'UND_ERR_CONNECT_TIMEOUT') return `超时（${ACCEL_TEST_TIMEOUT_MS / 1000} 秒）`;
+  if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') return `域名解析失败（${code}）`;
+  if (code === 'ECONNREFUSED') return '连接被拒绝（ECONNREFUSED）';
+  if (code === 'ECONNRESET') return '连接被重置（ECONNRESET）';
+  if (code === 'EHOSTUNREACH' || code === 'ENETUNREACH') return `网络不可达（${code}）`;
+  if (/CERT|SSL|TLS/i.test(String(code))) return `证书 / HTTPS 校验失败（${code}）`;
+  const msg = e && e.message ? String(e.message) : String(code || '未知错误');
+  return msg.length > 120 ? `${msg.slice(0, 120)}…` : msg;
+}
+
+/** 探测一个加速镜像源：先看元数据（GET /ms），再看 tarball（HEAD ms-2.1.3.tgz，失败换 Range GET） */
+async function testAccelerator(rawUrl, log) {
+  const url = String(rawUrl || '').trim().replace(/\/+$/, '');
+  const out = { url, ok: false, ms: 0, meta: null, tarball: null, error: '' };
+  const started = Date.now();
+  try {
+    const r = await accelFetch(`${url}/${ACCEL_TEST_PKG}`, {
+      headers: { accept: 'application/vnd.npm.install-v1+json, application/json;q=0.9, */*;q=0.8' },
+    });
+    const ms = Date.now() - started;
+    let doc = null;
+    try { doc = await r.json(); } catch { /* 不是 JSON，下面按不可用处理 */ }
+    const versions = doc && doc.versions && typeof doc.versions === 'object' ? Object.keys(doc.versions).length : 0;
+    const metaOk = !!r.ok && !!doc && (typeof doc.name === 'string' || versions > 0);
+    out.meta = {
+      ok: metaOk, status: r.status, ms, versions,
+      error: metaOk ? '' : (r.ok ? '响应不是 npm 元数据（缺少 name/versions）' : `HTTP ${r.status}`),
+    };
+  } catch (e) {
+    out.meta = { ok: false, status: 0, ms: Date.now() - started, versions: 0, error: accelErrorText(e) };
+  }
+  const tarballUrl = `${url}/${ACCEL_TEST_PKG}/-/${ACCEL_TEST_PKG}-${ACCEL_TEST_VER}.tgz`;
+  const t0 = Date.now();
+  try {
+    let r = await accelFetch(tarballUrl, { method: 'HEAD' });
+    let mode = 'HEAD';
+    // 部分静态源不支持 HEAD，用 Range GET 兜底（只要拿到 2xx 就说明 tarball 可下载）
+    if (r.status === 403 || r.status === 405 || r.status === 501) {
+      r = await accelFetch(tarballUrl, { headers: { range: 'bytes=0-0' } });
+      mode = 'Range';
+    }
+    const len = Number(r.headers.get('content-length') || 0);
+    const tarOk = mode === 'HEAD' ? (!!r.ok && len > 0) : !!r.ok;
+    out.tarball = { ok: tarOk, status: r.status, ms: Date.now() - t0, mode, error: tarOk ? '' : `HTTP ${r.status}` };
+  } catch (e) {
+    out.tarball = { ok: false, status: 0, ms: Date.now() - t0, mode: 'HEAD', error: accelErrorText(e) };
+  }
+  out.ms = Date.now() - started;
+  out.ok = !!(out.meta.ok && out.tarball.ok);
+  if (!out.ok) out.error = !out.meta.ok ? `元数据不可用：${out.meta.error || '未知原因'}` : `tarball 不可用：${out.tarball.error || '未知原因'}`;
+  if (log) log.debug(`加速镜像源连通性 ${url}：${out.ok ? '可用' : '不可用'}（元数据 ${out.meta.status || out.meta.error}，tarball ${out.tarball.status || out.tarball.error}）`);
+  return out;
+}
+
 /** 路由：把 /__admin/api/packages/... 拆成 { name, tail } */
 function parsePackageRoute(pathname) {
   const raw = pathname.slice(`${API}/packages`.length).replace(/^\/+/, '');
@@ -1688,6 +1773,28 @@ async function handleAdmin(ctx) {
     const restartRequired = config.requiresRestart(before, after);
     ctx.state.restartRequired = restartRequired;
     return ok(res, { config: config.publicConfig(false), restartRequired, requiresRestart: restartRequired });
+  }
+
+  /* 加速镜像源「测试连通性」：只读探测，不落盘、不改配置；地址规则与 PUT /config 的 accelerators 校验一致 */
+  if (rel === '/upstream/accelerators/test' && method === 'POST') {
+    const body = await readJson(req);
+    const urls = body && body.urls !== undefined ? body.urls : [];
+    if (!Array.isArray(urls)) return fail(res, 400, 'urls 必须是地址数组（每行一个）', 'EBADACCEL');
+    if (urls.length > 8) return fail(res, 400, '最多同时测试 8 个加速镜像源', 'EBADACCEL');
+    const clean = [];
+    for (const item of urls) {
+      const s = typeof item === 'string' ? item.trim() : '';
+      if (!/^https?:\/\/[^\s/]+/i.test(s) || s.length > 300) {
+        return fail(res, 400, `加速镜像源地址不合法：${String(item)}（必须是 http(s) 地址）`, 'EBADACCEL');
+      }
+      const base = s.replace(/\/+$/, '');
+      // 与保存配置一致：忽略大小写去重（结尾斜杠已经去掉）
+      if (!clean.some(x => x.toLowerCase() === base.toLowerCase())) clean.push(base);
+    }
+    const results = await Promise.all(clean.map(u => testAccelerator(u, log)));
+    const okCount = results.filter(r => r.ok).length;
+    if (log) log.info(`加速镜像源连通性测试：${okCount} / ${results.length} 个可用`);
+    return ok(res, { results, okCount, total: results.length, testedAt: new Date().toISOString() });
   }
 
   if (rel === '/token/regenerate' && method === 'POST') {

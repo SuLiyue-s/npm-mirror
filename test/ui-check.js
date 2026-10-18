@@ -1138,6 +1138,47 @@ async function get(p, { json = false } = {}) {
         && /assertSameHost\(registryBase, res\.url \|\| url, \{ denyPrivate: denyPrivateRedirect \}\)/.test(upstreamSrc));
   }
 
+  console.log('\x1b[1m九之十、加速镜像源输入框角标 + 连通性测试（新）\x1b[0m');
+  {
+    const jsAcc2 = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
+    const cssAcc2 = fs.readFileSync(path.join(__dirname, '..', 'public', 'style.css'), 'utf8');
+    const apiAcc2 = fs.readFileSync(path.join(__dirname, '..', 'src', 'api.js'), 'utf8');
+
+    check('多行输入框角标：隐藏原生 resize 把手，右下角换成项目风格自绘角标（斜纹 + 悬停/拖动变青）',
+      /\.ta-wrap textarea\{display:block;width:100%;resize:none;/.test(cssAcc2)
+        && /\.ta-grip\{[\s\S]*?repeating-linear-gradient\(135deg,currentColor/.test(cssAcc2)
+        && /\.ta-grip\{[\s\S]*?clip-path:polygon\(100% 0,100% 100%,0 100%\)/.test(cssAcc2)
+        && /\.ta-grip:hover,\.ta-grip\.is-drag\{color:var\(--cy\)/.test(cssAcc2),
+      '角标要用项目配色（currentColor + 悬停 --cy），不能是浏览器原生灰白把手');
+
+    check('角标可拖动调整高度（Pointer 事件 + setPointerCapture，限制 64~420px）',
+      /grip\.addEventListener\('pointerdown'/.test(jsAcc2)
+        && /setPointerCapture\(e\.pointerId\)/.test(jsAcc2)
+        && /Math\.max\(64, Math\.min\(420, drag\.h \+ \(e\.clientY - drag\.y\)\)\)/.test(jsAcc2),
+      '拖动逻辑要限制最小/最大高度，避免把输入框拖没或拖出屏幕');
+
+    check('加速镜像源多行框自动清理空行与每行首尾空白（blur 时整理；测试前也按行 trim）',
+      /function normalizeLineList\(text\)/.test(jsAcc2)
+        && /\.split\(\/\\r\?\\n\/\)/.test(jsAcc2)
+        && /\.filter\(function \(s\) \{ return s\.length > 0; \}\)/.test(jsAcc2)
+        && /ta\.addEventListener\('blur', function \(\)/.test(jsAcc2),
+      '防止误打的空行/空格被当地址保存');
+
+    check('「测试连通性」按钮：把每行地址提交到 POST /upstream/accelerators/test 并逐源展示可用/不可用',
+      /text: '测试连通性'/.test(jsAcc2)
+        && /api\('\/upstream\/accelerators\/test', \{ method: 'POST', body: \{ urls: lines \}/.test(jsAcc2)
+        && /class: 'acc-row ' \+ \(r\.ok \? 'is-ok' : 'is-bad'\)/.test(jsAcc2),
+      '结果要逐源展示，可用/不可用分别用 is-ok / is-bad 样式');
+
+    check('后端连通性测试接口：只读探测元数据 + 测试包 tarball（HEAD 失败用 Range 兜底），返回中文原因',
+      /rel === '\/upstream\/accelerators\/test' && method === 'POST'/.test(apiAcc2)
+        && /async function testAccelerator\(rawUrl, log\)/.test(apiAcc2)
+        && /application\/vnd\.npm\.install-v1\+json/.test(apiAcc2)
+        && /r\.status === 403 \|\| r\.status === 405 \|\| r\.status === 501/.test(apiAcc2)
+        && /元数据不可用：/.test(apiAcc2) && /tarball 不可用：/.test(apiAcc2),
+      '接口只做只读探测，不改配置；地址规则与保存配置一致');
+  }
+
   console.log('\x1b[1m十之五、概览页「上游与来源分布」条形图渲染\x1b[0m');
   {
     const jsBars = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');

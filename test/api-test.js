@@ -1617,6 +1617,65 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
       restore.status === 200, `status=${restore.status}`);
   }
 
+  // ---------------------------------------------------------------- 加速镜像源连通性测试
+  section('五之十一、加速镜像源连通性测试（POST /upstream/accelerators/test）');
+  {
+    const http = require('node:http');
+    const mkAccelSrv = (handler) => new Promise((resolve) => {
+      const srv = http.createServer(handler);
+      srv.listen(0, '127.0.0.1', () => resolve({ srv, base: `http://127.0.0.1:${srv.address().port}` }));
+    });
+    const msDoc = JSON.stringify({ name: 'ms', 'dist-tags': { latest: '2.1.3' }, versions: { '2.1.3': { name: 'ms', version: '2.1.3' } } });
+    const msBytes = Buffer.from('fake-ms-tarball-' + Date.now());
+    const goodSrv = await mkAccelSrv((req, res) => {
+      if (req.url === '/ms') { res.writeHead(200, { 'content-type': 'application/json' }); res.end(msDoc); return; }
+      if (req.url === '/ms/-/ms-2.1.3.tgz') {
+        res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': String(msBytes.length) });
+        if (req.method === 'HEAD') { res.end(); return; }
+        res.end(msBytes); return;
+      }
+      res.writeHead(404, { 'content-type': 'text/plain' }); res.end('nope');
+    });
+    const badSrv = await mkAccelSrv((req, res) => { res.writeHead(500, { 'content-type': 'text/plain' }); res.end('boom'); });
+    // 先监听再关闭：拿到一个确定没人监听的端口，验证「连接被拒绝」类错误也能给中文原因
+    const tmpSrv = await mkAccelSrv((req, res) => { res.writeHead(200); res.end('x'); });
+    const closedPort = new URL(tmpSrv.base).port;
+    await new Promise((r) => tmpSrv.srv.close(r));
+    try {
+      const rEmpty = await api('/__admin/api/upstream/accelerators/test', { method: 'POST', body: { urls: [] } });
+      check('连通性测试接口：空列表返回 200 与空结果',
+        rEmpty.status === 200 && Array.isArray(rEmpty.json.data.results) && rEmpty.json.data.results.length === 0,
+        `status=${rEmpty.status} ${rEmpty.text.slice(0, 120)}`);
+
+      const rBadType = await api('/__admin/api/upstream/accelerators/test', { method: 'POST', body: { urls: 'x' } });
+      check('连通性测试接口：urls 不是数组时 400', rBadType.status === 400 && /数组/.test(rBadType.text), `status=${rBadType.status}`);
+
+      const rBadUrl = await api('/__admin/api/upstream/accelerators/test', { method: 'POST', body: { urls: ['ftp://mirror.example.com/npm'] } });
+      check('连通性测试接口：非 http(s) 地址 400（与保存配置的校验一致）', rBadUrl.status === 400 && /http\(s\)/.test(rBadUrl.text), `status=${rBadUrl.status}`);
+
+      const rMany = await api('/__admin/api/upstream/accelerators/test', { method: 'POST', body: { urls: Array.from({ length: 9 }, (_, i) => `http://mirror-${i}.example.com/npm`) } });
+      check('连通性测试接口：超过 8 个地址时 400', rMany.status === 400 && /8 个/.test(rMany.text), `status=${rMany.status}`);
+
+      const rMixed = await api('/__admin/api/upstream/accelerators/test', {
+        method: 'POST',
+        body: { urls: [goodSrv.base, badSrv.base, `http://127.0.0.1:${closedPort}`, goodSrv.base + '/'] },
+        timeoutMs: 60000,
+      });
+      const results = (rMixed.json && rMixed.json.data && rMixed.json.data.results) || [];
+      check('连通性测试接口：可用的源返回 ok=true（元数据与 tarball 探测都通过、带耗时）',
+        rMixed.status === 200 && results.length === 3 && results[0].ok === true && results[0].meta.ok === true && results[0].tarball.ok === true && results[0].ms >= 0,
+        `status=${rMixed.status} len=${results.length} ${rMixed.text.slice(0, 160)}`);
+      check('连通性测试接口：坏源返回 ok=false 并给出中文原因（HTTP 500 / 连接失败）',
+        results.length === 3 && results[1].ok === false && /元数据不可用/.test(results[1].error || '')
+          && results[2].ok === false && /连接被拒绝|超时|网络不可达|域名解析失败|证书/.test(results[2].error || ''),
+        `bad=${JSON.stringify(results[1] && results[1].error)} closed=${JSON.stringify(results[2] && results[2].error)}`);
+      check('连通性测试接口：忽略大小写去重、结尾斜杠视为同一地址',
+        results.length === 3 && rMixed.json.data.total === 3, `total=${rMixed.json && rMixed.json.data && rMixed.json.data.total}`);
+    } finally {
+      goodSrv.srv.close(); badSrv.srv.close();
+    }
+  }
+
   // ---------------------------------------------------------------- 离线包
   section('六、离线包导出 / 导入（迁移用）');
   let bundleFile = null;
@@ -3088,11 +3147,13 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
   // ---------------------------------------------------------------- 缓存导入
   section('八、从本机 npm 缓存导入（离线补包）');
   {
-    const scan = await api('/__admin/api/npmcache/scan', { timeoutMs: 300000 });
+    // anyRegistry=1：本机缓存可能是用别的 registry 产生的（本项目默认 npmjs，而缓存常来自 npmmirror），
+    // 自检用「任意来源」模式，避免换配置就扫出 0 个包、后续缓存导入用例被静默跳过。
+    const scan = await api('/__admin/api/npmcache/scan?anyRegistry=1', { timeoutMs: 300000 });
     const d = scan.json && scan.json.data;
     check('GET /npmcache/scan 扫描本机 npm 缓存', scan.status === 200 && d && typeof d.total === 'number', `status=${scan.status} total=${d && d.total} dir=${d && d.cacheDir}`);
     // progress=1：缓存扫描也改成长任务，前端据此显示「已检查 N / M 个索引文件、发现 X 个包」而不是干等
-    const scanTask = await api('/__admin/api/npmcache/scan?refresh=1&progress=1', { timeoutMs: 60000 });
+    const scanTask = await api('/__admin/api/npmcache/scan?refresh=1&progress=1&anyRegistry=1', { timeoutMs: 60000 });
     const st = (scanTask.json && scanTask.json.data) || {};
     check('POST /npmcache/scan?refresh=1&progress=1 立即返回 async:true + taskId',
       scanTask.status === 200 && st.async === true && !!st.taskId, `status=${scanTask.status} taskId=${st.taskId}`);

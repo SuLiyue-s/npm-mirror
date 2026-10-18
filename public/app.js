@@ -4189,7 +4189,7 @@
     {
       title: '上游', en: 'UPSTREAM', fields: [
         { k: 'upstream.registry', label: '上游 registry', type: 'text' },
-        { k: 'upstream.accelerators', label: '加速镜像源', type: 'lines', hint: '每行一个加速镜像源地址（最多 8 个，填 http(s) 地址，例如 npmmirror 的公共源）。包版本元数据仍从上游源获取；下载 tarball 时先并行探测这些镜像，优先走「有该版本且响应最快」的镜像，所有镜像都没有这个版本再回上游源。' },
+        { k: 'upstream.accelerators', label: '加速镜像源', type: 'lines', hint: '每行一个加速镜像源地址（最多 8 个，填 http(s) 地址，例如 npmmirror 的公共源）。包版本元数据仍从上游源获取；下载 tarball 时先并行探测这些镜像，优先走「有该版本且响应最快」的镜像，所有镜像都没有这个版本再回上游源。保存时会自动删除空行并去掉每行首尾空白；可用「测试连通性」检查每个源是否可用（只读探测元数据与测试包 tarball）。' },
         { k: 'upstream.timeoutMs', label: '超时（毫秒）', type: 'number' },
         { k: 'upstream.retries', label: '重试次数', type: 'number' },
         { k: 'upstream.concurrency', label: '「补 tarball」并发下载数', type: 'number', hint: '同时下载几个 tarball，1~32，默认 6；太大可能被上游限速或占用较多内存。也可在「包管理」页选择条里直接改。' },
@@ -4263,6 +4263,86 @@
       syncFillConc();
       setSideHint('READY');
     }, function (e) { setSideHint('ERROR'); handleErr(e); }).catch(function () {});
+  }
+
+  /* 「每行一个」的多行输入框：隐藏浏览器原生 resize 角标，右下角换成项目风格的自绘角标。
+   * - blur 时自动整理：删除空行、去掉每行首尾空白（防止输入误打）；
+   * - 角标可上下拖动调整高度（限制 64~420px）。
+   * 返回 { wrap, textarea }，wrap 是表单里实际放置的容器。 */
+  function normalizeLineList(text) {
+    return String(text || '').split(/\r?\n/).map(function (s) { return s.trim(); }).filter(function (s) { return s.length > 0; });
+  }
+
+  function mkTextarea(opts) {
+    var ta = el('textarea', { class: 'mono', 'data-cfg': opts.key, rows: opts.rows || '3', placeholder: opts.placeholder || '' });
+    var grip = el('span', { class: 'ta-grip', title: '拖动调整高度' });
+    var wrap = el('div', { class: 'ta-wrap' }, [ta, grip]);
+    ta.addEventListener('blur', function () {
+      var norm = normalizeLineList(ta.value).join('\n');
+      if (norm !== ta.value) ta.value = norm;
+    });
+    var drag = null;
+    grip.addEventListener('pointerdown', function (e) {
+      e.preventDefault();
+      drag = { y: e.clientY, h: ta.offsetHeight };
+      grip.classList.add('is-drag');
+      try { grip.setPointerCapture(e.pointerId); } catch (err) { /* 部分浏览器不支持指针捕获，忽略 */ }
+    });
+    grip.addEventListener('pointermove', function (e) {
+      if (!drag) return;
+      ta.style.height = Math.max(64, Math.min(420, drag.h + (e.clientY - drag.y))) + 'px';
+    });
+    var endDrag = function () {
+      if (!drag) return;
+      drag = null;
+      grip.classList.remove('is-drag');
+    };
+    grip.addEventListener('pointerup', endDrag);
+    grip.addEventListener('pointercancel', endDrag);
+    return { wrap: wrap, textarea: ta };
+  }
+
+  /* 加速镜像源「测试连通性」：把 textarea 里的每个地址提交给服务端做只读探测
+   * （元数据是否可读 + 「ms」测试包的 tarball 能否下载），逐源展示可用/不可用、耗时与原因。 */
+  function mkAccelTester(ta) {
+    var list = el('div', { class: 'acc-results', hidden: true });
+    var sum = el('span', { class: 'acc-sum', text: '未测试' });
+    var btn = el('button', { class: 'btn btn-xs', type: 'button', text: '测试连通性', title: '并行探测每个加速镜像源：元数据是否可读、「ms」测试包的 tarball 是否可下载' });
+    var box = el('div', { class: 'acc-test' }, [btn, sum, list]);
+    btn.addEventListener('click', function () {
+      var lines = normalizeLineList(ta.value);
+      var norm = lines.join('\n');
+      if (ta.value !== norm) ta.value = norm;   /* 顺手把空行与首尾空白清理掉 */
+      if (!lines.length) { toast('请先填写至少一个加速镜像源地址', 'warn'); return; }
+      btnBusy(btn, true, '测试中');
+      setText(sum, '正在并行探测 ' + lines.length + ' 个源…');
+      clear(list); list.hidden = true;
+      api('/upstream/accelerators/test', { method: 'POST', body: { urls: lines }, timeout: 30000 }).then(function (d) {
+        btnBusy(btn, false);
+        var results = (d && d.results) || [];
+        var okCount = results.filter(function (r) { return r.ok; }).length;
+        setText(sum, results.length ? okCount + ' / ' + results.length + ' 个源可用' : '没有可测试的地址');
+        if (!results.length) { toast('没有可测试的地址', 'warn'); return; }
+        list.hidden = false;
+        results.forEach(function (r) {
+          var detail = r.ok
+            ? '元数据 ' + ((r.meta && r.meta.ms) || 0) + 'ms · tarball ' + ((r.tarball && r.tarball.ms) || 0) + 'ms'
+            : (r.error || '不可用');
+          list.appendChild(el('div', { class: 'acc-row ' + (r.ok ? 'is-ok' : 'is-bad') }, [
+            el('span', { class: 'mk', text: r.ok ? '✓' : '✕' }),
+            el('span', { class: 'nm', text: String(r.url || '').replace(/^https?:\/\//, '') }),
+            el('span', { class: 'ms', text: ((r.ok && r.ms) || 0) + 'ms' }),
+            el('span', { class: 'why', text: detail, title: detail }),
+          ]));
+        });
+        toast(okCount === results.length ? '全部 ' + okCount + ' 个加速镜像源可用' : (results.length - okCount) + ' 个加速镜像源不可用', okCount === results.length ? 'ok' : 'warn', 6000);
+      }, function (e) {
+        btnBusy(btn, false);
+        setText(sum, '测试失败');
+        handleErr(e);
+      });
+    });
+    return box;
   }
 
   function paintConfig() {
@@ -4339,16 +4419,15 @@
           item.appendChild(el('div', { class: 'row-inline' }, [input, eye, cp, reset]));
           item.appendChild(el('p', { class: 'hint', text: '令牌只能通过「重置令牌」修改；未显示时无法复制（先点「显示」加载当前令牌）。' }));
         } else if (f.type === 'lines') {
-          /* 多行文本（每行一个地址）：保存时拆成数组上报，对应后端 config.sanitize 的数组字段 */
+          /* 多行文本（每行一个地址）：保存时拆成数组上报，对应后端 config.sanitize 的数组字段。
+           * 加速镜像源额外提供「测试连通性」按钮。 */
           var lines = Array.isArray(val) ? val : [];
-          input = el('textarea', {
-            class: 'mono', 'data-cfg': f.k, rows: '3',
-            placeholder: '每行一个加速镜像源地址（http(s)）',
-            style: 'width:100%;min-height:64px;resize:vertical'
-          });
-          input.value = lines.join('\n');
+          var ta = mkTextarea({ key: f.k, rows: '3', placeholder: '每行一个加速镜像源地址（http(s)）' });
+          ta.textarea.value = lines.join('\n');
+          input = ta.textarea;
           item.appendChild(el('label', { text: f.label }));
-          item.appendChild(input);
+          item.appendChild(ta.wrap);
+          if (f.k === 'upstream.accelerators') item.appendChild(mkAccelTester(ta.textarea));
         } else if (f.type === 'number') {
           input = el('input', { type: 'number', class: 'mono', 'data-cfg': f.k, value: val === undefined || val === null ? '' : String(val) });
           item.appendChild(el('label', { text: f.label }));

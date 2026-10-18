@@ -488,6 +488,40 @@ select{cursor:pointer;appearance:none;padding-right:26px;
   background-size:5px 5px,5px 5px;background-repeat:no-repeat;}
 textarea{resize:vertical;min-height:66px;line-height:1.6}
 
+/* 「每行一个」的多行输入框（加速镜像源）：原生右下角 resize 把手是浏览器系统绘制，
+   深色主题里是一块很扎眼的浅色角标；这里隐藏原生把手，换成项目风格的自绘角标：
+   右下角三角形内是斜纹（currentColor 跟随主题），悬停/拖动时变青色，并支持拖动调整高度。 */
+.ta-wrap{position:relative;width:100%}
+.ta-wrap textarea{display:block;width:100%;resize:none;min-height:64px;max-height:420px;overflow:auto;padding-bottom:16px}
+.ta-grip{
+  position:absolute;right:3px;bottom:3px;width:13px;height:13px;cursor:ns-resize;
+  color:var(--line-3);touch-action:none;opacity:.85;
+  background-image:repeating-linear-gradient(135deg,currentColor 0 1px,transparent 1px 4px);
+  clip-path:polygon(100% 0,100% 100%,0 100%);
+  transition:color .15s,opacity .15s;
+}
+.ta-grip:hover,.ta-grip.is-drag{color:var(--cy);opacity:1}
+
+/* 加速镜像源「测试连通性」：按钮 + 汇总 + 逐源结果（可用/不可用、耗时、失败原因） */
+.acc-test{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:6px}
+.acc-test .acc-sum{font-family:var(--mono);font-size:10.5px;color:var(--txt-dim)}
+.acc-test .acc-results{flex:1 1 100%;display:flex;flex-direction:column;gap:3px;margin-top:2px}
+.acc-test .acc-results[hidden]{display:none!important}
+.acc-row{
+  display:flex;align-items:baseline;gap:8px;padding:3px 7px;
+  border:1px solid var(--line);border-radius:var(--r);background:#0a1016;
+  font-size:11px;line-height:1.5;
+}
+.acc-row .mk{flex:none;width:12px;font-weight:700;text-align:center}
+.acc-row .nm{flex:1;min-width:0;font-family:var(--mono);font-size:10.5px;color:var(--txt-hi);overflow-wrap:anywhere}
+.acc-row .ms{flex:none;font-family:var(--mono);font-size:10px;color:var(--txt-dim);font-variant-numeric:tabular-nums}
+.acc-row .why{flex:none;max-width:48%;color:var(--txt-dim);font-size:10.5px;overflow-wrap:anywhere}
+.acc-row.is-ok{border-color:rgba(46,230,196,.28)}
+.acc-row.is-ok .mk{color:var(--cy)}
+.acc-row.is-bad{border-color:rgba(255,95,86,.28)}
+.acc-row.is-bad .mk{color:var(--red)}
+.acc-row.is-bad .why{color:var(--am)}
+
 /* 去掉浏览器原生小部件（搜索框的清除叉、数字框的上下箭头），统一成项目风格 */
 input[type=search]::-webkit-search-decoration,
 input[type=search]::-webkit-search-cancel-button,
