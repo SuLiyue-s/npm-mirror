@@ -7,7 +7,7 @@ const crypto = require('node:crypto');
 const os = require('node:os');
 const {
   integrityToCachePath, ensureDir, readJson, writeJsonAtomic, rootPath, compareVersions,
-  isSafePkgName, isSafeVersion,
+  isSafePkgName, isSafeVersion, mapLimit,
 } = require('./util');
 
 let scanState = null;                   // { cacheDir, registry, scannedAt, packages:[{...,__contentPath}] }
@@ -15,7 +15,6 @@ let scanState = null;                   // { cacheDir, registry, scannedAt, pack
 const SCAN_STATE_VERSION = 2;
 
 function stateFile() { return rootPath('data', 'npmcache-scan.json'); }
-function yieldNow() { return new Promise(r => setImmediate(r)); }
 
 /** 用户主目录：环境变量缺失时回退 os.homedir()；都取不到返回 ''。
  *  绝不能让空字符串参与 path.join，否则会变成相对路径、误读「当前目录下的 .npmrc」。 */
@@ -112,6 +111,18 @@ function walkFiles(dir, out = [], depth = 0) {
   return out;
 }
 
+async function walkFilesAsync(dir, out = [], depth = 0) {
+  if (depth > 6) return out;
+  let entries = [];
+  try { entries = await fsp.readdir(dir, { withFileTypes: true }); } catch { return out; }
+  for (const e of entries) {
+    const full = path.join(dir, e.name);
+    if (e.isDirectory()) await walkFilesAsync(full, out, depth + 1);
+    else out.push(full);
+  }
+  return out;
+}
+
 function safeUrl(u) { try { return new URL(u); } catch { return null; } }
 function hostOf(registry) { const u = safeUrl(registry); return u ? u.host : ''; }
 
@@ -146,7 +157,7 @@ function lastScan() { return publicScan(loadScanState()); }
  * 扫描本机 npm 缓存，列出可以离线导入的包。
  * 使用异步读取 + 定期让出事件循环，扫描期间镜像服务仍然可用。
  */
-async function scanCache({ cacheDir, registry, logger, anyRegistry = false, onProgress } = {}) {
+async function scanCache({ cacheDir, registry, logger, anyRegistry = false, onProgress, concurrency = 8 } = {}) {
   const dir = resolveCacheDir(cacheDir);
   if (!dir) {
     const err = new Error('无法确定 npm 缓存目录：HOME/USERPROFILE 环境变量缺失且系统主目录不可用，请在「配置」页手动指定缓存目录');
@@ -161,17 +172,22 @@ async function scanCache({ cacheDir, registry, logger, anyRegistry = false, onPr
     throw err;
   }
   const wantHost = anyRegistry ? '' : hostOf(registry);
-  const files = walkFiles(indexDir);
-  const found = new Map();
+  const files = await walkFilesAsync(indexDir);
+  const conc = Math.max(1, Math.min(64, Math.floor(Number(concurrency)) || 8));
   let scanned = 0;
   let tampered = 0;
+  const foundNow = new Set();
 
-  for (const f of files) {
+  /* 第一阶段（并发读索引）：原来是一个文件一个文件串行 await，npm 缓存大时（几万个索引文件）
+   * 扫描要等很久。现在按 concurrency 路并发读索引文件并校验元数据内容，镜像服务在扫描期间仍可用。
+   * 并发下同一个包可能被多个索引条目指向，所以先按文件顺序收候选、最后顺序去重，
+   * 保证「先扫到的为准」，扫描结果与串行版本一致、不会时快时慢。 */
+  const hits = await mapLimit(files, conc, async (f) => {
     let text = '';
-    try { text = await fsp.readFile(f, 'utf8'); } catch { continue; }
+    try { text = await fsp.readFile(f, 'utf8'); } catch { return null; }
     scanned++;
-    if (onProgress && scanned % 2000 === 0) onProgress({ scanned, total: files.length, found: found.size });
-    if (scanned % 500 === 0) await yieldNow();
+    const out = [];
+    const seenInFile = new Set();
     for (const line of text.split('\n')) {
       if (!line) continue;
       const tab = line.indexOf('\t');
@@ -190,35 +206,48 @@ async function scanCache({ cacheDir, registry, logger, anyRegistry = false, onPr
       if (wantHost && u.host !== wantHost) continue;
       let pkgName = '';
       try { pkgName = decodeURIComponent(u.pathname.replace(/^\/+/, '')); } catch { continue; }
-      if (!isSafePkgName(pkgName)) continue;
-      if (found.has(pkgName)) continue;
+      if (!isSafePkgName(pkgName) || seenInFile.has(pkgName)) continue;
+      seenInFile.add(pkgName);
       const contentPath = integrityToCachePath(dir, entry.integrity);
-      if (!contentPath || !fs.existsSync(contentPath)) continue;
+      if (!contentPath) continue;
       let raw = null;
       try { raw = await fsp.readFile(contentPath); } catch { continue; }
       // 缓存内容可能被篡改：必须与索引记录里的 integrity 一致才认可
       if (!verifyIntegrity(raw, entry.integrity)) {
         tampered++;
+        foundNow.add(pkgName);
         if (logger) logger.warn(`跳过完整性校验失败的 npm 缓存条目：${pkgName}`);
         continue;
       }
       let data = null;
       try { data = JSON.parse(raw.toString('utf8')); } catch { continue; }
       if (!data || !data.versions || !data.name) continue;
-      if (!isSafePkgName(data.name) || found.has(data.name)) continue;
-      found.set(data.name, { packument: data, contentPath, integrity: entry.integrity });
+      if (!isSafePkgName(data.name)) continue;
+      foundNow.add(data.name);
+      out.push({ name: data.name, packument: data, contentPath, integrity: entry.integrity });
+    }
+    if (onProgress && scanned % 2000 === 0) onProgress({ scanned, total: files.length, found: foundNow.size });
+    return out;
+  });
+  const found = new Map();
+  for (const list of hits) {
+    if (!list) continue;
+    for (const it of list) {
+      if (found.has(it.name)) continue;
+      found.set(it.name, it);
     }
   }
+  if (onProgress) onProgress({ scanned, total: files.length, found: found.size });
 
-  const packages = [];
-  let bytes = 0;
-  for (const [name, rec] of found) {
+  /* 第二阶段（并发校验 tarball）：逐包读取本地缓存里的每个版本 tarball 并校验 integrity，
+   * 包与包之间并发执行（原来逐包逐版本全串行）。 */
+  const rows = await mapLimit(Array.from(found.entries()), conc, async ([name, rec]) => {
     const versions = Object.keys(rec.packument.versions || {});
     let avail = 0, size = 0, badTarballs = 0;
     for (const v of versions) {
       const dist = rec.packument.versions[v].dist || {};
       const p = integrityToCachePath(dir, dist.integrity);
-      if (!p || !fs.existsSync(p)) continue;
+      if (!p) continue;
       let buf = null;
       try { buf = await fsp.readFile(p); } catch { buf = null; }
       // 扫描阶段就校验 tarball 的 integrity：否则「扫描说有 N 个可导入」与「导入只成功 M 个」口径不一致
@@ -231,8 +260,7 @@ async function scanCache({ cacheDir, registry, logger, anyRegistry = false, onPr
       avail++;
     }
     const latest = (rec.packument['dist-tags'] && rec.packument['dist-tags'].latest) || versions.sort(compareVersions).pop();
-    bytes += size;
-    packages.push({
+    return {
       name,
       version: latest || '',
       versionCount: versions.length,
@@ -244,8 +272,9 @@ async function scanCache({ cacheDir, registry, logger, anyRegistry = false, onPr
       __contentPath: rec.contentPath,
       // 导入时要用它重新校验元数据完整性（publicScan 会剥掉）
       __integrity: rec.integrity,
-    });
-  }
+    };
+  });
+  const packages = rows.filter(Boolean);
   packages.sort((a, b) => b.sizeBytes - a.sizeBytes || a.name.localeCompare(b.name));
   scanState = {
     version: SCAN_STATE_VERSION,
@@ -276,12 +305,12 @@ async function scanCache({ cacheDir, registry, logger, anyRegistry = false, onPr
  *                      versions, tarballs, sizeBytes, reason, error, done, total }
  * 传 isCanceled 后，每处理一个包前都会检查一次；返回 true 则停下，并把 result.canceled 置为 true。
  */
-async function importFromCache({ store, cacheDir, names = [], all = false, overwrite = false, onlyWithTarball = true, logger, onProgress, isCanceled }) {
+async function importFromCache({ store, cacheDir, names = [], all = false, overwrite = false, onlyWithTarball = true, logger, onProgress, isCanceled, concurrency = 8 }) {
   const dir = resolveCacheDir(cacheDir);
   let state = loadScanState();
   // 旧版本扫描结果没有 __integrity / 未做 tarball 校验，或缓存目录只是写法不同，都需要重新扫描
   if (!state || !sameCacheDir(state.cacheDir, dir) || state.version !== SCAN_STATE_VERSION || state.packages.some(p => !p.__integrity)) {
-    await scanCache({ cacheDir: dir, registry: '', logger, anyRegistry: true });
+    await scanCache({ cacheDir: dir, registry: '', logger, anyRegistry: true, concurrency });
     state = scanState;
   }
   const wanted = all ? state.packages.map(p => p.name) : names;
@@ -293,107 +322,121 @@ async function importFromCache({ store, cacheDir, names = [], all = false, overw
     if (!onProgress) return;
     try { onProgress(e); } catch { /* 进度回调异常不能打断导入 */ }
   };
+  const conc = Math.max(1, Math.min(64, Math.floor(Number(concurrency)) || 8));
+  const infoByName = new Map();
+  for (const p of state.packages) if (!infoByName.has(p.name)) infoByName.set(p.name, p);
   let done = 0;
-  for (const name of wanted) {
-    if (isCanceled && isCanceled()) { result.canceled = true; break; }
+
+  /* 包级并发：每个包只锁自己（store.withLock），跨包互不阻塞；包内仍按版本顺序读盘。
+   * 原来逐包串行、包内又用同步 readFileSync，一次只能用一个核读一个文件；
+   * 现在并发读盘 + 同步写入，等待磁盘的时间被多路复用。结果先按输入下标收集，
+   * 最后按原顺序汇总，保证 imported/failed/skipped 顺序稳定。 */
+  const settled = await mapLimit(Array.from(wanted), conc, async (rawName, index) => {
+    const name = String(rawName);
+    const base = { index, name };
+    if (isCanceled && isCanceled()) { result.canceled = true; return { ...base, canceled: true }; }
     if (!isSafePkgName(name)) {
       done++;
       const bad = { status: 'skipped', versions: 0, tarballs: 0, sizeBytes: 0, reason: '非法包名，已拒绝导入' };
-      result.skipped.push({ name: String(name), reason: bad.reason });
-      if (logger) logger.warn(`从 npm 缓存导入时拒绝非法包名：${String(name)}`);
-      emit(Object.assign({ phase: 'done', name: String(name), done, total: wanted.length }, bad));
-      continue;
+      if (logger) logger.warn(`从 npm 缓存导入时拒绝非法包名：${name}`);
+      emit(Object.assign({ phase: 'done', name, done, total: wanted.length }, bad));
+      return Object.assign(base, bad);
     }
-    const info = state.packages.find(p => p.name === name);
-    let outcome = null;
+    const info = infoByName.get(name);
+    if (!info) {
+      done++;
+      const skipped = { status: 'skipped', versions: 0, tarballs: 0, sizeBytes: 0, reason: '缓存中未找到该包的元数据' };
+      emit(Object.assign({ phase: 'done', name, done, total: wanted.length }, skipped));
+      return Object.assign(base, skipped);
+    }
+    emit({ phase: 'start', name, versionTotal: Number(info.versionCount) || 0, done, total: wanted.length });
     let invalidVersions = 0;
     let invalidTarballs = 0;
-    if (!info) {
-      outcome = { status: 'skipped', versions: 0, tarballs: 0, sizeBytes: 0, reason: '缓存中未找到该包的元数据' };
-    } else {
-      emit({ phase: 'start', name, versionTotal: Number(info.versionCount) || 0, done, total: wanted.length });
-      try {
-        await store.withLock(name, async () => {
-          let packument = null;
-          if (info.__contentPath && fs.existsSync(info.__contentPath)) {
-            // 元数据同样按扫描时记录的 integrity 校验，防止被篡改的缓存直接写进镜像
-            let raw = null;
-            try { raw = fs.readFileSync(info.__contentPath); } catch { raw = null; }
-            if (raw && verifyIntegrity(raw, info.__integrity)) {
-              try { packument = JSON.parse(raw.toString('utf8')); } catch { packument = null; }
-            } else if (logger) {
-              logger.warn(`跳过完整性校验失败的缓存元数据：${name}`);
+    let outcome = null;
+    try {
+      outcome = await store.withLock(name, async () => {
+        let packument = null;
+        if (info.__contentPath) {
+          // 元数据同样按扫描时记录的 integrity 校验，防止被篡改的缓存直接写进镜像
+          let raw = null;
+          try { raw = await fsp.readFile(info.__contentPath); } catch { raw = null; }
+          if (raw && verifyIntegrity(raw, info.__integrity)) {
+            try { packument = JSON.parse(raw.toString('utf8')); } catch { packument = null; }
+          } else if (logger) {
+            logger.warn(`跳过完整性校验失败的缓存元数据：${name}`);
+          }
+        }
+        if (!packument) throw new Error('缓存中的元数据已失效或完整性校验失败，请重新扫描');
+        const local = await store.getAsync(name);
+        // 新建 packument 时清空 dist-tags，下面只写入指向真实存在版本号的 tag
+        const target = local ? local.packument : { ...packument, versions: {}, 'dist-tags': {} };
+        const files = {}; const sizes = {}; const origins = {};
+        const versionTotal = Object.keys(packument.versions || {}).length;
+        let added = 0, got = 0, seen = 0, lastEmit = 0;
+        for (const [v, manifest] of Object.entries(packument.versions)) {
+          // 版本号会参与 tarball 文件名拼接，非法版本号直接跳过（不写盘）
+          if (!isSafeVersion(v)) { invalidVersions++; continue; }
+          const dist = manifest.dist || {};
+          const p = integrityToCachePath(dir, dist.integrity);
+          let tarBuf = null;
+          if (p) {
+            try { tarBuf = await fsp.readFile(p); } catch { tarBuf = null; }
+            if (tarBuf && !verifyIntegrity(tarBuf, dist.integrity)) {
+              invalidTarballs++;
+              if (logger) logger.warn(`跳过完整性校验失败的缓存 tarball：${name}@${v}`);
+              tarBuf = null;
             }
           }
-          if (!packument) throw new Error('缓存中的元数据已失效或完整性校验失败，请重新扫描');
-          const local = store.get(name);
-          // 新建 packument 时清空 dist-tags，下面只写入指向真实存在版本号的 tag
-          const target = local ? local.packument : { ...packument, versions: {}, 'dist-tags': {} };
-          const files = {}; const sizes = {}; const origins = {};
-          const versionTotal = Object.keys(packument.versions || {}).length;
-          let added = 0, got = 0, seen = 0, lastEmit = 0;
-          for (const [v, manifest] of Object.entries(packument.versions)) {
-            // 版本号会参与 tarball 文件名拼接，非法版本号直接跳过（不写盘）
-            if (!isSafeVersion(v)) { invalidVersions++; continue; }
-            const dist = manifest.dist || {};
-            const p = integrityToCachePath(dir, dist.integrity);
-            let tarBuf = null;
-            if (p && fs.existsSync(p)) {
-              try { tarBuf = fs.readFileSync(p); } catch { tarBuf = null; }
-              if (tarBuf && !verifyIntegrity(tarBuf, dist.integrity)) {
-                invalidTarballs++;
-                if (logger) logger.warn(`跳过完整性校验失败的缓存 tarball：${name}@${v}`);
-                tarBuf = null;
-              }
-            }
-            const hasFile = !!tarBuf;
-            seen++;
-            if (onlyWithTarball && !hasFile) continue;
-            if (target.versions[v] && !overwrite && store.hasTarball(name, v)) continue;
-            target.versions[v] = manifest;
-            if (hasFile) {
-              const info2 = store.putTarball(name, v, tarBuf);
-              files[v] = info2.file; sizes[v] = info2.sizeBytes; origins[v] = 'npm-cache';
-              got++;
-            }
-            added++;
-            const now = Date.now();
-            if (now - lastEmit >= 120) { lastEmit = now; emit({ phase: 'version', name, versionDone: seen, versionTotal }); }
+          const hasFile = !!tarBuf;
+          seen++;
+          if (onlyWithTarball && !hasFile) continue;
+          if (target.versions[v] && !overwrite && store.hasTarball(name, v)) continue;
+          target.versions[v] = manifest;
+          if (hasFile) {
+            const info2 = store.putTarball(name, v, tarBuf);
+            files[v] = info2.file; sizes[v] = info2.sizeBytes; origins[v] = 'npm-cache';
+            got++;
           }
-          if (added === 0) {
-            // 跳过原因要明确：是本地已全有、缓存里没 tarball，还是 tarball 校验失败（疑似被篡改）
-            let reason;
-            if (invalidTarballs > 0) reason = `没有可导入的版本（${invalidTarballs} 个 tarball 完整性校验失败，疑似被篡改）`;
-            else if (onlyWithTarball && !got) reason = local ? '本地已有全部版本' : '缓存中没有通过完整性校验的 tarball';
-            else reason = local ? '本地已有全部版本' : '没有可导入的版本';
-            outcome = { status: 'skipped', versions: 0, tarballs: 0, sizeBytes: 0, reason };
-            return;
-          }
-          for (const [tag, v] of Object.entries(packument['dist-tags'] || {})) {
-            if (!target.versions[v]) continue; // 悬空 dist-tag 丢弃
-            target['dist-tags'] = target['dist-tags'] || {};
-            if (!target['dist-tags'][tag] || overwrite) target['dist-tags'][tag] = v;
-          }
-          store.save(name, target, {
-            source: (local && local.meta && local.meta.source) || 'cache',
-            description: target.description || packument.description || '',
-            files, sizes, origins,
-          });
-          outcome = { status: 'imported', versions: added, tarballs: got, sizeBytes: Object.values(sizes).reduce((a, b) => a + b, 0) };
+          added++;
+          const now = Date.now();
+          if (now - lastEmit >= 120) { lastEmit = now; emit({ phase: 'version', name, versionDone: seen, versionTotal }); }
+        }
+        if (added === 0) {
+          // 跳过原因要明确：是本地已全有、缓存里没 tarball，还是 tarball 校验失败（疑似被篡改）
+          let reason;
+          if (invalidTarballs > 0) reason = `没有可导入的版本（${invalidTarballs} 个 tarball 完整性校验失败，疑似被篡改）`;
+          else if (onlyWithTarball && !got) reason = local ? '本地已有全部版本' : '缓存中没有通过完整性校验的 tarball';
+          else reason = local ? '本地已有全部版本' : '没有可导入的版本';
+          return { status: 'skipped', versions: 0, tarballs: 0, sizeBytes: 0, reason };
+        }
+        for (const [tag, v] of Object.entries(packument['dist-tags'] || {})) {
+          if (!target.versions[v]) continue; // 悬空 dist-tag 丢弃
+          target['dist-tags'] = target['dist-tags'] || {};
+          if (!target['dist-tags'][tag] || overwrite) target['dist-tags'][tag] = v;
+        }
+        store.save(name, target, {
+          source: (local && local.meta && local.meta.source) || 'cache',
+          description: target.description || packument.description || '',
+          files, sizes, origins,
         });
-      } catch (e) {
-        outcome = { status: 'failed', versions: 0, tarballs: 0, sizeBytes: 0, error: e.message };
-      }
+        return { status: 'imported', versions: added, tarballs: got, sizeBytes: Object.values(sizes).reduce((a, b) => a + b, 0) };
+      });
+    } catch (e) {
+      outcome = { status: 'failed', versions: 0, tarballs: 0, sizeBytes: 0, error: e.message };
     }
-    result.invalidVersions += invalidVersions;
-    result.invalidTarballs += invalidTarballs;
     done++;
-    if (outcome.status === 'imported') result.imported.push({ name, versions: outcome.versions, tarballs: outcome.tarballs, sizeBytes: outcome.sizeBytes });
-    else if (outcome.status === 'failed') result.failed.push({ name, error: outcome.error });
-    else result.skipped.push({ name, reason: outcome.reason });
-    result.tarballs += outcome.tarballs || 0;
     emit(Object.assign({ phase: 'done', name, done, total: wanted.length }, outcome));
-    if (done % 20 === 0) await yieldNow();
+    return Object.assign(base, { invalidVersions, invalidTarballs }, outcome);
+  });
+
+  for (const it of settled) {
+    if (!it || it.canceled) continue;
+    result.invalidVersions += it.invalidVersions || 0;
+    result.invalidTarballs += it.invalidTarballs || 0;
+    if (it.status === 'imported') result.imported.push({ name: it.name, versions: it.versions, tarballs: it.tarballs, sizeBytes: it.sizeBytes });
+    else if (it.status === 'failed') result.failed.push({ name: it.name, error: it.error });
+    else if (it.status === 'skipped') result.skipped.push({ name: it.name, reason: it.reason });
+    result.tarballs += it.tarballs || 0;
   }
   if (logger) {
     const extra = [

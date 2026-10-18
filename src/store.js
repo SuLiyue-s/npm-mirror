@@ -7,7 +7,7 @@ const path = require('node:path');
 const {
   ensureDir, readJson, writeJsonAtomic, writeFileAtomic,
   safePkgDir, pkgBaseName, integrityOf, sha1hex, nowIso, compareVersions,
-  isSafePkgName, isSafeVersion,
+  isSafePkgName, isSafeVersion, mapLimit,
 } = require('./util');
 
 /** 判断 child 是否位于 base 目录内（同盘、规范化后比较，用于杜绝路径穿越） */
@@ -33,9 +33,22 @@ class Store {
   init() {
     ensureDir(this.dir);
     this.reloadIndex();
+    this.startFlushTimer();
+    return this.index.size;
+  }
+
+  /** createServer 用：启动时并发读取所有 meta.json，把索引加载时间压到原来的几分之一。
+   *  只在开始监听端口之前调用，不影响在线服务；同步 init() 保留给测试/CLI 单进程场景。 */
+  async initAsync() {
+    ensureDir(this.dir);
+    await this.reloadIndexAsync();
+    this.startFlushTimer();
+    return this.index.size;
+  }
+
+  startFlushTimer() {
     this.flushTimer = setInterval(() => this.flushDirty(), 5000);
     if (this.flushTimer.unref) this.flushTimer.unref();
-    return this.index.size;
   }
 
   close() {
@@ -53,6 +66,20 @@ class Store {
       const meta = readJson(path.join(this.dir, d, 'meta.json'), null);
       if (meta && meta.name) this.index.set(meta.name, meta);
     }
+    return this.index.size;
+  }
+
+  /** reloadIndex 的并发版：1500+ 个包的 meta.json 并发读（原来逐个同步读，启动要多等几百毫秒） */
+  async reloadIndexAsync() {
+    this.index.clear();
+    let dirs = [];
+    try {
+      dirs = (await fsp.readdir(this.dir, { withFileTypes: true })).filter(d => d.isDirectory()).map(d => d.name);
+    } catch { dirs = []; }
+    const metas = await mapLimit(dirs, 32, async (d) => {
+      try { return JSON.parse(await fsp.readFile(path.join(this.dir, d, 'meta.json'), 'utf8')); } catch { return null; }
+    });
+    for (const meta of metas) if (meta && meta.name) this.index.set(meta.name, meta);
     return this.index.size;
   }
 

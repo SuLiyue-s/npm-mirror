@@ -304,7 +304,7 @@ commands.start = async function () {
   if (flags['no-open']) cliOpts['no-open'] = true;
 
   const { createServer } = require('./src/server');
-  const app = createServer({ cliOpts });
+  const app = await createServer({ cliOpts });
   try {
     await app.start();
   } catch (e) {
@@ -611,6 +611,8 @@ commands.export = async function () {
       addedFrom,
       addedTo,
       concurrency: Math.max(1, Number(config.get().storage.bundleExportConcurrency) || 4),
+      // 导出前的收集/统计阶段并发读盘
+      localScanConcurrency: Math.max(1, Number(config.get().storage.localScanConcurrency) || 8),
       onProgress: (p) => {
         if (!flags.verbose) return;
         if (p.phase === 'deps-fetch') log(`  …${p.message || '正在自动补齐缺失依赖…'}`);
@@ -659,6 +661,8 @@ commands.import = async function () {
         const r = await bundle.importBundle({
           store, file: abs, overwrite, logger: lg,
           concurrency: Math.max(1, Number(config.get().storage.bundleImportConcurrency) || 4),
+          // 解包后扫描包目录的并发读盘
+          scanConcurrency: Math.max(1, Number(config.get().storage.localScanConcurrency) || 8),
           onProgress: (p) => {
             let pct = -1;
             if (p.phase === 'extract' && p.totalBytes > 0) pct = Math.floor((p.bytes / p.totalBytes) * 100);
@@ -704,6 +708,7 @@ commands['scan-cache'] = async function () {
     registry,
     anyRegistry,
     logger: lg,
+    concurrency: Math.max(1, Number(cfg.storage.localScanConcurrency) || 8),
     onProgress: (p) => {
       process.stdout.write(`\r  已扫描 ${p.scanned}/${p.total} 个索引文件，命中 ${p.found} 个包…`.padEnd(50));
     },
@@ -727,6 +732,7 @@ commands['import-cache'] = async function () {
       overwrite: !!flags.overwrite,
       onlyWithTarball: !flags['include-empty'],
       logger: lg,
+      concurrency: Math.max(1, Number(config.get().storage.localScanConcurrency) || 8),
       onProgress: (p) => {
         // npmcache 的事件：导入阶段是 {phase:'start'|'version'|'done', done,total,...}，没有 p.phase 的旧进度字段
         let text = null;

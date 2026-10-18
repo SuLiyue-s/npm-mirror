@@ -40,6 +40,10 @@ function defaults() {
       bundleUploadChunkMB: 8, bundleUploadConcurrency: 4,
       // 解包（解压 + 写盘）的并发路数：与「导入包」的并发分开，默认 8。
       bundleImportExtractConcurrency: 8,
+      // 全项目「本地扫描 / 统计」类批处理的读盘并发：补 tarball 的前期规划、导出备份的统计、
+      // 依赖闭包扫描、npm 缓存扫描/导入、离线包导入后的包扫描等。默认 8（1-64）：
+      // 机械硬盘上太高反而抖动，SSD + 多核可调到接近逻辑处理器数。
+      localScanConcurrency: 8,
     },
     log: { level: 'info', maxDays: 7 },
     ui: { title: '私人 npm 镜像源' },
@@ -146,6 +150,8 @@ function sanitize(input) {
       bundleUploadConcurrency: clampInt(st.bundleUploadConcurrency, 1, 64, 4),
       // 解包（解压 + 写盘）的并发路数：1-64，默认 8；机械硬盘上写并发过高反而慢，可调低。
       bundleImportExtractConcurrency: clampInt(st.bundleImportExtractConcurrency, 1, 64, 8),
+      // 「本地扫描/统计」类批处理（补 tarball 规划、导出统计、依赖闭包、缓存扫描/导入）的读盘并发：1-64，默认 8。
+      localScanConcurrency: clampInt(st.localScanConcurrency, 1, 64, 8),
     },
     log: {
       level: LOG_LEVELS.includes(level) ? level : 'info',

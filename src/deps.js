@@ -159,7 +159,7 @@ function chosenAny(chosen, name) {
 
 /** 取元数据：persist=true 落盘（走 registry，后续下载要用），false 纯读 */
 async function loadPackument(ctx, name, { persist, cache }) {
-  const local = ctx.store.get(name);
+  const local = await ctx.store.getAsync(name);
   const hadPkg = !!local;
   const hadVersions = new Set(local && local.packument && local.packument.versions
     ? Object.keys(local.packument.versions) : []);

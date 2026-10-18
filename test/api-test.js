@@ -1473,8 +1473,10 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
         }[name];
         return versions ? { packument: { name, versions } } : null;
       },
+      // collectDepClosure 本轮起改成了 async + mapLimit 并发：同样给它一个异步读接口（真实 Store 已有）
+      async getAsync(name) { return this.get(name); },
     };
-    const cls = bundleMod.collectDepClosure(fake, ['a']);
+    const cls = await bundleMod.collectDepClosure(fake, ['a']);
     check('collectDepClosure 递归收集依赖闭包（a → b → c，根包不算在内）',
       cls.names.join(',') === 'b,c' && cls.added === 2, `names=${cls.names.join(',')} added=${cls.added}`);
     check('collectDepClosure 对镜像里没有的依赖记 missing（带 parent），file: 依赖不算 missing',
@@ -2425,6 +2427,22 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
     await api('/__admin/api/config', {
       method: 'PUT', body: { storage: { bundleExportConcurrency: 6, bundleImportConcurrency: 6 } },
     });
+    // 本地扫描并发（补 tarball 规划 / 导出统计 / 依赖闭包 / npm 缓存扫描导入共用）
+    check('GET /config 暴露本地扫描并发 localScanConcurrency（1~64，代码默认 8）',
+      numIn(st0.localScanConcurrency, 1, 64) && Number(dflt4.storage.localScanConcurrency) === 8,
+      JSON.stringify(st0.localScanConcurrency));
+    const badC3 = await api('/__admin/api/config', { method: 'PUT', body: { storage: { localScanConcurrency: 0 } } });
+    check('PUT /config storage.localScanConcurrency=0 → 400',
+      badC3.status === 400 && /localScanConcurrency/.test(badC3.text), `status=${badC3.status}`);
+    const badC3b = await api('/__admin/api/config', { method: 'PUT', body: { storage: { localScanConcurrency: 65 } } });
+    check('PUT /config storage.localScanConcurrency=65 → 400（上限 64）',
+      badC3b.status === 400 && /localScanConcurrency/.test(badC3b.text), `status=${badC3b.status}`);
+    const okC3 = await api('/__admin/api/config', { method: 'PUT', body: { storage: { localScanConcurrency: 16 } } });
+    check('PUT /config storage.localScanConcurrency=16 → 200 且回显 16',
+      okC3.status === 200 && Number((((((okC3.json || {}).data || {}).config || {}).storage || {})).localScanConcurrency) === 16,
+      `status=${okC3.status}`);
+    // 恢复用户原值，别把测试改动留在配置里
+    await api('/__admin/api/config', { method: 'PUT', body: { storage: { localScanConcurrency: Number(st0.localScanConcurrency) || 8 } } });
 
     const st4 = new Store4({ dir: cfgMod4.storageDir(), logger: quietLog4 });
     await st4.init();

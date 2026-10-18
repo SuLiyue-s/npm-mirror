@@ -21,7 +21,7 @@ const pull = require('./pull');
 const deps = require('./deps');
 const {
   nowIso, parsePkgSpec, satisfies, compareVersions, maxSatisfying,
-  rootPath, stamp, formatBytes, clamp, randomToken,
+  rootPath, stamp, formatBytes, clamp, randomToken, mapLimit,
 } = require('./util');
 
 const API = '/__admin/api';
@@ -41,14 +41,21 @@ function bundlesStat() {
 /** 安全解码 URL 片段 */
 function decodeStr(s) { try { return decodeURIComponent(s); } catch { return s; } }
 
+/** 「本地扫描 / 统计」类批处理的读盘并发：取 storage.localScanConcurrency（1-64，默认 8） */
+function localScanConcurrency(cfg) {
+  return Math.max(1, Math.min(64, Math.floor(Number((cfg && cfg.storage && cfg.storage.localScanConcurrency)) || 8)));
+}
+
 /* 「全部包补 tarball」的名单：上传包（只有 packument、没有 tarball 下载地址）与私有包（tarball 只在本机）
  * 本来就不可能从上游补下来，全部包模式下直接跳过，免得每次跑完都报一堆无意义的失败。
  * 返回 { names, skipped }；如果整个镜像都是本地包，就不跳过（保持行为可解释）。 */
 function allPackageNames(store) {
   const all = store.names();
   const kept = all.filter((n) => {
-    const rec = store.get(n);
-    const src = rec && rec.meta && rec.meta.source;
+    // 只取内存索引里的 meta：原来为拿 source 把整份 packument 读一遍，
+    // 「全部包补 tarball」规划 1520 个包时光这一步就要卡几秒。
+    const meta = typeof store.metaOf === 'function' ? store.metaOf(n) : (store.index.get(n) || null);
+    const src = meta && meta.source;
     return src !== 'upload' && src !== 'private';
   });
   return kept.length ? { names: kept, skipped: all.length - kept.length } : { names: all, skipped: 0 };
@@ -194,6 +201,8 @@ async function runBundleImportJob(ctx, { file, overwrite, update, isCanceled }) 
     concurrency: Math.max(1, Number(cfg.storage.bundleImportConcurrency) || 4),
     // 解包（解压+写盘）的并发路数：与「导入包」的并发分开，机械硬盘和小宝塔盘都能调
     extractConcurrency: Math.max(1, Number(cfg.storage.bundleImportExtractConcurrency) || 8),
+    // 解包后扫描各包目录的读盘并发（store.getAsync / stat 并发数）
+    scanConcurrency: localScanConcurrency(cfg),
     onProgress: makeImportProgressHandler(update),
   });
   return { ...r, total: r.packages, failedCount: r.failed.length };
@@ -548,10 +557,14 @@ async function handleAdmin(ctx) {
     if (unknown.length === names.length) return fail(res, 404, `本地没有这些包：${unknown.join('、')}`, 'ENOTFOUND');
 
     const out = { mode, scope: scopeAll ? 'all' : 'picked', skippedLocal, requested: names.length, tarballs: 0, packages: [], skipped: [], failed: [] };
-    for (const name of names) {
-      const rec = store.get(name);
-      if (!rec) { out.failed.push({ name, error: '本地没有这个包' }); continue; }
-      const missing = store.missingTarballs(name);
+    /* 两个阶段都并发：
+     * 1) 逐个包并发读 packument、算缺哪些版本（每个包只读一次，不再 get 两遍）；
+     * 2) 把「包@版本」摊平成任务后按上游并发数一起下载（原来是逐包逐版本串行 await）。 */
+    const scanConc = localScanConcurrency(cfg);
+    const plans = await mapLimit(names, scanConc, async (name) => {
+      const rec = await store.getAsync(name);
+      if (!rec) return { name, error: '本地没有这个包' };
+      const missing = pull.missingTarballsFrom(store, name, rec);
       const missingSet = new Set(missing);
       let targets;
       if (mode === 'all') {
@@ -565,32 +578,42 @@ async function handleAdmin(ctx) {
         for (const v of Object.values(tags)) if (missingSet.has(v)) set.add(v);
         targets = Array.from(set);
       }
-      if (!targets.length) {
+      return { name, missing, targets, got: [], bad: [] };
+    });
+    const jobs = [];
+    for (const plan of plans) {
+      if (plan.error) { out.failed.push({ name: plan.name, error: plan.error }); continue; }
+      if (!plan.targets.length) {
         out.skipped.push({
-          name,
-          reason: missing.length
+          name: plan.name,
+          reason: plan.missing.length
             ? (mode === 'latest'
-              ? `latest 版本已缓存（该包另有 ${missing.length} 个版本没缓存，可用「全部版本」模式补）`
-              : `dist-tag 指向的版本都已缓存（该包另有 ${missing.length} 个版本没缓存，可用「全部版本」模式补）`)
+              ? `latest 版本已缓存（该包另有 ${plan.missing.length} 个版本没缓存，可用「全部版本」模式补）`
+              : `dist-tag 指向的版本都已缓存（该包另有 ${plan.missing.length} 个版本没缓存，可用「全部版本」模式补）`)
             : '所有版本都已缓存',
-          missing: missing.length,
+          missing: plan.missing.length,
         });
-        out.packages.push({ name, target: 0, downloaded: 0, failed: 0, missing: missing.length });
+        out.packages.push({ name: plan.name, target: 0, downloaded: 0, failed: 0, missing: plan.missing.length });
         continue;
       }
-      const got = [], bad = [];
-      for (const v of targets) {
-        try {
-          const r = await ctx.registry.ensureTarballEx(ctx, name, v);
-          if (r && r.path) got.push(v);
-          else bad.push({ version: v, error: (ctx.registry.TARBALL_REASON_TEXT || {})[r && r.reason] || '无法获取（上游未提供或离线）' });
-        } catch (e) { bad.push({ version: v, error: e.message }); }
-      }
-      for (const b of bad) out.failed.push({ name: `${name}@${b.version}`, error: b.error });
-      out.tarballs += got.length;
-      const left = store.missingTarballs(name).length;
-      out.packages.push({ name, target: targets.length, downloaded: got.length, failed: bad.length, versions: got, missing: left });
-      if (log) log.info(`补 tarball ${name}（${mode}）：目标 ${targets.length} 个，成功 ${got.length} 个，剩余缺失 ${left} 个`);
+      for (const v of plan.targets) jobs.push({ plan, version: v });
+    }
+    const dlConc = clamp(Number(cfg.upstream.concurrency) || 6, 1, 32);
+    await mapLimit(jobs, dlConc, async (job) => {
+      try {
+        const r = await ctx.registry.ensureTarballEx(ctx, job.plan.name, job.version);
+        if (r && r.path) job.plan.got.push(job.version);
+        else job.plan.bad.push({ version: job.version, error: (ctx.registry.TARBALL_REASON_TEXT || {})[r && r.reason] || '无法获取（上游未提供或离线）' });
+      } catch (e) { job.plan.bad.push({ version: job.version, error: e.message }); }
+    });
+    for (const plan of plans) {
+      if (plan.error || !plan.targets || !plan.targets.length) continue;
+      for (const b of plan.bad) out.failed.push({ name: `${plan.name}@${b.version}`, error: b.error });
+      out.tarballs += plan.got.length;
+      const recNow = await store.getAsync(plan.name);
+      const left = recNow ? pull.missingTarballsFrom(store, plan.name, recNow).length : 0;
+      out.packages.push({ name: plan.name, target: plan.targets.length, downloaded: plan.got.length, failed: plan.bad.length, versions: plan.got, missing: left });
+      if (log) log.info(`补 tarball ${plan.name}（${mode}）：目标 ${plan.targets.length} 个，成功 ${plan.got.length} 个，剩余缺失 ${left} 个`);
     }
     return ok(res, out);
   }
@@ -631,7 +654,8 @@ async function handleAdmin(ctx) {
     if (unknown.length === names.length) return fail(res, 404, `本地没有这些包：${unknown.join('、')}`, 'ENOTFOUND');
 
     const concurrency = clamp(Number(body.concurrency) || Number(cfg.upstream.concurrency) || 6, 1, 32);
-    const plan = await pull.planTargets(store, names, mode, targets);
+    // 规划阶段同样并发读盘（并发数取 storage.localScanConcurrency），不再逐个包串行 get
+    const plan = await pull.planTargets(store, names, mode, targets, { concurrency: localScanConcurrency(cfg) });
     const total = plan.reduce((a, p) => a + p.target.length, 0);
     const modeLabel = mode === 'all' ? '全部版本'
       : (mode === 'latest' ? '最新版本' : (mode === 'selected' ? '选中版本' : 'dist-tag 版本'));
@@ -763,7 +787,7 @@ async function handleAdmin(ctx) {
           let dl = null;
 
           if (prefetch && targets.length && !task.cancelRequested) {
-            const plan = await pull.planTargets(store, names, 'selected', targets);
+            const plan = await pull.planTargets(store, names, 'selected', targets, { concurrency: localScanConcurrency(cfg) });
             const planTotal = plan.reduce((a, p) => a + p.target.length, 0);
             tasks.update(task.id, {
               phase: 'download',
@@ -860,7 +884,11 @@ async function handleAdmin(ctx) {
       const versions = Object.keys(pk.versions || {}).sort(compareVersions).map(v => {
         const m = pk.versions[v];
         const dist = m.dist || {};
-        const cached = store.hasTarball(name, v);
+        // 用内存索引里的 meta.files 判断是否已缓存（O(1)）：typescript 这类 3900 个版本的包
+        // 原来每个版本 existsSync 一遍，详情页要白等；索引里没有 files 的历史数据再回退真实检查。
+        const cached = meta.files
+          ? Object.prototype.hasOwnProperty.call(meta.files, v)
+          : store.hasTarball(name, v);
         let size = (meta.sizes && meta.sizes[v]) || 0;
         if (!size && cached) { try { size = fs.statSync(store.tarballPath(name, v)).size; } catch { size = 0; } }
         return {
@@ -926,18 +954,20 @@ async function handleAdmin(ctx) {
 
     if (tail.length === 1 && tail[0] === 'prefetch' && method === 'POST') {
       const body = await readJson(req).catch(() => ({}));
-      const rec = store.get(name);
+      const rec = await store.getAsync(name);
       if (!rec) return fail(res, 404, `本地没有包 ${name}`, 'ENOTFOUND');
       let list = Array.isArray(body.versions) ? body.versions.filter(v => rec.packument.versions[v]) : [];
-      if (!list.length) list = store.missingTarballs(name);
+      if (!list.length) list = pull.missingTarballsFrom(store, name, rec);
       const out = { name, requested: list.length, downloaded: [], failed: [] };
-      for (const v of list) {
+      // 多版本一起并发下载（原来是一个版本一个 await，选一大串版本时要等很久）
+      const dlConc = clamp(Number(cfg.upstream.concurrency) || 6, 1, 32);
+      await mapLimit(list, dlConc, async (v) => {
         try {
           const r = await ctx.registry.ensureTarballEx(ctx, name, v);
           if (r && r.path) out.downloaded.push(v);
           else out.failed.push({ version: v, error: (ctx.registry.TARBALL_REASON_TEXT || {})[r && r.reason] || '未能获取 tarball' });
         } catch (e) { out.failed.push({ version: v, error: e.message }); }
-      }
+      });
       return ok(res, out);
     }
 
@@ -1041,7 +1071,8 @@ async function handleAdmin(ctx) {
   if (rel === '/bundles' && method === 'GET') {
     const { items } = ctx.bundle.listBundles();
     const manifestCache = ctx.state.bundleManifests || (ctx.state.bundleManifests = new Map());
-    for (const it of items) {
+    // 多个离线包的 manifest 并发读取（每个都要读包尾部的 tar 条目；命中缓存的不再读）
+    await mapLimit(items, Math.max(1, Math.min(16, items.length || 1)), async (it) => {
       const key = `${it.file}:${it.sizeBytes}:${it.createdAt}`;
       let info = manifestCache.get(key);
       if (!info) {
@@ -1052,7 +1083,8 @@ async function handleAdmin(ctx) {
         } catch (e) { info = { error: e.message }; manifestCache.set(key, info); }
       }
       Object.assign(it, info);
-    }
+      return it;
+    });
     return ok(res, {
       items,
       totalBytes: items.reduce((a, b) => a + (b.sizeBytes || 0), 0),
@@ -1109,6 +1141,7 @@ async function handleAdmin(ctx) {
               logger: log,
               isCanceled,
               concurrency: conc,
+              localScanConcurrency: localScanConcurrency(cfg),
               ...addedRangeOpts,
               onProgress: (ev) => {
                 if (ev.phase === 'deps-fetch') {
@@ -1209,6 +1242,7 @@ async function handleAdmin(ctx) {
         autoFetchDeps,
         logger: log,
         concurrency: Math.max(1, Number(cfg.storage.bundleExportConcurrency) || 4),
+        localScanConcurrency: localScanConcurrency(cfg),
         ...addedRangeOpts,
       });
       return ok(res, r);
@@ -1495,7 +1529,7 @@ async function handleAdmin(ctx) {
         const m = Number(st.bundleUploadChunkMB);
         if (!Number.isInteger(m) || m < 1 || m > 64) return bad('storage.bundleUploadChunkMB 必须是 1-64 的整数（每片 MB 数）');
       }
-      for (const k of ['bundleExportConcurrency', 'bundleImportConcurrency', 'bundleImportExtractConcurrency', 'bundleUploadConcurrency']) {
+      for (const k of ['bundleExportConcurrency', 'bundleImportConcurrency', 'bundleImportExtractConcurrency', 'bundleUploadConcurrency', 'localScanConcurrency']) {
         if (st[k] !== undefined) {
           const n = Number(st[k]);
           if (!Number.isInteger(n) || n < 1 || n > 64) return bad(`storage.${k} 必须是 1-64 的整数`);
@@ -1564,6 +1598,8 @@ async function handleAdmin(ctx) {
         registry: cfg.upstream.registry,
         anyRegistry: q.get('anyRegistry') === '1',
         logger: log,
+        // 扫描 npm 缓存时的读盘并发（原来逐文件串行读，几十万个文件时很慢）
+        concurrency: localScanConcurrency(cfg),
       });
       return ok(res, { ...withLocalFlags(r), cached: false });
     } catch (e) {
@@ -1587,6 +1623,8 @@ async function handleAdmin(ctx) {
       overwrite: body.overwrite === true,
       onlyWithTarball: body.onlyWithTarball !== false,
       logger: log,
+      // 导入 npm 缓存时的包级并发（原来逐包串行；每个包只锁自己，跨包可并行）
+      concurrency: localScanConcurrency(cfg),
     };
     /* progress:true —— 长任务模式：立即返回 taskId，界面用 /tasks/<id> 轮询
      * 「整体进度 + 正在导入的包 + 逐包导入详情」。默认（不带该参数）仍是同步返回结果，兼容命令行/旧调用。 */

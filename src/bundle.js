@@ -1,11 +1,12 @@
 'use strict';
 /* 离线迁移包：整库/按范围导出为单个 .tgz，或从 .tgz 导入（合并式，可重复导入） */
 const fs = require('node:fs');
+const fsp = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const {
   ensureDir, readJson, rootPath, stamp, safePkgDir, pkgBaseName, sha1hex, integrityOf, nowIso, compareVersions,
-  isSafePkgName, isSafeVersion,
+  isSafePkgName, isSafeVersion, mapLimit, clamp,
 } = require('./util');
 const tar = require('./tar');
 const deps = require('./deps');
@@ -156,36 +157,53 @@ function depTargetName(alias, range) {
  * 求「这批包 + 它们（递归）依赖的包」的闭包。
  * 只纳入镜像里真实存在的包；镜像里没有的放进 missing，回报给前端提示用户先补。
  * 每条依赖都从 packument 的每个版本里收集（导出本来就是整包全部版本，依赖也按全部版本取并集）。
+ * 分层 BFS：同一层的包并发读 packument（mapLimit），依赖图通常只有几层，
+ * 并发读盘把「逐个 store.get」的串行等待摊开；并发数取 storage.localScanConcurrency。
  */
-function collectDepClosure(store, roots, { max = DEPS_MAX_PACKAGES } = {}) {
+async function collectDepClosure(store, roots, { max = DEPS_MAX_PACKAGES, concurrency = 8, isCanceled } = {}) {
+  const conc = Math.max(1, Math.min(64, Math.floor(Number(concurrency)) || 8));
+  const cancelErr = () => { const e = new Error('已取消'); e.code = 'ECANCELED'; return e; };
   const visited = new Set(roots);
-  const queue = roots.map(n => n);
+  let queue = roots.map(n => n);
   const missing = new Map();
   let added = 0;
   while (queue.length) {
-    const cur = queue.shift();
-    const rec = store.get(cur);
-    const versions = (rec && rec.packument && rec.packument.versions) || {};
-    for (const v of Object.keys(versions)) {
-      const map = versions[v] && versions[v].dependencies;
-      if (!map || typeof map !== 'object') continue;
-      for (const alias of Object.keys(map)) {
-        const real = depTargetName(alias, map[alias]);
-        if (!real || visited.has(real)) continue;
+    if (isCanceled && isCanceled()) throw cancelErr();
+    const level = queue;
+    queue = [];
+    const rows = await mapLimit(level, conc, async (cur) => {
+      const rec = await store.getAsync(cur);
+      const versions = (rec && rec.packument && rec.packument.versions) || {};
+      const found = [];
+      for (const v of Object.keys(versions)) {
+        const map = versions[v] && versions[v].dependencies;
+        if (!map || typeof map !== 'object') continue;
+        for (const alias of Object.keys(map)) {
+          const real = depTargetName(alias, map[alias]);
+          if (real) found.push({ real, range: String(map[alias]), parent: cur });
+        }
+      }
+      return found;
+    });
+    for (const found of rows) {
+      if (!Array.isArray(found)) continue;       // 读包失败（mapLimit 收成 {__error}）按没有依赖处理
+      for (const { real, range, parent } of found) {
+        if (visited.has(real)) continue;
         if (store.index.has(real)) {
           if (visited.size >= max) {
-            if (!missing.has(real)) missing.set(real, { name: real, range: String(map[alias]), parent: cur, reason: `超过连带导出上限（${max} 个包），未纳入` });
+            if (!missing.has(real)) missing.set(real, { name: real, range, parent, reason: `超过连带导出上限（${max} 个包），未纳入` });
             continue;
           }
           visited.add(real);
           added++;
           queue.push(real);
         } else if (!missing.has(real)) {
-          missing.set(real, { name: real, range: String(map[alias]), parent: cur });
+          missing.set(real, { name: real, range, parent });
         }
       }
     }
   }
+  if (isCanceled && isCanceled()) throw cancelErr();
   const out = Array.from(visited).filter(n => !roots.includes(n));
   return { names: out, added, missing: Array.from(missing.values()) };
 }
@@ -227,7 +245,9 @@ async function autoFillDeps({ ctx, store, roots, logger, emit = () => {}, isCanc
   let remaining = limit;
   for (let round = 0; round < maxRounds; round++) {
     if (stop()) { res.canceled = true; break; }
-    const missing = collectDepClosure(store, roots).missing.filter(m => !m.reason && !tried.has(m.name));
+    const scanConc = Math.max(1, Math.min(64, Math.floor(Number(opts.localScanConcurrency)) || Number(opts.concurrency) || AUTO_DEPS.concurrency));
+    const missing = (await collectDepClosure(store, roots, { concurrency: scanConc, isCanceled }))
+      .missing.filter(m => !m.reason && !tried.has(m.name));
     const todo = [];
     for (const m of missing) {
       if (remaining <= 0) break;
@@ -344,6 +364,7 @@ async function autoFillDeps({ ctx, store, roots, logger, emit = () => {}, isCanc
 async function exportBundle({
   store, ctx = null, scope = 'all', names = [], fileName, withDeps = false,
   autoFetchDeps = true, autoDeps = null, logger, onProgress, isCanceled, concurrency = 1,
+  localScanConcurrency = 8,
   addedFrom = null, addedTo = null,
 }) {
   const emit = (ev) => {
@@ -357,6 +378,8 @@ async function exportBundle({
     return e;
   };
   const checkCancel = () => { if (isCanceled && isCanceled()) throw canceledError(); };
+  /* 本地扫描/统计类批处理的读盘并发（依赖闭包与打包前的逐包 stats 共用）：默认 8，1-64 */
+  const localScanConc = Math.max(1, Math.min(64, Math.floor(Number(localScanConcurrency)) || 8));
   const all = Array.from(store.index.keys());
   let addedRange = null;
   let targets = all;
@@ -376,11 +399,14 @@ async function exportBundle({
   let missingDeps = [];
   let autoFetch = null;
   if (withDeps && scope === 'selected' && roots.length) {
-    let closure = collectDepClosure(store, roots);
+    let closure = await collectDepClosure(store, roots, { concurrency: localScanConc, isCanceled });
     // 镜像里没有的依赖：cache/proxy 模式自动从上游下载并入库；离线模式只提示、不下载
     if (autoFetchDeps && closure.missing.length) {
-      autoFetch = await autoFillDeps({ ctx, store, roots, logger, emit, isCanceled, opts: autoDeps || {} });
-      if (!autoFetch.skippedReason) closure = collectDepClosure(store, roots);
+      autoFetch = await autoFillDeps({
+        ctx, store, roots, logger, emit, isCanceled,
+        opts: { ...(autoDeps || {}), localScanConcurrency: localScanConc },
+      });
+      if (!autoFetch.skippedReason) closure = await collectDepClosure(store, roots, { concurrency: localScanConc, isCanceled });
     }
     depsAdded = closure.added;
     // 给仍然缺的依赖补一句人话原因，前端/CLI/告警文案直接展示
@@ -417,56 +443,83 @@ async function exportBundle({
    * 供打包阶段的「逐包打包详情」与「当前包」进度条使用。 */
   const pkgPlan = [];
   let versions = 0, tarballs = 0, bytes = 0;
-  for (const name of targets) {
-    checkCancel();
-    const rec = store.get(name);
-    if (!rec) continue;
-    const list = [];
+  /* 统计阶段改成并发读盘：此前是同步 for 循环（1520 个包 × 几万个 tarball 逐个 statSync），
+   * 大镜像能卡住事件循环好几秒，页面轮询和托盘健康检查都跟着卡。
+   * 并发数取 storage.localScanConcurrency；结果仍按 targets 顺序合并，manifest/进度顺序不变。 */
+  let collectedN = 0;
+  const collected = await mapLimit(targets, localScanConc, async (name) => {
+    if (isCanceled && isCanceled()) return null;
+    const rec = await store.getAsync(name);
+    if (!rec) return null;
     let dir;
     try { dir = safePkgDir(name); }
     catch (e) {
       // 历史遗留的非法包名（例如早期被写入的可疑目录）不参与导出，跳过并提示，避免整个导出失败
       if (logger) logger.warn(`导出跳过非法包名：${String(name)}（${e.message}）`);
-      continue;
+      return null;
     }
     const meta = rec.meta || {};
+    const list = [];
     const pkgVersions = [];
+    let pkgBytes = 0, pkgTarballs = 0, pkgVersionsN = 0;
     for (const v of Object.keys(rec.packument.versions || {})) {
       const file = store.tarballFileName(name, v);
       const abs = store.tarballPath(name, v);
       const entryName = `storage/${dir}/tarballs/${file}`;
       if (abs) {
-        const st = fs.statSync(abs);
-        list.push({ name: entryName, source: abs, size: st.size, mtime: st.mtimeMs / 1000 });
-        bytes += st.size;
-        tarballs++;
-        pkgVersions.push({ version: v, file, sizeBytes: st.size, cached: true });
+        let st = null;
+        try { st = await fsp.stat(abs); } catch { st = null; }
+        if (st && st.isFile()) {
+          list.push({ name: entryName, source: abs, size: st.size, mtime: st.mtimeMs / 1000 });
+          pkgBytes += st.size;
+          pkgTarballs++;
+          pkgVersions.push({ version: v, file, sizeBytes: st.size, cached: true });
+        } else {
+          pkgVersions.push({ version: v, file: null, sizeBytes: 0, cached: false });
+        }
       } else {
         pkgVersions.push({ version: v, file: null, sizeBytes: 0, cached: false });
       }
-      versions++;
+      pkgVersionsN++;
     }
     list.push({ name: `storage/${dir}/packument.json`, source: store.packumentPath(name) });
     if (fs.existsSync(store.metaPath(name))) list.push({ name: `storage/${dir}/meta.json`, source: store.metaPath(name) });
-    pkgEntryLists.push(list);
-    pkgPlan.push({
-      name,
-      entries: list.length,
-      tarballs: pkgVersions.filter(v => v.cached).length,
-      versions: pkgVersions.length,
-      sizeBytes: pkgVersions.reduce((a, v) => a + (v.sizeBytes || 0), 0),
-    });
-    manifestPackages.push({
-      name,
-      source: meta.source || 'upstream',
-      latest: meta.latest || null,
-      versionCount: pkgVersions.length,
-      private: !!meta.private,
-      versions: pkgVersions,
-    });
+    collectedN++;
     // 统计阶段对大镜像也要有反馈（每个包都要 stat 一遍 tarball）
-    if (manifestPackages.length % 100 === 0) emit({ phase: 'collect', packages: manifestPackages.length, total: targets.length });
+    if (collectedN % 100 === 0) emit({ phase: 'collect', packages: collectedN, total: targets.length });
+    return {
+      list,
+      planRow: {
+        name,
+        entries: list.length,
+        tarballs: pkgTarballs,
+        versions: pkgVersionsN,
+        sizeBytes: pkgBytes,
+      },
+      manifestPkg: {
+        name,
+        source: meta.source || 'upstream',
+        latest: meta.latest || null,
+        versionCount: pkgVersionsN,
+        private: !!meta.private,
+        versions: pkgVersions,
+      },
+      versions: pkgVersionsN,
+      tarballs: pkgTarballs,
+      bytes: pkgBytes,
+    };
+  });
+  checkCancel();   // 统计期间按过取消：一个包都不打包，直接结束
+  for (const row of collected) {
+    if (!row) continue;
+    pkgEntryLists.push(row.list);
+    pkgPlan.push(row.planRow);
+    manifestPackages.push(row.manifestPkg);
+    versions += row.versions;
+    tarballs += row.tarballs;
+    bytes += row.bytes;
   }
+  emit({ phase: 'collect', packages: manifestPackages.length, total: targets.length });
 
   /* 跨包轮流交织展开（round-robin）：第 1 轮每个包的 1 条，第 2 轮每个包的第 2 条……
    * 这样并行压缩的 N 路分别落在不同包上，进度弹窗右栏才能同时显示多个包（而不是几路挤在一个包）。 */
@@ -502,11 +555,13 @@ async function exportBundle({
     packages: manifestPackages,
   };
   // 先把每个条目的大小补齐（下面要拿它算「预计总字节」，好让进度条有百分比，而不是只有已写入字节）
-  for (const e of entries) {
+  // packument/meta 条目没有 size，这里并发 stat 补齐（tarball 条目的 size 已在统计阶段拿到）
+  await mapLimit(entries, Math.max(1, Math.min(32, localScanConc * 2)), async (e) => {
     if (e.size === undefined && e.source) {
-      try { e.size = fs.statSync(e.source).size; } catch { e.size = 0; }
+      try { e.size = (await fsp.stat(e.source)).size; } catch { e.size = 0; }
     }
-  }
+    return e;
+  });
   entries.unshift({ name: 'manifest.json', data: Buffer.from(JSON.stringify(manifest, null, 2)) });
   const expectedBytes = entries.reduce((a, e) => a + (e.size || (e.data ? e.data.length : 0)), 0);
   emit({ phase: 'collect-done', packages: manifestPackages.length, entries: entries.length, totalBytes: expectedBytes });
@@ -648,10 +703,11 @@ async function readBundleManifest(file) {
  * @param {function} [o.isCanceled] 返回 true 时在包之间/版本之间尽快停下来（结果带 canceled=true 的部分数据）
  * @param {number} [o.concurrency=1] 并行路数（不同包/同一包的版本级任务一起抢，包级不再被 min(并发,包数) 卡死）
  * @param {number} [o.extractConcurrency=4] 解包时并发写盘的文件数（单流读 tar，多路写盘收尾）
+ * @param {number} [o.scanConcurrency=8] 解包后扫描各包目录（stat + 读 packument.json）的读盘并发
  */
 async function importBundle({
   store, file, overwrite = false, metadataOnly = false, onProgress, isCanceled, logger,
-  concurrency = 1, extractConcurrency = 4,
+  concurrency = 1, extractConcurrency = 4, scanConcurrency = 8,
 }) {
   const manifest = await readBundleManifest(file); // 先校验格式与 manifest 是否可读
   const mstats = (manifest && manifest.stats) || {};
@@ -696,20 +752,33 @@ async function importBundle({
       maxTotalBytes: Math.max(2 * 1024 * 1024 * 1024, bundleSize * 4),
       maxEntries: 2000000,
     });
-    const dirs = fs.existsSync(path.join(tmp, 'storage')) ? fs.readdirSync(path.join(tmp, 'storage')) : [];
+    const storageDir = path.join(tmp, 'storage');
+    let dirs = [];
+    try {
+      const ents = await fsp.readdir(storageDir, { withFileTypes: true });
+      dirs = ents.filter(d => d.isDirectory()).map(d => d.name).sort();
+    } catch { dirs = []; }
     emit({ phase: 'extract-done', bytes: extracted, packages: dirs.length });
 
-    /* 先过滤出真正要处理的包目录（顺序稳定，日志/结果可复现）。
-     * 不同包之间可以并行导入：每个包只锁自己（store.withLock(name)），包内版本仍按顺序写，
-     * 所以并发不会改变任何单个包的最终内容，只是把多个包的磁盘读写/校验摊开。 */
-    const pkgDirs = [];
-    for (const dir of dirs) {
-      const pkgDir = path.join(tmp, 'storage', dir);
-      if (!fs.statSync(pkgDir).isDirectory()) continue;
-      const incomingPackument = readJson(path.join(pkgDir, 'packument.json'), null);
-      if (!incomingPackument || !incomingPackument.versions) continue;
-      pkgDirs.push({ dir, pkgDir, incomingPackument, name: incomingPackument.name || dir.replace(/__/g, '/') });
-    }
+    /* 先并发扫描出真正要处理的包目录（按目录名排序，日志/结果可复现）。
+     * 此前是同步逐包 statSync + readJson：1521 个包目录会让事件循环停顿 1~2 秒，
+     * 这里改用 fsp 异步读盘 + mapLimit 并发（并发数取 storage.localScanConcurrency）。
+     * 不同包之间本来就可以并行导入：每个包只锁自己（store.withLock(name)），包内版本按版本级调度，
+     * 所以并发不会改变任何单个包的最终内容，只是把磁盘读写/校验摊开。 */
+    const scanConc = Math.max(1, Math.min(64, Math.floor(Number(scanConcurrency)) || 8));
+    const scanned = await mapLimit(dirs, scanConc, async (dir) => {
+      const pkgDir = path.join(storageDir, dir);
+      let st = null;
+      try { st = await fsp.stat(pkgDir); } catch { st = null; }
+      if (!st || !st.isDirectory()) return null;
+      let incomingPackument = null;
+      try {
+        incomingPackument = JSON.parse(await fsp.readFile(path.join(pkgDir, 'packument.json'), 'utf8'));
+      } catch { incomingPackument = null; }
+      if (!incomingPackument || !incomingPackument.versions) return null;
+      return { dir, pkgDir, incomingPackument, name: incomingPackument.name || dir.replace(/__/g, '/') };
+    });
+    const pkgDirs = scanned.filter(Boolean);
     const totalPkgs = pkgDirs.length;
 
     /* 并行路数：配置多少就用多少，不再被「包数」min 掉（原来 workerCount=min(并发,包数)，
@@ -785,7 +854,7 @@ async function importBundle({
       st.incomingMeta = readJson(path.join(st.item.pkgDir, 'meta.json'), {}) || {};
       const incomingMeta = st.incomingMeta;
       await store.withLock(name, async () => {
-        const local = store.get(name);
+        const local = await store.getAsync(name);
         st.local = local;
         // 新建 packument 时清空 dist-tags，避免把包内可能悬空的 tag 原样带进来
         st.packument = local ? local.packument : { ...st.item.incomingPackument, versions: {}, 'dist-tags': {} };
@@ -929,7 +998,7 @@ async function importBundle({
         if (!st.badName) {
           try {
             await store.withLock(st.name, async () => {
-              const fresh = store.get(st.name);
+              const fresh = await store.getAsync(st.name);
               const packument = fresh ? fresh.packument : st.packument;
               // 本次导入写出的版本合并进「磁盘最新」的 packument（prepare 期间可能有其它写入）
               if (fresh) {

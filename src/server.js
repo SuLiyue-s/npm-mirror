@@ -36,13 +36,14 @@ function applyCliOverrides(cfg, opts) {
   return changed;
 }
 
-function createServer({ cliOpts = {} } = {}) {
+async function createServer({ cliOpts = {} } = {}) {
   if (Object.keys(cliOpts).length) applyCliOverrides(config.get(), cliOpts);
 
   const cfg0 = config.get();
   const log = loggerMod.init({ dir: config.logsDir(), level: cfg0.log.level, maxDays: cfg0.log.maxDays, console: true });
   const store = new Store({ dir: config.storageDir(), logger: log });
-  store.init();
+  // 启动前并发加载索引：原来 1500+ 个包逐个同步读 meta.json，监听端口前要多等几百毫秒
+  await store.initAsync();
 
   let stopping = false;
   let listenIp = config.get().server.ip;

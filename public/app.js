@@ -4031,6 +4031,7 @@
         { k: 'storage.bundleImportConcurrency', label: '离线包导入并发', type: 'number', hint: '导入整机备份时的总并行路数，1-64，默认 4。设 1 回到串行；剩余包少于路数时空闲路会抢同一包里的版本。机械硬盘或 CPU 较忙时调小更稳。' },
         { k: 'storage.bundleImportExtractConcurrency', label: '离线包解包并发', type: 'number', hint: '解压并把文件写盘的并发路数，1-64，默认 8。机械硬盘上并发太高反而慢，可调低到 2-4；SSD 多核可调大到 16-32。' },
         { k: 'storage.bundleUploadChunkMB', label: '分片上传 · 每片大小（MB）', type: 'number', hint: '网页上传离线包时每片的大小，1-64，默认 8。片越小进度越细，但请求次数变多。' },
+        { k: 'storage.localScanConcurrency', label: '本地扫描并发', type: 'number', hint: '补 tarball 前统计缺失、导出备份时统计包、依赖闭包、npm 缓存扫描/导入等多处本地读盘的并发路数，1-64，默认 8。SSD/多核可调大，机械硬盘调小更稳。' },
         { k: 'storage.bundleUploadConcurrency', label: '分片上传 · 并发数', type: 'number', hint: '同时上传几个分片，1-64，默认 4。浏览器对同一域名通常最多 6 条连接，设太大反而排队；反向代理开 HTTP/2 后调大才有明显收益。' }
       ]
     },

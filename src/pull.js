@@ -6,13 +6,14 @@
  */
 const fs = require('node:fs');
 const path = require('node:path');
+const { clamp, mapLimit } = require('./util');
 
-/** 规划时每处理多少个包让出一次事件循环（大规划不能把服务同步卡住十几秒） */
-const PLAN_YIELD_EVERY = 8;
+/** 规划时默认的读盘并发（data/config.json 的 storage.localScanConcurrency 会覆盖它） */
+const DEFAULT_PLAN_CONCURRENCY = 8;
 
-/** 让出一次事件循环：让正在等待的 HTTP 请求（健康检查 / 页面轮询）能插进来 */
-function yieldLoop() {
-  return new Promise((resolve) => setImmediate(resolve));
+/** 规划并发归一化：1-64 的整数，非法值回退默认值 */
+function planConcurrency(v) {
+  return clamp(Math.floor(Number(v)) || DEFAULT_PLAN_CONCURRENCY, 1, 64);
 }
 
 /**
@@ -35,11 +36,13 @@ function missingTarballsFrom(store, name, rec) {
  * - mode='all'：补全部本地缺失的版本
  * - mode='selected'：只补 selected（[{name,version}]）里点名且本地缺失的版本
  *
- * 异步实现：读 packument 改用 store.getAsync（await IO），并且每处理 PLAN_YIELD_EVERY 个包
- * 主动让出一次事件循环。此前是同步循环读 1500+ 个包，会让服务整整卡住 9~15 秒，
- * 连 /-/ping、/session 都来不及响应，托盘健康检查因此误判「服务已停止」并连控制台一起关掉。
+ * 并发实现：读 packument 改用 store.getAsync（await IO），并用 mapLimit 同时读多个包
+ * （并发数取 storage.localScanConcurrency，默认 8，1-64）。此前是同步循环读 1500+ 个包，
+ * 会让服务整整卡住 9~15 秒，连 /-/ping、/session 都来不及响应，
+ * 托盘健康检查因此误判「服务已停止」并连控制台一起关掉。
+ * @param {object} [opts] { concurrency?: number } 规划读盘并发
  */
-async function planTargets(store, names, mode, selected) {
+async function planTargets(store, names, mode, selected, opts = {}) {
   const pick = mode === 'selected';
   const byName = new Map();
   if (pick) {
@@ -52,12 +55,10 @@ async function planTargets(store, names, mode, selected) {
     }
   }
   const list = pick ? Array.from(byName.keys()) : names;
-  const plan = [];
-  for (let i = 0; i < list.length; i++) {
-    if (i > 0 && i % PLAN_YIELD_EVERY === 0) await yieldLoop();
-    const name = list[i];
+  const limit = planConcurrency(opts.concurrency);
+  const plan = await mapLimit(list, limit, async (name) => {
     const rec = await store.getAsync(name);
-    if (!rec) { plan.push({ name, target: [], missingCount: 0, missingVersions: 0, error: '本地没有这个包' }); continue; }
+    if (!rec) return { name, target: [], missingCount: 0, missingVersions: 0, error: '本地没有这个包' };
     const missing = missingTarballsFrom(store, name, rec);   // 已缓存元数据但没有 tarball 的版本
     const missingSet = new Set(missing);
     let target;
@@ -78,13 +79,17 @@ async function planTargets(store, names, mode, selected) {
     }
     const meta = rec.meta || {};
     const totalVersions = Number.isFinite(meta.versionCount) ? meta.versionCount : Object.keys(rec.packument.versions || {}).length;
-    plan.push({
+    return {
       name, target, missingCount: missing.length, missingVersions: missing.length, totalVersions,
       selectedCount: pick ? (byName.get(name) || new Set()).size : 0,
       latest: (rec.packument['dist-tags'] || {}).latest || '',
-    });
-  }
-  return plan;
+    };
+  });
+  // mapLimit 把单个包抛出的异常收成 {__error}：转成与「本地没有这个包」一致的失败行，不中断整批规划
+  return plan.map((row, i) => (row && !row.__error ? row : {
+    name: list[i], target: [], missingCount: 0, missingVersions: 0,
+    error: (row && row.__error) || '规划失败',
+  }));
 }
 
 /**
@@ -107,7 +112,9 @@ async function pullTarballs(ctx, opts) {
   const limit = Math.max(1, Math.min(32, Number(opts.concurrency) || cfgConc || 6));
 
   // api.js 已经算好的规划直接复用：避免同一批包在请求处理与任务启动里各规划一次（大镜像会白卡两遍）
-  const plan = Array.isArray(opts.plan) ? opts.plan : await planTargets(ctx.store, names, mode, selected);
+  const plan = Array.isArray(opts.plan)
+    ? opts.plan
+    : await planTargets(ctx.store, names, mode, selected, { concurrency: limit });
   const pkgs = plan.map((p) => ({
     name: p.name, target: p.target.length, done: 0, ok: 0, failed: 0, bytes: 0,
     missing: p.missingCount, totalVersions: p.totalVersions || 0,
@@ -251,4 +258,4 @@ async function pullTarballs(ctx, opts) {
   });
 }
 
-module.exports = { planTargets, pullTarballs };
+module.exports = { planTargets, pullTarballs, missingTarballsFrom };

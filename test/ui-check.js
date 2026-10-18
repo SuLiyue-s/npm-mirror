@@ -631,10 +631,10 @@ async function get(p, { json = false } = {}) {
     const traySrc2 = fs.readFileSync(path.join(__dirname, '..', 'tools', 'tray.ps1'), 'utf8');
     const cmdSrc2 = fs.readFileSync(path.join(__dirname, '..', '启动镜像源.cmd'), 'utf8');
 
-    // ① 「补充全部包」不再把服务卡死：规划改异步、每 8 个包让出事件循环、packument 只读一次
-    check('补 tarball 规划改为异步：每 8 个包让出事件循环，且用同一次 packument 计算缺失（不再重复读盘）',
-      /async function planTargets\s*\(/.test(pullSrc2) && /PLAN_YIELD_EVERY = 8/.test(pullSrc2)
-        && /await yieldLoop\(\)/.test(pullSrc2) && /function missingTarballsFrom\s*\(/.test(pullSrc2)
+    // ① 「补充全部包」不再把服务卡死：规划改成 mapLimit 并发读盘 + 同一次 packument 计算缺失
+    check('补 tarball 规划改为并发：mapLimit 多路 getAsync 读包，用同一次 packument 计算缺失（不再重复读盘）',
+      /async function planTargets\s*\(/.test(pullSrc2) && /mapLimit\(list, limit/.test(pullSrc2)
+        && /function planConcurrency/.test(pullSrc2) && /function missingTarballsFrom\s*\(/.test(pullSrc2)
         && /await store\.getAsync\(name\)/.test(pullSrc2) && /async getAsync\(name\)/.test(storeSrc2));
     check('HTTP 请求处理里 await 规划，任务直接复用已算好的 plan（同一批包不再规划两遍）',
       /await pull\.planTargets\(/.test(apiSrc2) && /Array\.isArray\(opts\.plan\)/.test(pullSrc2)
@@ -662,6 +662,54 @@ async function get(p, { json = false } = {}) {
         && /::ffff:/.test(utilSrc2) && /主机名 localhost 不等于回环/.test(utilSrc2));
     check('配置页提示与 cli.js 的 npmrc 识别同步写成「127.0.0.0/8 网段与 ::1」/ isLoopback 判断',
       js.text.includes('127.0.0.0/8 网段与 ::1') && /util\.isLoopback\(host\)/.test(cliSrc2));
+  }
+
+  console.log('\x1b[1m九之四、本地扫描 / 统计阶段全部并发（补 tarball 规划、导出统计、缓存扫描导入等）\x1b[0m');
+  {
+    const pullSrc3 = fs.readFileSync(path.join(__dirname, '..', 'src', 'pull.js'), 'utf8');
+    const bundleSrc3 = fs.readFileSync(path.join(__dirname, '..', 'src', 'bundle.js'), 'utf8');
+    const storeSrc3 = fs.readFileSync(path.join(__dirname, '..', 'src', 'store.js'), 'utf8');
+    const npmcacheSrc3 = fs.readFileSync(path.join(__dirname, '..', 'src', 'npmcache.js'), 'utf8');
+    const apiSrc3 = fs.readFileSync(path.join(__dirname, '..', 'src', 'api.js'), 'utf8');
+    const configSrc3 = fs.readFileSync(path.join(__dirname, '..', 'src', 'config.js'), 'utf8');
+    const depsSrc3 = fs.readFileSync(path.join(__dirname, '..', 'src', 'deps.js'), 'utf8');
+    const serverSrc3 = fs.readFileSync(path.join(__dirname, '..', 'src', 'server.js'), 'utf8');
+    const cliSrc3 = fs.readFileSync(path.join(__dirname, '..', 'cli.js'), 'utf8');
+
+    check('配置新增 storage.localScanConcurrency（默认 8，范围 1-64），配置页有「本地扫描并发」输入框',
+      /localScanConcurrency:\s*8/.test(configSrc3) && /clampInt\(st\.localScanConcurrency, 1, 64, 8\)/.test(configSrc3)
+        && /k: 'storage.localScanConcurrency'/.test(js.text) && /本地扫描并发/.test(js.text));
+
+    check('补 tarball 规划用 mapLimit 并发（多路 getAsync 读包，替代原来每 8 个包串行让出的实现）',
+      /mapLimit\(list, limit/.test(pullSrc3) && /await store\.getAsync\(name\)/.test(pullSrc3)
+        && /function planConcurrency/.test(pullSrc3) && !/PLAN_YIELD_EVERY/.test(pullSrc3));
+
+    check('导出备份的「统计包」阶段并发：collectDepClosure 异步分层 + collect 用 mapLimit + fsp.stat',
+      /async function collectDepClosure/.test(bundleSrc3) && /await mapLimit\(level,/.test(bundleSrc3)
+        && /const collected = await mapLimit\(targets,/.test(bundleSrc3) && /await fsp\.stat\(/.test(bundleSrc3));
+
+    check('导入备份解包后扫描并发：fsp.readdir + mapLimit 读 packument；准备/收尾改用 getAsync',
+      /await fsp\.readdir\(storageDir/.test(bundleSrc3) && /await mapLimit\(dirs,/.test(bundleSrc3)
+        && /await store\.getAsync\(st\.name\)/.test(bundleSrc3));
+
+    check('npm 缓存扫描 / 导入并发：walkFilesAsync + mapLimit 扫描两阶段、importFromCache 包级并发',
+      /function walkFilesAsync/.test(npmcacheSrc3) && /await mapLimit\(files,/.test(npmcacheSrc3)
+        && /await mapLimit\(Array\.from\(found/.test(npmcacheSrc3)
+        && /await mapLimit\(Array\.from\(wanted\),/.test(npmcacheSrc3));
+
+    check('store 启动索引加载并发（initAsync / reloadIndexAsync），server 监听前 await',
+      /async initAsync\(\)/.test(storeSrc3) && /async reloadIndexAsync\(\)/.test(storeSrc3)
+        && /await mapLimit\(dirs, 32,/.test(storeSrc3) && /await store\.initAsync\(\)/.test(serverSrc3));
+
+    check('包详情 cached 用内存索引 meta.files（不再逐版本 existsSync），依赖解析读包改 getAsync',
+      /meta\.files\s*\n?\s*\? Object\.prototype\.hasOwnProperty\.call\(meta\.files, v\)/.test(apiSrc3)
+        && /await ctx\.store\.getAsync\(name\)/.test(depsSrc3));
+
+    check('CLI 导出 / 导入 / 缓存扫描 / 缓存导入都传本地扫描并发（localScanConcurrency / scanConcurrency / concurrency）',
+      /localScanConcurrency: Math\.max\(1, Number\(config\.get\(\)\.storage\.localScanConcurrency\)/.test(cliSrc3)
+        && /scanConcurrency: Math\.max\(1, Number\(config\.get\(\)\.storage\.localScanConcurrency\)/.test(cliSrc3)
+        && (cliSrc3.match(/localScanConcurrency/g) || []).length >= 3
+        && /concurrency: Math\.max\(1, Number\(cfg\.storage\.localScanConcurrency\)/.test(cliSrc3));
   }
 
   console.log('\x1b[1m十、导入备份结束后的「失败 / 跳过详情」（整理在弹窗最下方，可一键复制）\x1b[0m');
