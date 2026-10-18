@@ -8,11 +8,14 @@ const { rootPath, ensureDir, writeJsonAtomic, randomToken } = require('./util');
 const CONFIG_FILE = rootPath('data', 'config.json');
 const MODES = ['cache', 'proxy', 'offline'];
 const LOG_LEVELS = ['debug', 'info', 'warn', 'error'];
-const OBJECT_SECTIONS = ['server', 'upstream', 'security', 'storage', 'log', 'ui'];
+const OBJECT_SECTIONS = ['server', 'admin', 'upstream', 'security', 'storage', 'log', 'ui'];
 
 function defaults() {
   return {
     server: { ip: '127.0.0.1', port: 4873, openBrowserOnStart: true },
+    // 管理界面独立监听：ip 只允许 127.0.0.0/8 的本地回环 IPv4（只有本机能访问管理界面），
+    // port 不能与 server.port 相同（两个监听不能共用同一个端口）。默认 4874，冲突时回退到 4873/server.port±1。
+    admin: { ip: '127.0.0.1', port: 4874 },
     mode: 'cache',                 // cache=本地优先并回源缓存 | proxy=过期即回源 | offline=纯离线
     upstream: {
       registry: 'https://registry.npmmirror.com',
@@ -61,6 +64,30 @@ function safeListenIp(ip) {
   if (!s) return '127.0.0.1';
   if (s === '0.0.0.0' || s === '::') return s;
   return net.isIP(s) ? s : '127.0.0.1';
+}
+
+/**
+ * 管理界面监听 IP 的严格校验：只允许 IPv4 的 127.0.0.0/8 网段（本地回环）。
+ * 这是安全需求：管理界面只能被本机访问，不能配置成 0.0.0.0、局域网 IP、主机名或 ::1。
+ */
+function isAdminListenIp(ip) {
+  const s = String(ip || '').trim();
+  if (!net.isIPv4(s)) return false;
+  return s.split('.')[0] === '127';
+}
+
+/** 管理界面监听 IP 规整：非法值回退到 127.0.0.1（API 保存时会直接报错，不会静默改值） */
+function safeAdminIp(ip) {
+  const s = String(ip || '').trim();
+  return isAdminListenIp(s) ? s : '127.0.0.1';
+}
+
+/** 管理界面端口：1-65535；与镜像源监听端口相同时回退到相邻端口（需求：两个端口不能一样） */
+function safeAdminPort(value, serverPort) {
+  const sp = clampInt(serverPort, 1, 65535, 4873);
+  let p = clampInt(value, 1, 65535, 4874);
+  if (p === sp) p = sp > 1 ? sp - 1 : sp + 1;
+  return p;
 }
 
 /** 存储目录：允许项目内相对路径或绝对路径（迁移到大磁盘），但拒绝空字节与磁盘根目录 */
@@ -120,6 +147,7 @@ function sanitize(input) {
   const d = defaults();
   const src = isPlainObject(input) ? input : {};
   const server = isPlainObject(src.server) ? src.server : {};
+  const admin = isPlainObject(src.admin) ? src.admin : {};
   const up = isPlainObject(src.upstream) ? src.upstream : {};
   const sec = isPlainObject(src.security) ? src.security : {};
   const st = isPlainObject(src.storage) ? src.storage : {};
@@ -127,6 +155,7 @@ function sanitize(input) {
   const ui = isPlainObject(src.ui) ? src.ui : {};
 
   const ip = String(server.ip || '').trim();
+  const serverPort = clampInt(server.port, 1, 65535, 4873);
   const registry = String(up.registry || '').trim();
   const level = String(lg.level || '').trim().toLowerCase();
   const title = String(ui.title || '').trim();
@@ -135,8 +164,13 @@ function sanitize(input) {
   return {
     server: {
       ip: safeListenIp(ip),
-      port: clampInt(server.port, 1, 65535, 4873),
+      port: serverPort,
       openBrowserOnStart: server.openBrowserOnStart !== false,
+    },
+    admin: {
+      // 管理界面监听：只允许 127.0.0.0/8 回环 IPv4；端口不能与镜像源端口相同
+      ip: safeAdminIp(admin.ip),
+      port: safeAdminPort(admin.port, serverPort),
     },
     mode: MODES.includes(String(src.mode)) ? String(src.mode) : 'cache',
     upstream: {
@@ -253,11 +287,25 @@ function storageDir() {
 function bundlesDir() { return rootPath('data', 'bundles'); }
 function logsDir() { return rootPath('data', 'logs'); }
 
-/** 需要在重启后才生效的字段 */
+/**
+ * 需要在重启后才生效的字段，按「需要重启谁」分类：
+ *   registry —— 镜像源监听（server.ip / server.port）：可只重启镜像源服务，管理界面不中断；
+ *   admin    —— 管理界面监听（admin.ip / admin.port）：可只重启管理界面，镜像源服务不中断；
+ *   program  —— 进程级配置（storage.dir）：只能重启整个程序。
+ */
+function restartChanges(before, after) {
+  const beforeAdmin = (before && before.admin) || {};
+  const afterAdmin = (after && after.admin) || {};
+  const registry = ['ip', 'port'].some(k => String(before.server[k]) !== String(after.server[k]));
+  const admin = ['ip', 'port'].some(k => String(beforeAdmin[k]) !== String(afterAdmin[k]));
+  const program = String(before.storage.dir) !== String(after.storage.dir);
+  return { registry, admin, program };
+}
+
+/** 是否有需要在重启后才生效的字段（兼容旧调用：任一需要重启即为 true） */
 function requiresRestart(before, after) {
-  const serverChanged = ['ip', 'port'].some(k => String(before.server[k]) !== String(after.server[k]));
-  const storageChanged = String(before.storage.dir) !== String(after.storage.dir);
-  return serverChanged || storageChanged;
+  const r = restartChanges(before, after);
+  return r.registry || r.admin || r.program;
 }
 
 /** 供界面显示：默认隐藏令牌 */
@@ -270,5 +318,6 @@ function publicConfig(reveal) {
 
 module.exports = {
   CONFIG_FILE, defaults, load, get, save, sanitize, rotateToken, storageDir, bundlesDir, logsDir,
-  publicConfig, requiresRestart, deepMerge,
+  publicConfig, requiresRestart, restartChanges, deepMerge,
+  isAdminListenIp, safeAdminIp, safeAdminPort,
 };

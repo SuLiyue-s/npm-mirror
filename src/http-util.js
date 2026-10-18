@@ -301,10 +301,29 @@ function lanUrls(port) {
   return lanAddresses().map(ip => `http://${ip}:${port}`);
 }
 
-/** 访问地址（0.0.0.0 时用回环地址展示） */
+/** 监听地址转 URL 主机名：0.0.0.0/:: 时用本机回环地址展示，IPv6 加方括号 */
+function urlHost(ip) {
+  const s = String(ip || '').trim();
+  if (!s || s === '0.0.0.0') return '127.0.0.1';
+  if (s === '::') return '::1';
+  return s;
+}
+
+/** 由监听 IP + 端口拼出访问地址（http） */
+function httpUrl(ip, port) {
+  const h = urlHost(ip);
+  return `http://${h.includes(':') ? `[${h}]` : h}:${port}`;
+}
+
+/** 镜像源访问地址（0.0.0.0 时用回环地址展示） */
 function registryUrl(cfg) {
-  const ip = !cfg.server.ip || cfg.server.ip === '0.0.0.0' || cfg.server.ip === '::' ? '127.0.0.1' : cfg.server.ip;
-  return `http://${ip}:${cfg.server.port}`;
+  return httpUrl(cfg.server.ip, cfg.server.port);
+}
+
+/** 管理界面访问地址（仅 127.0.0.0/8 回环地址） */
+function adminUrl(cfg) {
+  const admin = cfg.admin || {};
+  return httpUrl(admin.ip || '127.0.0.1', admin.port);
 }
 
 function hostName(hostHeader) {
@@ -346,5 +365,6 @@ function originAllowed(req) {
 
 module.exports = {
   MIME, sendJson, ok, fail, sendText, readBody, readJson, readBodyToFile, bodyToTempFile, tempFilePath,
-  streamFile, baseFor, clientIp, lanAddresses, lanUrls, registryUrl, hostName, hostAllowed, originAllowed,
+  streamFile, baseFor, clientIp, lanAddresses, lanUrls, urlHost, httpUrl, registryUrl, adminUrl,
+  hostName, hostAllowed, originAllowed,
 };

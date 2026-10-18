@@ -16,7 +16,7 @@
  *   2) 本机有 Chrome/Edge；在 DSH 沙箱下需放宽权限执行（浏览器多进程依赖命名管道）
  *   3) 上游可访问（「成功包」要真的能下到 tarball）
  * 用法：
- *   node test/ui-e2e-fail.js [--base http://127.0.0.1:4873] [--ok-pkg <包名>] [--bad-pkg mirror-e2e-bad-tarball] [--shot 截图\补tarball-失败不关闭.png]
+ *   node test/ui-e2e-fail.js [--base http://127.0.0.1:4874] [--ok-pkg <包名>] [--bad-pkg mirror-e2e-bad-tarball] [--shot 截图\补tarball-失败不关闭.png]
  */
 const { spawn } = require('node:child_process');
 const fs = require('node:fs');
@@ -28,7 +28,8 @@ function arg(name, def) {
   const i = args.indexOf('--' + name);
   return i >= 0 && args[i + 1] ? args[i + 1] : def;
 }
-const cfgPort = () => { try { return require('../src/config').get().server.port || 4873; } catch { return 4873; } };
+// BASE 指向管理界面（admin.port）：页面与 /__admin/api 都在管理界面监听上，镜像源监听只提供 registry 协议。
+const cfgPort = () => { try { const c = require('../src/config').get(); return (c.admin && c.admin.port) || c.server.port || 4874; } catch { return 4874; } };
 const BASE = arg('base', `http://127.0.0.1:${cfgPort()}`).replace(/\/+$/, '');
 const OK_PKG_ARG = arg('ok-pkg', ''); // 空 = 自动挑一个还有未缓存版本的上游包
 const BAD_PKG = arg('bad-pkg', 'mirror-e2e-bad-tarball');

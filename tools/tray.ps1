@@ -2,12 +2,17 @@
 #  私人 npm 镜像源 · Windows 托盘宿主（零依赖，只用系统自带的 PowerShell）
 #
 #  由「启动镜像源.cmd」在后台拉起，负责：
-#    · 等服务就绪后，把命令行窗口隐藏到右下角托盘，并注册项目图标（public\favicon.ico）
+#    · 两个独立监听：镜像源服务 server.ip:server.port（npm registry 协议）、
+#                    管理界面   admin.ip:admin.port  （管理页面 + /__admin/api/*）
+#    · 等管理界面就绪后，把命令行窗口隐藏到右下角托盘，并注册项目图标（public\favicon.ico）
 #    · 左键单击图标 = 打开管理界面（网页端控制台）
 #    · 右键菜单根据命令行窗口当前是显示还是隐藏，动态改变第一项，其余固定：
-#        显示中：【隐藏控制台】【打开管理界面】【重启镜像源】【退出镜像源】
-#        隐藏中：【打开控制台】【打开管理界面】【重启镜像源】【退出镜像源】
-#    · 重启镜像源 = 调管理接口让服务自己重启（数据/配置不变，托盘与窗口都保持）
+#        显示中：【隐藏控制台】【打开管理界面】【重启管理界面】【重启镜像源服务】【退出镜像源】
+#        隐藏中：【打开控制台】【打开管理界面】【重启管理界面】【重启镜像源服务】【退出镜像源】
+#    · 打开管理界面 = 用系统默认浏览器打开管理界面监听（admin.ip:admin.port）
+#    · 重启管理界面 = 只调管理接口重建管理界面监听；镜像源服务与托盘都不受影响
+#      （管理页面会短暂断连，恢复后刷新即可）
+#    · 重启镜像源服务 = 只调管理接口重建镜像源监听；管理界面不中断（数据/配置都不变）
 #    · 退出镜像源 = 调管理接口优雅停止服务 → 关闭命令行窗口 → 托盘图标消失
 #    · 服务被外部停止（比如双击「停止镜像源.cmd」）时，图标自动退出
 #
@@ -32,6 +37,9 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# Windows PowerShell 5.1 的 Invoke-WebRequest 默认会画进度条：托盘常驻后台、控制台可能不可见时，
+# 读取控制台输出缓冲区会抛 HostException（Access is denied），让所有探活误判为失败——直接关掉进度条。
+$ProgressPreference = 'SilentlyContinue'
 if (-not $Root) {
   if (-not $PSScriptRoot) {
     [Console]::Error.WriteLine('无法确定项目根目录：请用 -File 方式运行 tray.ps1，或显式传 -Root <项目目录>')
@@ -104,32 +112,58 @@ $ICON_SMALL = [IntPtr]0
 $ICON_BIG = [IntPtr]1
 
 # ---------- 配置 ----------
+# 两个独立监听（端口不能相同，后端 config 会做冲突回退）：
+#   · 镜像源服务 server.ip:server.port —— npm registry 协议，探活用 /-/ping
+#   · 管理界面   admin.ip:admin.port   —— 管理页面 + /__admin/api/*
 function Read-MirrorConfig {
   $file = Join-Path $Root 'data\config.json'
-  $cfg = [pscustomobject]@{ port = 4873; token = '' }
+  # 老配置可能没有 admin 段：按后端 safeAdminPort 的默认值 4874 兜底（src/config.js），
+  # 否则托盘会探到镜像源监听（/__admin/api/* 在那边返回 403 EADMINONLY），永远等不到就绪。
+  $cfg = [pscustomobject]@{ port = 4873; adminPort = 4874; token = '' }
   try {
     if (Test-Path $file) {
       $j = Get-Content $file -Raw -Encoding UTF8 | ConvertFrom-Json
       if ($j.server -and $j.server.port) { $cfg.port = [int]$j.server.port }
+      if ($j.admin -and $j.admin.port) { $cfg.adminPort = [int]$j.admin.port }
       if ($j.security -and $j.security.token) { $cfg.token = [string]$j.security.token }
     }
   } catch { /* 配置读不了就用默认端口 */ }
+  # 两个监听不能共用端口：管理端口与镜像源端口相同时退到相邻端口（与后端 config 的规则一致）
+  if ($cfg.adminPort -eq $cfg.port) {
+    if ($cfg.port -gt 1) { $cfg.adminPort = $cfg.port - 1 } else { $cfg.adminPort = $cfg.port + 1 }
+  }
   return $cfg
 }
 
 $script:Cfg = Read-MirrorConfig
 $script:Port = $script:Cfg.port
+$script:AdminPort = $script:Cfg.adminPort
 $script:Token = $script:Cfg.token
 
+# 管理界面地址（管理页面 + /__admin/api/*）
 function Get-ServiceUrl([string]$Path) {
+  return ('http://127.0.0.1:{0}{1}' -f $script:AdminPort, $Path)
+}
+
+# 镜像源服务地址（npm registry 协议，探活用 /-/ping）
+function Get-RegistryUrl([string]$Path) {
   return ('http://127.0.0.1:{0}{1}' -f $script:Port, $Path)
 }
 
+# 管理界面探活：GET /__admin/api/session 200
 function Test-Service {
   try {
     # 超时放宽到 5 秒：服务正在跑「补全部包」这类大任务时，偶发一两次响应慢属于正常忙碌，
     # 不能因此判定服务已经停止（见下面健康检查里的进程存活二次确认）。
     $r = Invoke-WebRequest -UseBasicParsing -Uri (Get-ServiceUrl '/__admin/api/session') -TimeoutSec 5
+    return [bool]($r.StatusCode -eq 200)
+  } catch { return $false }
+}
+
+# 镜像源服务探活：GET /-/ping 200（2 秒超时；管理界面重启不影响它）
+function Test-Registry {
+  try {
+    $r = Invoke-WebRequest -UseBasicParsing -Uri (Get-RegistryUrl '/-/ping') -TimeoutSec 2
     return [bool]($r.StatusCode -eq 200)
   } catch { return $false }
 }
@@ -220,13 +254,13 @@ function Set-ConsoleVisible([bool]$Visible) {
 }
 
 # 右键菜单文案（按当前命令行窗口显示状态决定；自检也用同一个函数）
-# 「打开管理界面」「重启镜像源」与窗口状态无关，始终存在
+# 「打开管理界面」「重启管理界面」「重启镜像源服务」与窗口状态无关，始终存在
 function Get-MenuLabels([bool]$ConsoleVisible) {
   $toggle = if ($ConsoleVisible) { '隐藏控制台' } else { '打开控制台' }
-  return @($toggle, '打开管理界面', '重启镜像源', '退出镜像源')
+  return @($toggle, '打开管理界面', '重启管理界面', '重启镜像源服务', '退出镜像源')
 }
 
-# 打开管理界面：用系统默认浏览器打开镜像源的网页端首页
+# 打开管理界面：用系统默认浏览器打开管理界面监听（管理页面，admin.ip:admin.port）
 function Open-ManagementUi {
   $url = Get-ServiceUrl '/'
   Write-TrayLog ('用户选择「打开管理界面」：{0}' -f $url)
@@ -245,51 +279,98 @@ function Open-ManagementUi {
   }
 }
 
-# 重启镜像源：调管理接口让服务自己重启（旧进程退出、拉新进程，端口/数据/配置都不变）。
-# 不关控制台窗口、退出托盘；重启期间健康检查会短暂失败，用 $script:Restarting 标记跳过，
-# 避免托盘把「正在重启」误判成「服务已停止」而自杀。
+# 重启管理界面：调管理接口只重建管理界面监听（镜像源服务不中断，托盘不退出）。
+# 重启期间管理接口会短暂不可用，健康检查用 $script:AdminRestarting 标记跳过，
+# 避免托盘把「正在重启管理界面」误判成「服务已停止」而自杀。
+function Restart-AdminUi {
+  if ($script:Closing) { return }
+  if ($script:AdminRestarting) { Write-TrayLog '正在重启管理界面，忽略重复的「重启管理界面」请求'; return }
+  $script:AdminRestarting = $true
+  Write-TrayLog '用户选择「重启管理界面」：请求重启管理界面监听'
+  try {
+    $headers = @{ 'X-Mirror-Token' = $script:Token }
+    $resp = Invoke-WebRequest -UseBasicParsing -Method Post -Uri (Get-ServiceUrl '/__admin/api/service/restart-admin') -Headers $headers -TimeoutSec 10
+    $accepted = $false
+    try { $accepted = [bool](($resp.Content | ConvertFrom-Json).ok) } catch { /* 忽略 */ }
+    if (-not $accepted) { throw '重启接口没有返回 ok=true' }
+    Write-TrayLog '管理界面重启请求已受理（只重建管理界面监听），等待管理界面恢复…'
+    if ($script:Notify) {
+      $script:Notify.ShowBalloonTip(3000, '正在重启管理界面', '管理界面监听正在重建，稍等几秒…', [System.Windows.Forms.ToolTipIcon]::Info)
+    }
+    # 先给旧监听一点时间释放端口，再轮询管理界面是否恢复（最多 60 秒）
+    Start-Sleep -Milliseconds 800
+    $deadline = (Get-Date).AddSeconds(60)
+    $ok = $false
+    while ((Get-Date) -lt $deadline) {
+      if (Test-Service) { $ok = $true; break }
+      Start-Sleep -Milliseconds 400
+    }
+    if ($ok) {
+      Write-TrayLog '管理界面已重启，管理接口已恢复'
+      if ($script:Notify) {
+        $script:Notify.Text = ('私人 npm 镜像源 · 运行中（{0}）' -f (Get-ServiceUrl '/'))
+        $script:Notify.ShowBalloonTip(3000, '管理界面已重启', ('管理界面已恢复：{0}（浏览器页面如需可刷新）' -f (Get-ServiceUrl '/')), [System.Windows.Forms.ToolTipIcon]::Info)
+      }
+    } else {
+      Write-TrayLog '重启管理界面后等待恢复超时（镜像源服务不受影响），请打开控制台查看日志'
+      if ($script:Notify) { $script:Notify.ShowBalloonTip(5000, '重启管理界面超时', '管理界面 60 秒内没有恢复；镜像源服务不受影响，请打开控制台检查日志', [System.Windows.Forms.ToolTipIcon]::Warning) }
+    }
+  } catch {
+    Write-TrayLog ('重启管理界面失败：{0}' -f $_.Exception.Message)
+    if ($script:Notify) { $script:Notify.ShowBalloonTip(5000, '重启管理界面失败', ('{0}' -f $_.Exception.Message), [System.Windows.Forms.ToolTipIcon]::Error) }
+  } finally {
+    $script:AdminRestarting = $false
+    $script:HealthFail = 0
+    if ($script:Notify -and -not $script:Closing) {
+      $script:Notify.Text = ('私人 npm 镜像源 · 运行中（{0}）' -f (Get-ServiceUrl '/'))
+    }
+  }
+}
+
+# 重启镜像源服务：调管理接口只重建镜像源监听（端口/数据/配置都不变，管理界面与托盘都保持）。
+# 恢复判定用镜像源自己的 /-/ping（管理界面不会中断，不能拿 Test-Service 代替）；
+# 期间健康检查用 $script:Restarting 标记跳过更稳妥。
 function Restart-MirrorService {
   if ($script:Closing) { return }
-  if ($script:Restarting) { Write-TrayLog '正在重启中，忽略重复的「重启镜像源」请求'; return }
+  if ($script:Restarting) { Write-TrayLog '正在重启镜像源服务，忽略重复的「重启镜像源服务」请求'; return }
   $script:Restarting = $true
-  Write-TrayLog '用户选择「重启镜像源」：请求重启服务'
+  Write-TrayLog '用户选择「重启镜像源服务」：请求重启镜像源监听'
   try {
     $headers = @{ 'X-Mirror-Token' = $script:Token }
     $resp = Invoke-WebRequest -UseBasicParsing -Method Post -Uri (Get-ServiceUrl '/__admin/api/service/restart') -Headers $headers -TimeoutSec 10
     $accepted = $false
     try { $accepted = [bool](($resp.Content | ConvertFrom-Json).ok) } catch { /* 忽略 */ }
     if (-not $accepted) { throw '重启接口没有返回 ok=true' }
-    Write-TrayLog '重启请求已受理（旧进程会退出并拉起新进程），等待服务恢复…'
+    Write-TrayLog '镜像源重启请求已受理（只重建镜像源监听，管理界面不中断），等待镜像源恢复…'
     if ($script:Notify) {
-      $script:Notify.Text = '私人 npm 镜像源 · 正在重启…'
-      $script:Notify.ShowBalloonTip(3000, '正在重启镜像源', '服务正在重启，稍等几秒…', [System.Windows.Forms.ToolTipIcon]::Info)
+      $script:Notify.ShowBalloonTip(3000, '正在重启镜像源服务', '镜像源监听正在重建，稍等几秒…', [System.Windows.Forms.ToolTipIcon]::Info)
     }
-    # 先给旧进程一点时间退出，再等新进程把端口监听起来（最多 90 秒）
-    Start-Sleep -Milliseconds 1500
+    # 先给旧监听一点时间退出，再轮询镜像源 /-/ping 是否恢复（最多 90 秒）
+    Start-Sleep -Milliseconds 800
     $started = Get-Date
     $deadline = $started.AddSeconds(90)
     $wentDown = $false
     $ok = $false
     while ((Get-Date) -lt $deadline) {
-      Start-Sleep -Milliseconds 400
-      if (-not (Test-Service)) { $wentDown = $true; continue }
-      # 见过「服务消失」再恢复才算重启成功；若旧进程退得太快没观察到 down，
-      # 3 秒后仍在正常响应也认为重启完成（新进程已接替）
+      if (-not (Test-Registry)) { $wentDown = $true; Start-Sleep -Milliseconds 400; continue }
+      # 见过「镜像源消失」再恢复才算重启成功；若旧监听退得太快没观察到 down，
+      # 3 秒后仍在正常响应也认为重启完成（新监听已接替）
       if ($wentDown -or ((Get-Date) - $started).TotalSeconds -ge 3) { $ok = $true; break }
+      Start-Sleep -Milliseconds 400
     }
     if ($ok) {
-      Write-TrayLog '镜像源重启完成，服务已恢复'
+      Write-TrayLog '镜像源服务重启完成，/-/ping 已恢复'
       if ($script:Notify) {
         $script:Notify.Text = ('私人 npm 镜像源 · 运行中（{0}）' -f (Get-ServiceUrl '/'))
-        $script:Notify.ShowBalloonTip(3000, '镜像源已重启', ('服务已恢复：{0}' -f (Get-ServiceUrl '/')), [System.Windows.Forms.ToolTipIcon]::Info)
+        $script:Notify.ShowBalloonTip(3000, '镜像源服务已重启', ('镜像源服务已恢复：{0}' -f (Get-RegistryUrl '/')), [System.Windows.Forms.ToolTipIcon]::Info)
       }
     } else {
-      Write-TrayLog '重启后等待服务恢复超时（可能还在启动或启动失败），请打开控制台查看'
-      if ($script:Notify) { $script:Notify.ShowBalloonTip(5000, '镜像源重启超时', '请打开控制台检查服务日志', [System.Windows.Forms.ToolTipIcon]::Warning) }
+      Write-TrayLog '重启镜像源服务后等待 /-/ping 恢复超时（管理界面仍在运行），请打开控制台查看日志'
+      if ($script:Notify) { $script:Notify.ShowBalloonTip(5000, '重启镜像源服务超时', '镜像源服务 90 秒内没有恢复；管理界面仍可用，请查看服务日志', [System.Windows.Forms.ToolTipIcon]::Warning) }
     }
   } catch {
-    Write-TrayLog ('重启镜像源失败：{0}' -f $_.Exception.Message)
-    if ($script:Notify) { $script:Notify.ShowBalloonTip(5000, '重启镜像源失败', ('{0}' -f $_.Exception.Message), [System.Windows.Forms.ToolTipIcon]::Error) }
+    Write-TrayLog ('重启镜像源服务失败：{0}' -f $_.Exception.Message)
+    if ($script:Notify) { $script:Notify.ShowBalloonTip(5000, '重启镜像源服务失败', ('{0}' -f $_.Exception.Message), [System.Windows.Forms.ToolTipIcon]::Error) }
   } finally {
     $script:Restarting = $false
     if ($script:Notify -and -not $script:Closing) {
@@ -321,7 +402,10 @@ if ($SelfTest) {
     visibleMenu = @(Get-MenuLabels $true)
     hiddenMenu = @(Get-MenuLabels $false)
     servicePort = $script:Port
+    adminPort = $script:AdminPort
+    registryPort = $script:Port
     managementUrl = Get-ServiceUrl '/'
+    registryUrl = Get-RegistryUrl '/'
   }
   $json = ($result | ConvertTo-Json -Compress)
   if ($SelfTestOut) {
@@ -332,8 +416,8 @@ if ($SelfTest) {
   exit 0
 }
 
-# ---------- 等镜像源就绪（就绪前保持命令行窗口可见，启动失败的报错不会被吞掉） ----------
-Write-TrayLog ('托盘宿主启动：root={0} port={1} wait={2}s' -f $Root, $script:Port, $WaitSeconds)
+# ---------- 等管理界面就绪（就绪前保持命令行窗口可见，启动失败的报错不会被吞掉） ----------
+Write-TrayLog ('托盘宿主启动：root={0} registryPort={1} adminPort={2} wait={3}s' -f $Root, $script:Port, $script:AdminPort, $WaitSeconds)
 $deadline = (Get-Date).AddSeconds([Math]::Max(5, $WaitSeconds))
 $ready = $false
 while ((Get-Date) -lt $deadline) {
@@ -354,6 +438,7 @@ if ($script:ConsoleHwnd -ne [IntPtr]::Zero) {
 $script:Closing = $false
 $script:HealthFail = 0
 $script:Restarting = $false
+$script:AdminRestarting = $false
 $script:Context = New-Object System.Windows.Forms.ApplicationContext
 $script:Notify = $null
 $script:Timer = $null
@@ -375,10 +460,10 @@ function Stop-Tray([bool]$CloseConsole) {
   [System.Environment]::Exit(0)
 }
 
-# ---------- 退出镜像源：先优雅停服务，再关窗口、退托盘 ----------
+# ---------- 退出镜像源：先优雅停服务（管理接口 → 整个程序退出），再关窗口、退托盘 ----------
 function Stop-MirrorAndExit {
   if ($script:Closing) { return }
-  Write-TrayLog '用户选择「退出镜像源」：请求停止服务'
+  Write-TrayLog '用户选择「退出镜像源」：请求停止整个程序（镜像源服务 + 管理界面）'
   try {
     if (Test-Service) {
       $headers = @{ 'X-Mirror-Token' = $script:Token }
@@ -429,7 +514,7 @@ try {
   }
 } catch { Write-TrayLog ('设置命令行窗口图标失败：{0}' -f $_.Exception.Message) }
 
-# ---------- 右键菜单（每次弹出时按当前窗口状态重建，保证只显示该显示的控制台项；「打开管理界面」「重启镜像源」「退出镜像源」始终在） ----------
+# ---------- 右键菜单（每次弹出时按当前窗口状态重建，保证只显示该显示的控制台项；「打开管理界面」「重启管理界面」「重启镜像源服务」「退出镜像源」始终在） ----------
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 function Rebuild-Menu {
   $menu.Items.Clear()
@@ -440,10 +525,12 @@ function Rebuild-Menu {
   })
   $openUi = $menu.Items.Add($labels[1])
   $openUi.add_Click({ [void](Open-ManagementUi) })
-  $restart = $menu.Items.Add($labels[2])
-  $restart.add_Click({ Restart-MirrorService })
+  $restartAdmin = $menu.Items.Add($labels[2])
+  $restartAdmin.add_Click({ Restart-AdminUi })
+  $restartMirror = $menu.Items.Add($labels[3])
+  $restartMirror.add_Click({ Restart-MirrorService })
   [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
-  $exit = $menu.Items.Add($labels[3])
+  $exit = $menu.Items.Add($labels[4])
   $exit.add_Click({ Stop-MirrorAndExit })
 }
 $menu.add_Opening({ Rebuild-Menu })
@@ -458,12 +545,14 @@ $notify.add_MouseClick({
 # 注意：服务「忙」和「已停止」必须区分开。大任务（如补全部包）期间接口可能连续几秒没响应，
 # 以前 3 次探测失败就直接关控制台窗口，等于把还活着的 node 进程一起杀掉。
 # 现在失败 5 次后先看 data/mirror.pid 里的进程是否真的还在：还活着就只记日志、继续等。
+# 探活只打管理界面的 /__admin/api/session：重启镜像源服务时管理界面不中断，托盘不会因此误退出；
+# 重启管理界面期间用 $script:AdminRestarting 跳过，避免把「正在重启」误判成「服务已停止」。
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 4000
 $timer.add_Tick({
   if ($script:Closing) { return }
-  # 正在重启时服务必然短暂不可用：跳过检查，等 Restart-MirrorService 自己等到恢复
-  if ($script:Restarting) { return }
+  # 正在重启时对应监听必然短暂不可用：跳过检查，等 Restart-* 自己等到恢复
+  if ($script:Restarting -or $script:AdminRestarting) { return }
   if (Test-Service) {
     $script:HealthFail = 0
     if (-not $script:Closing -and $script:Notify) { $script:Notify.Text = ('私人 npm 镜像源 · 运行中（{0}）' -f (Get-ServiceUrl '/')) }

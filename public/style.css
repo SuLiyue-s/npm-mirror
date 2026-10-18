@@ -176,9 +176,11 @@ code,kbd,pre{font-family:var(--mono)}
 .lamp-grn{background:var(--grn);box-shadow:0 0 8px var(--grn)}
 .lamp-warn{background:var(--am);box-shadow:0 0 8px var(--am)}
 .lamp-idle{background:#3b4b59}
-/* 顶栏「与镜像源连接状态」：正常为青灯；断线变红灯并轻微呼吸，恢复连接后页面自动刷新 */
-.chip-conn{min-width:96px}
+/* 顶栏两个连接状态 chip：管理界面 / 镜像源服务（两种探测分开显示，互不混淆）
+ * 正常为青灯；断线变红灯并轻微呼吸；镜像源服务状态恢复只更新灯和文案，不刷新界面 */
+.chip-conn{min-width:132px;justify-content:center}
 .chip-conn.is-red{animation:conn-blink 1.6s ease-in-out infinite}
+.chip-conn.is-idle{border-color:var(--line);color:var(--txt-faint);background:#0c1219}
 @keyframes conn-blink{0%,100%{opacity:1}50%{opacity:.66}}
 
 @keyframes breathe{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.42;transform:scale(.82)}}

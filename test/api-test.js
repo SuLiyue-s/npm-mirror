@@ -16,16 +16,27 @@ const tar = require('../src/tar');
 config.load();
 const cfg = config.get();
 const TOKEN = cfg.security.token;
+// 管理界面监听地址：管理 API 与网页都只在这个地址上（默认 config.admin.ip:admin.port）。
+// 镜像源监听是另一个端口（registry 协议），见下面的 REG_BASE。
 const BASE = (() => {
   const i = process.argv.indexOf('--base');
   if (i > 0 && process.argv[i + 1]) return process.argv[i + 1].replace(/\/+$/, '');
+  const admin = cfg.admin || {};
+  return `http://127.0.0.1:${admin.port || cfg.server.port}`;
+})();
+// 镜像源监听地址：npm 客户端用的 registry 协议（/-/ping、包下载、发布等）走这里。
+// 两个监听端口必须不同（后端有校验），测试分别用 --base 与 --registry-base 指定。
+const REG_BASE = (() => {
+  const i = process.argv.indexOf('--registry-base');
+  if (i > 0 && process.argv[i + 1]) return process.argv[i + 1].replace(/\/+$/, '');
   return `http://127.0.0.1:${cfg.server.port}`;
 })();
-// 端口/主机统一从 BASE 推导：支持 --base 指向别的端口（npmrc、裸 http 用例都跟着走），
-// 不再用本地 config 里的端口，避免「--base 指 5000、断言却打 4873」的错位。
 const BASE_URL = new URL(BASE);
 const BASE_HOST = BASE_URL.hostname.replace(/^\[|\]$/g, ''); // http.request 的 host 不能带 IPv6 方括号
 const BASE_PORT = Number(BASE_URL.port || 80);
+const REG_URL = new URL(REG_BASE);
+const REG_HOST = REG_URL.hostname.replace(/^\[|\]$/g, '');
+const REG_PORT = Number(REG_URL.port || 80);
 
 // 破坏性用例（重启服务、清空日志）默认不跑：自检不应替用户重启服务或删掉日志。
 // 需要时显式加 --destructive。
@@ -92,13 +103,17 @@ async function makeTarball(dir, pkg) {
  * 裸 http 请求：用于需要伪造 Host/Origin 头、或故意保留 URL 里 %5C/%2F 编码的用例。
  * （Node 的 fetch 不允许改 Host、会规范化 URL，测不了这些边界。）
  */
-function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 15000 } = {}) {
+function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 15000, base } = {}) {
   const httpMod = require('node:http');
+  // 默认打管理界面；传 base: REG_BASE 表示打镜像源监听（registry 协议用例）
+  const target = base ? new URL(base) : BASE_URL;
+  const host = target.hostname.replace(/^\[|\]$/g, '');
+  const port = Number(target.port || 80);
   return new Promise((resolve) => {
     // agent: false = 每次开新连接。node:http 的全局 agent 默认 keep-alive，
     // 而本文件有用例故意「声明了很大的 Content-Length 却不发完」（验证服务端提前 413 并断连），
     // 那条连接会被服务端 close，若下一个请求恰好复用到它就会一直等不到响应（假超时）。
-    const req = httpMod.request({ host: BASE_HOST, port: BASE_PORT, path: pathname, method, headers, agent: false }, (res) => {
+    const req = httpMod.request({ host, port, path: pathname, method, headers, agent: false }, (res) => {
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
       res.on('end', () => resolve({ status: res.statusCode, text: Buffer.concat(chunks).toString('utf8'), headers: res.headers }));
@@ -117,7 +132,7 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
   const PRIVATE = 'mirror-selftest-private';
   const PRIVATE2 = '@mirror-selftest/scoped-pkg';
 
-  process.stdout.write(`\x1b[1m私人 npm 镜像源自检\x1b[0m  目标：${BASE}\n`);
+  process.stdout.write(`\x1b[1m私人 npm 镜像源自检\x1b[0m  管理界面：${BASE}  镜像源：${REG_BASE}\n`);
 
   // 清理上一轮遗留的「自检专用」数据（mirror-selftest-* 只可能由本脚本创建，删掉是安全的）。
   // 注意：不在开头删 ms / lodash 等真实公共包——它们是用户镜像里的真实数据，
@@ -131,11 +146,11 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
   // ---------------------------------------------------------------- 基础协议
   section('一、基础协议');
   {
-    const r = await api('/-/ping');
+    const r = await api('/-/ping', { base: REG_BASE });
     check('GET /-/ping 返回 {}', r.status === 200 && r.json && Object.keys(r.json).length === 0, `status=${r.status}`);
   }
   {
-    const r = await api('/-/whoami');
+    const r = await api('/-/whoami', { base: REG_BASE });
     // 期望用户名以「服务端当前配置」为准：直接改磁盘 config.json 时服务内存里仍是旧值，
     // 不能拿本地文件里的值来断言，否则测试会假失败。
     let serverUser = cfg.security.username || 'admin';
@@ -147,27 +162,27 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
       `${JSON.stringify(r.json)} 期望=${serverUser}`);
   }
   {
-    const r = await api('/-/user/org.couchdb.user:admin', { method: 'PUT', body: { name: 'admin', password: 'x' } });
+    const r = await api('/-/user/org.couchdb.user:admin', { method: 'PUT', body: { name: 'admin', password: 'x' } , base: REG_BASE });
     check('PUT /-/user/... 登录返回令牌', r.status === 201 && r.json && r.json.token === TOKEN, `status=${r.status}`);
   }
   {
-    const r = await api('/-/v1/login');
+    const r = await api('/-/v1/login', { base: REG_BASE });
     check('GET /-/v1/login 明确不支持网页登录', r.status === 404 && r.json && r.json.code === 'ENOWEBLOGIN', `status=${r.status}`);
   }
   {
-    const r = await api('/-/npm/v1/security/audits/quick', { method: 'POST', body: {} });
+    const r = await api('/-/npm/v1/security/audits/quick', { method: 'POST', body: {}, base: REG_BASE });
     check('POST audits/quick 返回空报告', r.status === 200, `status=${r.status}`);
   }
   {
-    const r = await api('/-/npm/v1/security/advisories/bulk', { method: 'POST', body: {} });
+    const r = await api('/-/npm/v1/security/advisories/bulk', { method: 'POST', body: {}, base: REG_BASE });
     check('POST advisories/bulk 返回 200', r.status === 200, `status=${r.status}`);
   }
   {
-    const r = await api('/mirror-selftest-nonexistent-zzz');
+    const r = await api('/mirror-selftest-nonexistent-zzz', { base: REG_BASE });
     check('GET 不存在的包返回 404', r.status === 404, `status=${r.status}`);
   }
   {
-    const r = await api('/%E4%B8%8D%E5%90%88%E6%B3%95%E7%9A%84%E5%8C%85%E5%90%8D');
+    const r = await api('/%E4%B8%8D%E5%90%88%E6%B3%95%E7%9A%84%E5%8C%85%E5%90%8D', { base: REG_BASE });
     check('GET 非法包名返回 400', r.status === 400, `status=${r.status}`);
   }
 
@@ -176,6 +191,30 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
   {
     const r = await api('/__admin/api/session', { auth: false });
     check('GET /session 免鉴权且返回监听信息', r.status === 200 && r.json && r.json.data && !!r.json.data.registryUrl, `status=${r.status}`);
+  }
+  {
+    // 双监听：管理界面（admin）与镜像源（registry）是两个独立端口，管理 API 只在管理界面监听上可用
+    const s = await api('/__admin/api/session');
+    const d = (s.json || {}).data || {};
+    check('GET /session 区分两组监听（listen=镜像源端口，admin=管理界面端口）',
+      s.status === 200 && !!d.listen && !!d.admin &&
+      Number(d.listen.port) === REG_PORT && Number(d.admin.port) === BASE_PORT,
+      `listen=${JSON.stringify(d.listen)} admin=${JSON.stringify(d.admin)}`);
+    check('GET /session 同时对管理界面与镜像源服务做探测（admin 实例信息 + registry.reachable/latencyMs）',
+      !!d.admin && typeof d.admin.listenError === 'string' && !!d.registry &&
+      d.registry.reachable === true && Number.isFinite(Number(d.registry.latencyMs)),
+      `admin=${JSON.stringify(d.admin)} registry=${JSON.stringify(d.registry)}`);
+    const onRegistry = await fetch(REG_BASE + '/__admin/api/session', { signal: AbortSignal.timeout(5000) });
+    check('镜像源监听不提供管理 API（/__admin/api/* 返回 403 EADMINONLY）',
+      onRegistry.status === 403, `status=${onRegistry.status}`);
+    const home = await fetch(REG_BASE + '/', { redirect: 'manual', signal: AbortSignal.timeout(5000) });
+    const homeLoc = String(home.headers.get('location') || '');
+    check('本机访问镜像源首页 302 跳转到管理界面监听（管理页面不挂在镜像源端口上）',
+      home.status === 302 && homeLoc.startsWith(BASE), `status=${home.status} location=${homeLoc}`);
+    const adminHome = await fetch(BASE + '/', { signal: AbortSignal.timeout(5000) });
+    const adminHomeText = await adminHome.text();
+    check('管理界面监听直接提供管理页面（首页 200 且是 HTML）',
+      adminHome.status === 200 && /<html/i.test(adminHomeText), `status=${adminHome.status}`);
   }
   {
     // 前端要靠这两个上限做体积预检：超限直接提示「放进 data\bundles 再导入」，而不是让浏览器干等后报网络错误
@@ -203,9 +242,9 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
     check('GET /config 默认打码令牌', r.status === 200 && c && c.security.token !== TOKEN, c && c.security && c.security.token);
   }
   {
-    const r = await api('/__admin/api/npmrc', { method: 'POST', body: { ip: BASE_HOST, port: BASE_PORT, token: true } });
+    const r = await api('/__admin/api/npmrc', { method: 'POST', body: { ip: REG_HOST, port: REG_PORT, token: true } });
     const d = r.json && r.json.data;
-    check('POST /npmrc 生成 .npmrc（token:true 用服务端令牌）', r.status === 200 && d && d.npmrc.includes(`_authToken=${TOKEN}`) && d.npmrc.includes(`registry=http://${BASE_HOST}:${BASE_PORT}/`) && !d.npmrc.includes('_authToken=true'), d && d.registry);
+    check('POST /npmrc 生成 .npmrc（token:true 用服务端令牌）', r.status === 200 && d && d.npmrc.includes(`_authToken=${TOKEN}`) && d.npmrc.includes(`registry=http://${REG_HOST}:${REG_PORT}/`) && !d.npmrc.includes('_authToken=true'), d && d.registry);
   }
   {
     const r = await api('/__admin/api/logs?lines=10');
@@ -235,19 +274,19 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
     check('POST /packages 添加公共包 ms@2.1.3', r.status === 200 && d && ((Array.isArray(d.added) && d.added.length >= 1) || (Array.isArray(d.skipped) && d.skipped.length >= 1)), JSON.stringify(d).slice(0, 200));
   }
   {
-    const r = await api('/ms', { headers: { Accept: 'application/vnd.npm.install-v1+json' } });
+    const r = await api('/ms', { headers: { Accept: 'application/vnd.npm.install-v1+json' }, base: REG_BASE });
     const d = r.json;
     check('GET /ms 返回 packument（含 2.1.3）', r.status === 200 && d && d.versions && d.versions['2.1.3'], `status=${r.status}`);
     if (d && d.versions && d.versions['2.1.3']) {
-      check('packument 的 tarball 地址指向本镜像', String(d.versions['2.1.3'].dist.tarball).startsWith(BASE), d.versions['2.1.3'].dist.tarball);
+      check('packument 的 tarball 地址指向本镜像', String(d.versions['2.1.3'].dist.tarball).startsWith(REG_BASE), d.versions['2.1.3'].dist.tarball);
     }
   }
   {
-    const r = await api('/ms/2.1.3');
+    const r = await api('/ms/2.1.3', { base: REG_BASE });
     check('GET /ms/2.1.3 返回单版本元数据', r.status === 200 && r.json && r.json.version === '2.1.3', `status=${r.status}`);
   }
   {
-    const r = await fetch(`${BASE}/ms/-/ms-2.1.3.tgz`, { signal: AbortSignal.timeout(60000) });
+    const r = await fetch(`${REG_BASE}/ms/-/ms-2.1.3.tgz`, { signal: AbortSignal.timeout(60000) });
     const buf = Buffer.from(await r.arrayBuffer());
     check('GET tarball 可下载且为 gzip', r.status === 200 && buf.length > 1000 && buf[0] === 0x1f && buf[1] === 0x8b, `status=${r.status} bytes=${buf.length}`);
   }
@@ -274,23 +313,23 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
       versions: {
         '1.0.0': {
           name: PRIVATE, version: '1.0.0', description: '镜像源自检私有包', main: 'index.js',
-          dist: { shasum: util.sha1hex(pub.buffer), integrity: util.integrityOf(pub.buffer), tarball: `${BASE}/${PRIVATE}/-/${PRIVATE}-1.0.0.tgz` },
+          dist: { shasum: util.sha1hex(pub.buffer), integrity: util.integrityOf(pub.buffer), tarball: `${REG_BASE}/${PRIVATE}/-/${PRIVATE}-1.0.0.tgz` },
         },
       },
       _attachments: { [`${PRIVATE}-1.0.0.tgz`]: { content_type: 'application/octet-stream', data: pub.buffer.toString('base64'), length: pub.buffer.length } },
     };
-    const r = await api(`/${PRIVATE}`, { method: 'PUT', body, timeoutMs: 60000 });
+    const r = await api(`/${PRIVATE}`, { method: 'PUT', body, timeoutMs: 60000, base: REG_BASE });
     check('PUT /<包名> 发布私有包', r.status === 201 || r.status === 200, `status=${r.status} ${r.text.slice(0, 120)}`);
   }
   {
-    const r = await api(`/${PRIVATE}`);
+    const r = await api(`/${PRIVATE}`, { base: REG_BASE });
     const d = r.json;
     const v = d && d.versions && d.versions['1.0.0'];
     check('发布后 GET 可读到版本', r.status === 200 && !!v, `status=${r.status}`);
-    if (v) check('私有包 tarball 地址被改写为本镜像', String(v.dist.tarball).startsWith(BASE), v.dist.tarball);
+    if (v) check('私有包 tarball 地址被改写为本镜像', String(v.dist.tarball).startsWith(REG_BASE), v.dist.tarball);
   }
   {
-    const r = await fetch(`${BASE}/${PRIVATE}/-/${PRIVATE}-1.0.0.tgz`, { signal: AbortSignal.timeout(30000) });
+    const r = await fetch(`${REG_BASE}/${PRIVATE}/-/${PRIVATE}-1.0.0.tgz`, { signal: AbortSignal.timeout(30000) });
     const buf = Buffer.from(await r.arrayBuffer());
     check('私有包 tarball 可下载且内容一致', r.status === 200 && buf.equals(pub.buffer), `status=${r.status} bytes=${buf.length}/${pub.buffer.length}`);
   }
@@ -302,7 +341,7 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
       versions: { '1.0.0': { name: PRIVATE, version: '1.0.0', dist: { integrity: util.integrityOf(pub.buffer) } } },
       _attachments: { [`${PRIVATE}-1.0.0.tgz`]: { content_type: 'application/octet-stream', data: pub.buffer.toString('base64'), length: pub.buffer.length } },
     };
-    const r = await api(`/${PRIVATE}`, { method: 'PUT', body });
+    const r = await api(`/${PRIVATE}`, { method: 'PUT', body, base: REG_BASE });
     check('重复发布同版本被拒绝', r.status >= 400, `status=${r.status}`);
   }
   {
@@ -313,22 +352,22 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
       versions: { '2.0.0': { name: PRIVATE2, version: '2.0.0', dist: { integrity: util.integrityOf(scoped.buffer) } } },
       _attachments: { [`${PRIVATE2.split('/')[1]}-2.0.0.tgz`]: { content_type: 'application/octet-stream', data: scoped.buffer.toString('base64'), length: scoped.buffer.length } },
     };
-    const r = await api(`/${encodeURIComponent(PRIVATE2)}`, { method: 'PUT', body });
+    const r = await api(`/${encodeURIComponent(PRIVATE2)}`, { method: 'PUT', body, base: REG_BASE });
     check('发布作用域包 @scope/name', r.status === 201 || r.status === 200, `status=${r.status} ${r.text.slice(0, 120)}`);
-    const g = await api(`/${encodeURIComponent(PRIVATE2)}`);
+    const g = await api(`/${encodeURIComponent(PRIVATE2)}`, { base: REG_BASE });
     check('作用域包可通过编码路径读取', g.status === 200 && g.json && g.json.versions && g.json.versions['2.0.0'], `status=${g.status}`);
-    const g2 = await api(`/${PRIVATE2}`);
+    const g2 = await api(`/${PRIVATE2}`, { base: REG_BASE });
     check('作用域包也可通过裸路径读取', g2.status === 200, `status=${g2.status}`);
   }
   {
-    const r = await api(`/${PRIVATE}`, { method: 'PUT', body: { name: PRIVATE, versions: { '1.0.0': { deprecated: '测试弃用标记' } } } });
-    const g = await api(`/${PRIVATE}`);
+    const r = await api(`/${PRIVATE}`, { method: 'PUT', body: { name: PRIVATE, versions: { '1.0.0': { deprecated: '测试弃用标记' } } }, base: REG_BASE });
+    const g = await api(`/${PRIVATE}`, { base: REG_BASE });
     const v = g.json && g.json.versions && g.json.versions['1.0.0'];
     check('PUT 元数据可设置 deprecated', (r.status === 200 || r.status === 201) && v && v.deprecated === '测试弃用标记', `status=${r.status} deprecated=${v && v.deprecated}`);
   }
   {
-    const r = await api(`/${PRIVATE}/beta`, { method: 'PUT', body: '1.0.0', headers: { 'Content-Type': 'application/json' } });
-    const g = await api(`/${PRIVATE}`);
+    const r = await api(`/${PRIVATE}/beta`, { method: 'PUT', body: '1.0.0', headers: { 'Content-Type': 'application/json' }, base: REG_BASE });
+    const g = await api(`/${PRIVATE}`, { base: REG_BASE });
     const tags = g.json && g.json['dist-tags'];
     check('PUT /<包名>/<tag> 可添加 dist-tag', (r.status === 200 || r.status === 201) && tags && tags.beta === '1.0.0', `status=${r.status} ${JSON.stringify(tags)}`);
   }
@@ -356,7 +395,7 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
       headers: { 'X-Filename': encodeURIComponent('mirror-selftest-json.json'), 'Content-Type': 'application/json' },
     });
     check('POST /upload 上传 packument.json', r.status === 200, `status=${r.status} ${r.text.slice(0, 120)}`);
-    const g = await api('/mirror-selftest-json');
+    const g = await api('/mirror-selftest-json', { base: REG_BASE });
     check('上传的 packument 可被读取', g.status === 200 && g.json && g.json.versions && g.json.versions['1.2.3'], `status=${g.status}`);
   }
 
@@ -1310,7 +1349,7 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
     const probe = (async () => {
       while (!stopProbe) {
         const st = Date.now();
-        try { await api('/-/ping', { timeoutMs: 20000 }); } catch { /* 超时也记一笔延迟 */ }
+        try { await api('/-/ping', { base: REG_BASE, timeoutMs: 20000 }); } catch { /* 超时也记一笔延迟 */ }
         lat.push(Date.now() - st);
         await sleep(120);
       }
@@ -1391,8 +1430,8 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
     let pidRec = null;
     try { pidRec = JSON.parse(fs.readFileSync(path.join(ROOT, 'data', 'mirror.pid'), 'utf8')); } catch { pidRec = null; }
     const pidPort = pidRec ? Number(pidRec.port) || 0 : 0;
-    const expectSame = pidPort && pidPort !== BASE_PORT ? 11 : 10;
-    const same = runCli(['prestart', '--port', String(BASE_PORT), '--json', '--no-open']);
+    const expectSame = pidPort && pidPort !== REG_PORT ? 11 : 10;
+    const same = runCli(['prestart', '--port', String(REG_PORT), '--json', '--no-open']);
     check(`cli.js prestart：服务已在本次要用的端口运行 → 退出码 10（启动脚本据此跳过重复启动；实际 pid 端口 ${pidPort || '无'} → 期望 ${expectSame}）`,
       same.status === expectSame, `exit=${same.status} out=${String(same.text || '').trim().slice(0, 160)}`);
     let sj = null;
@@ -1403,12 +1442,12 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
       sj = a >= 0 && b > a ? JSON.parse(jt.slice(a, b + 1)) : null;
     } catch { sj = null; }
     check('prestart --json 输出 running/samePort/wantPort 字段（供启动脚本判断）',
-      !!sj && sj.running === true && sj.samePort === (expectSame === 10) && Number(sj.wantPort) === BASE_PORT,
+      !!sj && sj.running === true && sj.samePort === (expectSame === 10) && Number(sj.wantPort) === REG_PORT,
       JSON.stringify(sj || {}).slice(0, 160));
-    const other = runCli(['prestart', '--port', String(BASE_PORT + 7), '--json', '--no-open']);
+    const other = runCli(['prestart', '--port', String(REG_PORT + 7), '--json', '--no-open']);
     check('cli.js prestart：已有实例运行在其它端口 → 退出码 11（不硬抢端口，提示先停止）',
       other.status === 11, `exit=${other.status} out=${String(other.text || '').trim().slice(0, 160)}`);
-    const human = runCli(['prestart', '--port', String(BASE_PORT), '--no-open']);
+    const human = runCli(['prestart', '--port', String(REG_PORT), '--no-open']);
     const humanTxt = String(human.text || '');
     check('prestart 人类可读模式说清「服务已经在运行 / 不再重复启动」或「在其它端口运行，请先停止」',
       human.status === expectSame
@@ -1700,10 +1739,10 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
   {
     // 删掉私有包，再用离线包恢复
     const del = await api(`/__admin/api/packages/${encodeURIComponent(PRIVATE)}`, { method: 'DELETE' });
-    const gone = await api(`/${PRIVATE}`);
+    const gone = await api(`/${PRIVATE}`, { base: REG_BASE });
     check('DELETE /packages/<名> 删除整包', del.status === 200 && gone.status === 404, `del=${del.status} get=${gone.status}`);
     const imp = await api('/__admin/api/bundles/import', { method: 'POST', body: { file: bundleFile, overwrite: true }, timeoutMs: 180000 });
-    const back = await api(`/${PRIVATE}`);
+    const back = await api(`/${PRIVATE}`, { base: REG_BASE });
     check('POST /bundles/import 恢复被删的包', imp.status === 200 && back.status === 200, `imp=${imp.status} get=${back.status} ${imp.text.slice(0, 120)}`);
   }
   {
@@ -2342,7 +2381,7 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
               [versionFd]: {
                 name: nameFd, version: versionFd,
                 dist: {
-                  tarball: `${BASE}/${nameFd}/-/${fileFd}`,
+                  tarball: `${REG_BASE}/${nameFd}/-/${fileFd}`,
                   integrity: `sha512-${cryptoFd.createHash('sha512').update(bufFd).digest('base64')}`,
                   shasum: cryptoFd.createHash('sha1').update(bufFd).digest('hex'),
                 },
@@ -2473,7 +2512,7 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
           versions: {
             [version]: {
               name, version,
-              dist: { tarball: `${BASE}/${name}/-/${put.file}`, integrity: put.integrity, shasum: put.shasum },
+              dist: { tarball: `${REG_BASE}/${name}/-/${put.file}`, integrity: put.integrity, shasum: put.shasum },
             },
           },
         }, { source: 'private', createdAt, files: { [version]: put.file }, sizes: { [version]: put.sizeBytes } });
@@ -2551,8 +2590,8 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
         name: NAME_BY,
         'dist-tags': { latest: '2.0.0' },
         versions: {
-          '1.0.0': { name: NAME_BY, version: '1.0.0', dist: { tarball: BASE + '/' + NAME_BY + '/-/' + putOld.file, integrity: putOld.integrity, shasum: putOld.shasum } },
-          '2.0.0': { name: NAME_BY, version: '2.0.0', dist: { tarball: BASE + '/' + NAME_BY + '/-/' + putNew.file, integrity: putNew.integrity, shasum: putNew.shasum } },
+          '1.0.0': { name: NAME_BY, version: '1.0.0', dist: { tarball: REG_BASE + '/' + NAME_BY + '/-/' + putOld.file, integrity: putOld.integrity, shasum: putOld.shasum } },
+          '2.0.0': { name: NAME_BY, version: '2.0.0', dist: { tarball: REG_BASE + '/' + NAME_BY + '/-/' + putNew.file, integrity: putNew.integrity, shasum: putNew.shasum } },
         },
       }, {
         source: 'private', createdAt: '2026-09-01T00:00:00.000Z',
@@ -2667,7 +2706,7 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
         for (const it of items) {
           versions[it.version] = {
             name, version: it.version,
-            dist: { tarball: `${BASE}/${name}/-/${it.put.file}`, integrity: it.put.integrity, shasum: it.put.shasum },
+            dist: { tarball: `${REG_BASE}/${name}/-/${it.put.file}`, integrity: it.put.integrity, shasum: it.put.shasum },
             ...(it.deps ? { dependencies: it.deps } : {}),
           };
           files[it.version] = it.put.file;
@@ -2793,7 +2832,7 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
         await tar.packTarGz(tgz, [{ name: 'package/package.json', source: path.join(srcDir, 'package.json') }], { gzip: true });
         return stV2.putTarball(name, version, fs.readFileSync(tgz));
       };
-      const mkDistV2 = (name, version, put) => ({ tarball: BASE + '/' + name + '/-/' + put.file, integrity: put.integrity, shasum: put.shasum });
+      const mkDistV2 = (name, version, put) => ({ tarball: REG_BASE + '/' + name + '/-/' + put.file, integrity: put.integrity, shasum: put.shasum });
       // 依赖包：元数据里有 2.0.0 / 2.5.0 两个版本，但只有 2.0.0 的 tarball 缓存（2.5.0 模拟「只有元数据」）
       const putE20 = await mkPutV2('mirror-selftest-vere', '2.0.0');
       stV2.save('mirror-selftest-vere', {
@@ -2801,7 +2840,7 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
         'dist-tags': { latest: '2.5.0' },
         versions: {
           '2.0.0': { name: 'mirror-selftest-vere', version: '2.0.0', dist: mkDistV2('mirror-selftest-vere', '2.0.0', putE20) },
-          '2.5.0': { name: 'mirror-selftest-vere', version: '2.5.0', dist: { tarball: BASE + '/mirror-selftest-vere/-/mirror-selftest-vere-2.5.0.tgz' } },
+          '2.5.0': { name: 'mirror-selftest-vere', version: '2.5.0', dist: { tarball: REG_BASE + '/mirror-selftest-vere/-/mirror-selftest-vere-2.5.0.tgz' } },
         },
       }, { source: 'private', files: { '2.0.0': putE20.file }, sizes: { '2.0.0': putE20.sizeBytes } });
       // 根包：1.0.0 依赖 depE ^2.0.0（按范围会解析出最高的 2.5.0，而它的 tarball 本地没有）
@@ -2944,7 +2983,7 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
       versions: {
         [oddVersion]: {
           name: oddName, version: oddVersion,
-          dist: { tarball: `${BASE}/${oddName}/-/${oddFile}`, integrity, shasum },
+          dist: { tarball: `${REG_BASE}/${oddName}/-/${oddFile}`, integrity, shasum },
         },
       },
     };
@@ -2977,7 +3016,7 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
     check('根目录名不是 package 的 tarball（odd-root/package.json）能正常导入，不再报「无法解析 package/package.json」',
       up.status === 200 && Number(ud.tarballs) >= 1 && (ud.failed || []).length === 0,
       `status=${up.status} data=${JSON.stringify(ud).slice(0, 300)}`);
-    const gotOdd = await api(`/${encodeURIComponent(oddName)}`);
+    const gotOdd = await api(`/${encodeURIComponent(oddName)}`, { base: REG_BASE });
     check('该包导入后能在镜像里取到（packument 含版本，说明没被当成坏 tarball 丢掉）',
       gotOdd.status === 200 && !!(gotOdd.json && gotOdd.json.versions && gotOdd.json.versions[oddVersion]),
       `status=${gotOdd.status}`);
@@ -3005,7 +3044,7 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
         [fmtKey]: {
           name: fmtName, version: fmtKey,
           dist: {
-            tarball: `${BASE}/${fmtName}/-/${fmtFile}`,
+            tarball: `${REG_BASE}/${fmtName}/-/${fmtFile}`,
             integrity: `sha512-${crypto.createHash('sha512').update(innerBuf2).digest('base64')}`,
             shasum: crypto.createHash('sha1').update(innerBuf2).digest('hex'),
           },
@@ -3034,7 +3073,7 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
     check('tarball 内版本写法被规范化（packument 1.0.0-beta / tarball 内 1.0.0beta）也能导入，不误报「不一致」',
       up2.status === 200 && Number(ud2.tarballs) >= 1 && (ud2.failed || []).length === 0,
       `status=${up2.status} data=${JSON.stringify(ud2).slice(0, 300)}`);
-    const gotFmt = await api(`/${encodeURIComponent(fmtName)}`);
+    const gotFmt = await api(`/${encodeURIComponent(fmtName)}`, { base: REG_BASE });
     check('版本写法被规范化的包导入后能在镜像里取到该版本',
       gotFmt.status === 200 && !!(gotFmt.json && gotFmt.json.versions && gotFmt.json.versions[fmtKey]),
       `status=${gotFmt.status}`);
@@ -3407,7 +3446,7 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
         compNew.status === 200 && Number(compData.packages) === 2 && Number(compData.versions) === VERS.length * 2
           && Number(compData.tarballs) === VERS.length * 2 && (compData.failed || []).length === 0,
         `status=${compNew.status} data=${JSON.stringify(compData).slice(0, 300)}`);
-      const gotA = await api('/' + PKG_A);
+      const gotA = await api('/' + PKG_A, { base: REG_BASE });
       check('分片上传导入后的包能从镜像读到（含全部版本）',
         gotA.status === 200 && !!(gotA.json && gotA.json.versions && gotA.json.versions[VERS[0]]), `status=${gotA.status}`);
 
@@ -3523,10 +3562,10 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
     check('DELETE /packages/<名>/<版本> 删除单版本', r.status === 200 && !has, `status=${r.status}`);
   }
   {
-    const g = await api(`/${PRIVATE}`);
+    const g = await api(`/${PRIVATE}`, { base: REG_BASE });
     const rev = (g.json && g.json._rev) || '1-0';
-    const r = await api(`/${PRIVATE}/1.0.0/-rev/${rev}`, { method: 'DELETE' });
-    const after = await api(`/${PRIVATE}`);
+    const r = await api(`/${PRIVATE}/1.0.0/-rev/${rev}`, { method: 'DELETE', base: REG_BASE });
+    const after = await api(`/${PRIVATE}`, { base: REG_BASE });
     const has = after.json && after.json.versions && after.json.versions['1.0.0'];
     check('DELETE /<包名>/<版本>/-rev/<rev> 取消发布单版本', (r.status === 200 || r.status === 201) && !has, `status=${r.status} rev=${rev}`);
   }
@@ -3720,16 +3759,64 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
   {
     if (!DESTRUCTIVE) {
       // 重启会短暂打断正在用镜像的用户，默认不自作主张：显式 SKIP，加 --destructive 才执行
-      skip('POST /service/restart 并验证自动恢复', '破坏性用例未执行：加 --destructive 开启');
+      skip('POST /service/restart（重启镜像源服务）并验证自动恢复', '破坏性用例未执行：加 --destructive 开启');
+      skip('POST /service/restart-admin（重启管理界面）并验证恢复', '破坏性用例未执行：加 --destructive 开启');
     } else {
+      // 「重启镜像源服务」= 只重建镜像源监听：管理界面全程可用，registry 短暂不可用后恢复
+      const before = ((await api('/__admin/api/session')).json || {}).data || {};
       const r = await api('/__admin/api/service/restart', { method: 'POST' });
-      check('POST /service/restart 返回重启中', r.status === 200 && r.json && r.json.data && r.json.data.restarting === true, `status=${r.status}`);
+      check('POST /service/restart 返回重启中（target=registry）',
+        r.status === 200 && r.json && r.json.data && r.json.data.restarting === true && r.json.data.target === 'registry',
+        `status=${r.status} ${r.text.slice(0, 120)}`);
+      let adminOkAll = true;
       let back = false;
-      for (let i = 0; i < 40; i++) {
-        await util.sleep(500);
-        try { const p = await api('/-/ping', { auth: false, timeoutMs: 3000 }); if (p.status === 200) { back = true; break; } } catch { /* 仍在重启 */ }
+      let after = null;
+      for (let i = 0; i < 60; i++) {
+        await util.sleep(300);
+        try {
+          const s = await api('/__admin/api/session');
+          if (s.status !== 200) { adminOkAll = false; continue; }
+          const d = (s.json || {}).data || {};
+          if (d.registry && d.registry.reachable === true) { after = d; back = true; break; }
+        } catch { adminOkAll = false; }
       }
-      check('重启后服务自动恢复可用', back, back ? '' : '15 秒内未恢复');
+      check('重启镜像源服务后 registry 自动恢复，且管理界面全程可用（页面不需要刷新）',
+        back && adminOkAll, back ? (adminOkAll ? '' : '管理界面在镜像源重启期间出现过不可用') : '18 秒内未恢复');
+      if (after) {
+        check('重启镜像源服务不会重建管理界面（管理界面实例标记不变）',
+          String(after.pid) === String(before.pid) &&
+          String(((after.admin || {}).startedAt) || '') === String(((before.admin || {}).startedAt) || ''),
+          `pid=${before.pid}→${after.pid} admin=${(before.admin || {}).startedAt}→${(after.admin || {}).startedAt}`);
+      }
+      const ping = await fetch(REG_BASE + '/-/ping', { signal: AbortSignal.timeout(5000) });
+      check('重启镜像源服务后镜像源 /-/ping 直接可用', ping.status === 200, `status=${ping.status}`);
+
+      // 「重启管理界面」= 只重建管理界面监听：registry 不受影响，管理界面实例标记变化
+      const beforeAdmin = ((await api('/__admin/api/session')).json || {}).data || {};
+      const ra = await api('/__admin/api/service/restart-admin', { method: 'POST' });
+      check('POST /service/restart-admin 返回重启中（target=admin）',
+        ra.status === 200 && ra.json && ra.json.data && ra.json.data.restarting === true && ra.json.data.target === 'admin',
+        `status=${ra.status} ${ra.text.slice(0, 120)}`);
+      let adminBack = false;
+      let adminAfter = null;
+      for (let i = 0; i < 60; i++) {
+        await util.sleep(300);
+        try {
+          const s = await api('/__admin/api/session');
+          if (s.status === 200) { adminAfter = (s.json || {}).data || {}; adminBack = true; break; }
+        } catch { /* 管理界面重启中 */ }
+      }
+      check('重启管理界面后管理接口自动恢复（前端据此断连恢复后刷新界面）', adminBack, adminBack ? '' : '18 秒内未恢复');
+      if (adminAfter) {
+        check('管理界面实例标记已变化（pid@admin.startedAt，前端刷新判据）',
+          String(((adminAfter.admin || {}).startedAt) || '') !== String(((beforeAdmin.admin || {}).startedAt) || ''),
+          `${(beforeAdmin.admin || {}).startedAt} → ${(adminAfter.admin || {}).startedAt}`);
+        check('重启管理界面不影响镜像源服务（registry 仍可达，进程不变）',
+          !!adminAfter.registry && adminAfter.registry.reachable === true && String(adminAfter.pid) === String(beforeAdmin.pid),
+          `registry=${JSON.stringify(adminAfter.registry)} pid=${beforeAdmin.pid}→${adminAfter.pid}`);
+      }
+      const ping2 = await fetch(REG_BASE + '/-/ping', { signal: AbortSignal.timeout(5000) });
+      check('重启管理界面后镜像源 /-/ping 仍可用', ping2.status === 200, `status=${ping2.status}`);
     }
   }
   {
@@ -3760,7 +3847,7 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
       '/ms/-/..%2F..%2F..%2Fdata%2Fconfig.json',
     ];
     for (const p of traversal) {
-      const r = await rawReq(p);
+      const r = await rawReq(p, { base: REG_BASE });
       check(`GET ${p} 返回 400/404 且不泄露配置`,
         (r.status === 400 || r.status === 404) && !r.text.includes(TOKEN) && !r.text.includes('"security"'),
         `status=${r.status} body=${String(r.text).slice(0, 120)}`);

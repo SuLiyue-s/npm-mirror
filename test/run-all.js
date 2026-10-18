@@ -7,7 +7,9 @@
  *      非 Windows 或沙箱禁止子进程时其中需真跑 PowerShell 的几项会自动跳过）
  *   3. 再跑 test/api-test.js（注册表协议 + 管理 API + 发布/删除 + 离线包导入导出 + 安全回归；
  *      环境不足 / 破坏性用例会显式 SKIP）
- * 用法：node test/run-all.js [--base http://127.0.0.1:4873]
+ * 用法：node test/run-all.js [--base http://127.0.0.1:4873] [--registry-base http://127.0.0.1:4874]
+ *   --base           管理界面监听地址（管理 API + 网页控制台，默认 config.admin.ip:admin.port）
+ *   --registry-base  镜像源监听地址（npm 客户端 registry 协议，默认 config.server.ip:server.port）
  * 说明：真实 npm 客户端的验收（install/publish/dist-tag/deprecate/unpublish）由
  *       test/acceptance-npm.ps1 负责，需要本机有 npm。
  */
@@ -18,11 +20,14 @@ const config = require('../src/config');
 
 config.load();
 const cfg = config.get();
-const BASE = (() => {
-  const i = process.argv.indexOf('--base');
+function argBase(flag, fallbackPort) {
+  const i = process.argv.indexOf(flag);
   if (i > 0 && process.argv[i + 1]) return process.argv[i + 1].replace(/\/+$/, '');
-  return `http://127.0.0.1:${cfg.server.port}`;
-})();
+  return `http://127.0.0.1:${fallbackPort}`;
+}
+const ADMIN = cfg.admin || {};
+const BASE = argBase('--base', ADMIN.port || cfg.server.port); // 管理界面
+const REG_BASE = argBase('--registry-base', cfg.server.port); // 镜像源
 
 function runNode(script, args) {
   return new Promise((resolve) => {
@@ -32,24 +37,37 @@ function runNode(script, args) {
 }
 
 (async () => {
-  process.stdout.write(`检查镜像源是否在运行：${BASE}\n`);
-  let up = false;
+  process.stdout.write(`检查服务是否在运行：管理界面 ${BASE}，镜像源 ${REG_BASE}\n`);
+  let adminUp = false;
+  let registryUp = false;
   try {
-    const r = await fetch(`${BASE}/-/ping`, { signal: AbortSignal.timeout(5000) });
-    up = r.status === 200;
-  } catch { up = false; }
-  if (!up) {
+    const r = await fetch(`${BASE}/__admin/api/session`, { signal: AbortSignal.timeout(5000) });
+    adminUp = r.status === 200;
+  } catch { adminUp = false; }
+  try {
+    const r = await fetch(`${REG_BASE}/-/ping`, { signal: AbortSignal.timeout(5000) });
+    registryUp = r.status === 200;
+  } catch { registryUp = false; }
+  if (!adminUp && !registryUp) {
     process.stdout.write(`\x1b[31m镜像源没有在运行。\x1b[0m\n请先另开一个窗口执行：node cli.js start --no-open\n或直接双击「启动镜像源.cmd」。\n`);
     process.exit(1);
   }
-  process.stdout.write('镜像源在线，开始自检。\n');
+  if (!adminUp) {
+    process.stdout.write(`\x1b[33m管理界面没有在监听（${BASE}），但镜像源仍可用。\x1b[0m\n接口自检需要管理界面，请检查 data/config.json 的 admin 段或执行：node cli.js restart-admin\n`);
+    process.exit(1);
+  }
+  if (!registryUp) {
+    process.stdout.write(`\x1b[33m镜像源监听没有响应（${REG_BASE}）。\x1b[0m\n可执行：node cli.js restart（只重启镜像源服务）\n`);
+    process.exit(1);
+  }
+  process.stdout.write('服务在线，开始自检。\n');
 
   if (process.platform === 'win32' && fs.existsSync(path.join(__dirname, 'tray-check.js'))) {
     process.stdout.write('\n===== 托盘 / 图标 / 启动脚本自检（test/tray-check.js）=====\n');
-    const trayCode = await runNode('tray-check.js', ['--base', BASE]);
+    const trayCode = await runNode('tray-check.js', ['--base', BASE, '--registry-base', REG_BASE]);
     if (trayCode !== 0) process.exit(trayCode);
   }
 
   process.stdout.write('\n===== 接口与功能自检（test/api-test.js）=====\n');
-  process.exit(await runNode('api-test.js', ['--base', BASE]));
+  process.exit(await runNode('api-test.js', ['--base', BASE, '--registry-base', REG_BASE]));
 })();

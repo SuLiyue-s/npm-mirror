@@ -8,7 +8,7 @@
  *   2) 本机有 Chrome，且进程能创建命名管道 —— 在 DSH 沙箱下需要用放宽权限执行本脚本
  *      （浏览器多进程依赖命名管道，受限沙箱会报 platform_channel Check failed: 拒绝访问）
  * 用法：
- *   node test/ui-e2e-fill.js [--base http://127.0.0.1:4873] [--pkg ms] [--mode all] [--conc 6] [--shot 截图\补tarball-进度.png]
+ *   node test/ui-e2e-fill.js [--base http://127.0.0.1:4874] [--pkg ms] [--mode all] [--conc 6] [--shot 截图\补tarball-进度.png]
  */
 const { spawn } = require('node:child_process');
 const fs = require('node:fs');
@@ -20,7 +20,8 @@ function arg(name, def) {
   const i = args.indexOf('--' + name);
   return i >= 0 && args[i + 1] ? args[i + 1] : def;
 }
-const cfgPort = () => { try { return require('../src/config').get().server.port || 4873; } catch { return 4873; } };
+// BASE 指向管理界面（admin.port）：页面与 /__admin/api 都在管理界面监听上，镜像源监听只提供 registry 协议。
+const cfgPort = () => { try { const c = require('../src/config').get(); return (c.admin && c.admin.port) || c.server.port || 4874; } catch { return 4874; } };
 const BASE = arg('base', `http://127.0.0.1:${cfgPort()}`).replace(/\/+$/, '');
 const PKG = arg('pkg', 'ms');
 const MODE = arg('mode', 'all');

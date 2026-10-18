@@ -26,7 +26,8 @@
     </span>
   </div>
   <div class="topbar-chips">
-    <span class="chip chip-conn is-cy" id="chip-conn" data-tip="与镜像源服务的连接状态（每 1 秒探测一次：心跳 + 服务实例标记；点「重启服务」后会临时加密，断线恢复后自动刷新界面）"><span class="lamp lamp-cy" id="chip-conn-lamp"></span><span id="chip-conn-text">已连接</span></span>
+    <span class="chip chip-conn is-cy" id="chip-conn" data-tip="管理界面连接状态（每 1 秒同源探测一次会话：心跳 + 管理界面实例标记；断开恢复后自动刷新界面，镜像源服务状态变化不会刷新界面）"><span class="lamp lamp-cy" id="chip-conn-lamp"></span><span id="chip-conn-text">管理界面 · 已连接</span></span>
+    <span class="chip chip-conn is-idle" id="chip-svc" data-tip="镜像源服务连接状态（由管理界面后台每 1 秒探测一次镜像源监听的本机 /-/ping，与上面的管理界面探测区分开；该状态恢复时只更新灯和文案，不刷新界面）"><span class="lamp lamp-idle" id="chip-svc-lamp"></span><span id="chip-svc-text">镜像源服务 · 检测中</span></span>
     <span class="chip" id="chip-mode" data-tip="运行模式"><span class="lamp lamp-idle"></span><b>—</b></span>
     <span class="chip" id="chip-uptime" data-tip="服务运行时长">运行 —</span>
     <span class="chip" id="chip-version" data-tip="服务端版本">v—</span>
@@ -393,8 +394,10 @@
 
       <div class="banner" id="cfg-restart" hidden>
         <span class="lamp lamp-warn"></span>
-        <span id="cfg-restart-msg">配置已保存，<b>部分改动需要重启服务</b>后生效。</span>
-        <button class="btn btn-sm btn-amber" id="cfg-restart-now">立即重启</button>
+        <span id="cfg-restart-msg">配置已保存，<b>部分改动需要重启</b>后生效。</span>
+        <button class="btn btn-sm btn-amber" id="cfg-restart-now" hidden>重启镜像源服务</button>
+        <button class="btn btn-sm btn-amber" id="cfg-restart-admin" hidden>重启管理界面</button>
+        <button class="btn btn-sm btn-amber" id="cfg-restart-process" hidden>重启程序</button>
       </div>
 
       <div class="panel" id="cfg-form-panel">
@@ -510,8 +513,10 @@
         <div class="panel">
           <h3 class="panel-title">服务控制 <em>CONTROL</em></h3>
           <div class="action-grid">
-            <button class="act" data-act="open"><b>打开本机地址</b><i>在浏览器中访问 registry</i></button>
-            <button class="act" data-act="restart"><b>重启服务</b><i>进程重启，短暂不可用</i></button>
+            <button class="act" data-act="open"><b>打开管理界面</b><i>在浏览器中打开本地控制台</i></button>
+            <button class="act" data-act="restart"><b>重启镜像源服务</b><i>只重启镜像源监听，管理界面不断（npm 客户端短暂不可用）</i></button>
+            <button class="act" data-act="restart-admin"><b>重启管理界面</b><i>只重启管理界面监听，镜像源服务不断</i></button>
+            <button class="act" data-act="restart-process"><b>重启程序</b><i>整个进程重启，管理界面与镜像源都短暂不可用</i></button>
             <button class="act act-danger" data-act="shutdown"><b>停止服务</b><i>结束进程，需手动重新启动</i></button>
           </div>
           <div class="panel-actions"><span class="muted" id="svc-status"></span></div>
@@ -521,8 +526,9 @@
       <div class="panel">
         <h3 class="panel-title">局域网共享 <em>LAN SHARING</em></h3>
         <ul class="steps compact">
-          <li>确保「配置 → 服务 IP」为 <code>0.0.0.0</code>，浏览器访问 <code>http://&lt;本机IP&gt;:&lt;端口&gt;/</code>。</li>
-          <li>若其它电脑连不上，在 Windows 防火墙放行该端口：
+          <li><b>管理界面只监听 127 网段的本地回环地址</b>（默认 <code>127.0.0.1</code>），只能在<b>本机</b>浏览器访问，不对外开放。</li>
+          <li>镜像源服务（npm registry）可监听 <code>0.0.0.0</code> 供局域网客户端使用；浏览器访问 <code>http://&lt;本机IP&gt;:&lt;镜像源端口&gt;/</code> 会被拒绝（管理界面仅限本机），客户端请使用 <code>.npmrc</code> 指向该地址。</li>
+          <li>若其它电脑连不上镜像源，在 Windows 防火墙放行镜像源端口：
             <code>netsh advfirewall firewall add rule name="npm-mirror" dir=in action=allow protocol=TCP localport=4873</code></li>
           <li>局域网客户端建议<b>关闭免鉴权</b>（<code>security.trustLocalhost=false</code> 或按需开启 <code>requireRead/requirePublish</code>），并分发 token。</li>
           <li>客户端 <code>.npmrc</code> 用本机 IP（见「配置」页生成的接入配置）。</li>

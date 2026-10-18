@@ -9,7 +9,7 @@
  *   2) 本机有 Chrome，且进程能创建命名管道 —— 在 DSH 沙箱下需要用放宽权限执行
  *      （浏览器多进程依赖命名管道，受限沙箱会报 platform_channel Check failed: 拒绝访问）
  * 用法：
- *   node test/ui-e2e-deps.js [--base http://127.0.0.1:4873] [--pkg ora@5.4.1] [--depth 8]
+ *   node test/ui-e2e-deps.js [--base http://127.0.0.1:4874] [--pkg ora@5.4.1] [--depth 8]
  *                            [--shot 截图\递归添加依赖-解析中.png] [--shot2 截图\递归添加依赖-完成.png]
  *   node test/ui-e2e-deps.js --keep    # 保留本次新加的包（默认收尾会删掉，保持镜像干净）
  */
@@ -28,7 +28,9 @@ function arg(name, def) {
   const i = args.indexOf('--' + name);
   return i >= 0 && args[i + 1] && !String(args[i + 1]).startsWith('--') ? args[i + 1] : def;
 }
-const BASE = arg('base', `http://127.0.0.1:${config.get().server.port}`).replace(/\/+$/, '');
+// BASE 指向管理界面（admin.port）：页面与 /__admin/api 都在管理界面监听上，镜像源监听只提供 registry 协议。
+const _adminPort = (() => { const a = config.get().admin; return (a && a.port) || config.get().server.port; })();
+const BASE = arg('base', `http://127.0.0.1:${_adminPort}`).replace(/\/+$/, '');
 const SPEC = arg('pkg', 'ora@5.4.1');
 const DEPTH = arg('depth', '8');
 const KEEP = args.includes('--keep');

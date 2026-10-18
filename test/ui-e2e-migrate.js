@@ -21,7 +21,7 @@
  *
  * 前置：服务已启动（node cli.js start --no-open）；本机有 Chrome/Edge；可访问上游（cache 模式）。
  *      DSH 沙箱下需放宽权限执行（浏览器多进程依赖命名管道）。
- * 用法：node test/ui-e2e-migrate.js [--base http://127.0.0.1:4873] [--shot 截图\迁移与下载进度.png]
+ * 用法：node test/ui-e2e-migrate.js [--base http://127.0.0.1:4874] [--shot 截图\迁移与下载进度.png]
  *                                [--port 9351] [--only a|b|c]
  */
 const { spawn } = require('node:child_process');
@@ -34,7 +34,8 @@ function arg(name, def) {
   const i = args.indexOf('--' + name);
   return i >= 0 && args[i + 1] ? args[i + 1] : def;
 }
-const cfgPort = () => { try { return require('../src/config').get().server.port || 4873; } catch { return 4873; } };
+// BASE 指向管理界面（admin.port）：页面与 /__admin/api 都在管理界面监听上，镜像源监听只提供 registry 协议。
+const cfgPort = () => { try { const c = require('../src/config').get(); return (c.admin && c.admin.port) || c.server.port || 4874; } catch { return 4874; } };
 const BASE = arg('base', `http://127.0.0.1:${cfgPort()}`).replace(/\/+$/, '');
 const SHOT = arg('shot', path.join(__dirname, '..', '截图', '迁移与下载进度.png'));
 const SHOT_IMPORT = arg('shot-import', path.join(__dirname, '..', '截图', '缓存导入-导入进度.png'));

@@ -7,6 +7,7 @@
  *   3. 前端代码里调用的每个 /__admin/api 接口，后端是否都有实现
  *   4. 界面依赖的只读接口是否都能返回 { ok: true }
  * 用法：node test/ui-check.js [--base http://127.0.0.1:4873]
+ *   --base 为「管理界面」监听地址；默认取 config.admin.port（缺省时退回 server.port）。
  * 说明：本脚本只能证明“接口通、资源在、无外链”；界面渲染请在浏览器中打开确认。
  */
 const fs = require('node:fs');
@@ -15,11 +16,14 @@ const config = require('../src/config');
 
 config.load();
 const cfg = config.get();
+/* 管理界面地址：页面 / 管理 API 只在管理界面监听上提供 */
 const BASE = (() => {
   const i = process.argv.indexOf('--base');
   if (i > 0 && process.argv[i + 1]) return process.argv[i + 1].replace(/\/+$/, '');
-  return `http://127.0.0.1:${cfg.server.port}`;
+  return `http://127.0.0.1:${(cfg.admin && cfg.admin.port) || cfg.server.port}`;
 })();
+/* 镜像源服务地址：npm registry 协议接口（管理界面不在这个监听上提供） */
+const REG_BASE = `http://127.0.0.1:${cfg.server.port}`;
 
 const PUB = path.join(__dirname, '..', 'public');
 let pass = 0; let fail = 0;
@@ -430,7 +434,7 @@ async function get(p, { json = false } = {}) {
       /maxBundleUploadMB \|\| 4096/.test(apiSrc) && /maxBundleUploadMB:\s*clampInt/.test(fs.readFileSync(path.join(__dirname, '..', 'src', 'config.js'), 'utf8')));
     check('声明体积就超限时立刻 413（不必收完几个 GB）', /content-length/.test(apiSrc) && /拒绝上传离线包/.test(apiSrc));
     check('服务端 requestTimeout 放宽到大离线包够用（≥ 10 分钟）',
-      Number((srvSrc.match(/server\.requestTimeout\s*=\s*(\d+)/) || [])[1]) >= 600000);
+      Number(((srvSrc.match(/(?:server|srv)\.requestTimeout\s*=\s*(\d+)/) || [])[1])) >= 600000);
     check('413/408 记 warn 日志（原来只在 debug，日志里完全看不到上传失败）', /code === 413 \|\| code === 408\) log\.warn/.test(srvSrc));
   }
 
@@ -1224,65 +1228,91 @@ async function get(p, { json = false } = {}) {
       '离线机器上也能直接导出精确版本');
   }
 
-  console.log('\x1b[1m九之十二、顶栏「与镜像源连接状态」+ 断线恢复自动刷新（新）\x1b[0m');
+  console.log('\x1b[1m九之十二、顶栏「管理界面 / 镜像源服务」双连接状态 + 分项重启（新）\x1b[0m');
   {
     const htmlConn = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
     const jsConn = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
     const cssConn = fs.readFileSync(path.join(__dirname, '..', 'public', 'style.css'), 'utf8');
 
-    check('顶栏有连接状态 chip（默认已连接：青灯 + 「已连接」文案，可悬停看说明）',
+    check('顶栏有两个连接状态 chip：管理界面（青灯默认已连接）与镜像源服务（初始检测中），文案能区分',
       /id="chip-conn"/.test(htmlConn)
-        && /id="chip-conn-text">已连接</.test(htmlConn)
+        && /id="chip-conn-text">管理界面 · 已连接</.test(htmlConn)
         && /chip-conn is-cy/.test(htmlConn)
         && /id="chip-conn-lamp"/.test(htmlConn)
-        && /每 1 秒探测一次/.test(htmlConn),
-      '要能一眼看出当前是否还连着镜像源服务');
+        && /id="chip-svc"/.test(htmlConn)
+        && /id="chip-svc-text">镜像源服务 · 检测中</.test(htmlConn)
+        && /id="chip-svc-lamp"/.test(htmlConn),
+      '管理界面与镜像源服务是两种探测，必须分开显示');
 
-    check('断线样式：红底红灯 + 轻微呼吸，与项目配色一致',
-      /\.chip-conn\{min-width:96px\}/.test(cssConn)
+    check('断线样式：两个 chip 共用红底红灯 + 轻微呼吸，未知状态用 idle 灰灯',
+      /\.chip-conn\{min-width:132px/.test(cssConn)
         && /\.chip-conn\.is-red\{animation:conn-blink/.test(cssConn)
-        && /@keyframes conn-blink/.test(cssConn),
-      '用现有 --cy/--red 变量，不引入新配色');
+        && /\.chip-conn\.is-idle/.test(cssConn)
+        && /@keyframes conn-blink/.test(cssConn));
 
-    check('默认每 1 秒探测一次 /-/ping（AbortController 2 秒超时，页面隐藏时跳过，不干扰前台操作）',
-      /fetch\(\'\/-\/ping\'/.test(jsConn)
-        && /new AbortController\(\)/.test(jsConn)
-        && /if \(ctrl\) ctrl\.abort\(\); \}, 2000\)/.test(jsConn)
-        && /var CONN_POLL_MS = 1000;/.test(jsConn)
-        && /setTimeout\(connTick, connDelay\(\)\)/.test(jsConn)
-        && /if \(document\.hidden\) \{ scheduleConnTick\(\); return; \}/.test(jsConn),
-      '探测用只读 /-/ping，不能带令牌、不能写配置');
+    check('两种探测在代码里分开：管理界面探测=每 1 秒同源 /session 请求，镜像源探测=同一次响应里的 registry.reachable',
+      /var CONN_POLL_MS = 1000;/.test(jsConn)
+        && /fetch\(API \+ '\/session', opts\)/.test(jsConn)
+        && /var reg = d\.registry \|\| \{\};/.test(jsConn)
+        && /if \(reg\.reachable\)/.test(jsConn)
+        && /function setAdminConn\(/.test(jsConn)
+        && /function setSvcConn\(/.test(jsConn)
+        && /管理界面 · 已连接/.test(jsConn)
+        && /镜像源服务 · 已连接/.test(jsConn),
+      '两种探测的请求与显示都必须分开');
 
-    check('点「重启服务」后切到 250ms 快探测 20~30 秒：服务重启的短暂不可用窗口也能被捕捉到并及时刷新页面',
+    check('刷新规则：只有「管理界面」断连恢复或管理界面实例标记（pid + admin.startedAt）变化才刷新页面；镜像源状态恢复只 toast',
+      /function adminInstanceMark\(d\)/.test(jsConn)
+        && /return String\(d\.pid \|\| ''\) \+ '@' \+ String\(admin\.startedAt \|\| ''\)/.test(jsConn)
+        && /if \(mark && connAdminMark && mark !== connAdminMark\)/.test(jsConn)
+        && /if \(wasDown\) connReloadForAdmin\('管理界面已重新连接，正在刷新界面…'\)/.test(jsConn)
+        && /toast\('镜像源服务已恢复连接', 'ok', 3000\)/.test(jsConn)
+        && !/if \(wasSvcDown\)[^\n]*location\.reload/.test(jsConn),
+      '镜像源服务状态变化不能触发管理界面刷新');
+
+    check('点重启按钮后进入 250ms 快探测窗口，管理界面实例标记与快探测参数齐全',
       /function connBoost\(ms\)/.test(jsConn)
         && /var CONN_FAST_MS = 250;/.test(jsConn)
         && /var CONN_FAST_WINDOW_MS = 20000;/.test(jsConn)
         && /connBoost\(30000\)/.test(jsConn)
-        && /if \(connProbing\) \{ scheduleConnTick\(\); return; \}/.test(jsConn),
-      '之前 4 秒一次，服务几秒就重启完了，页面根本看不到断开状态');
+        && /connAdminMark/.test(jsConn));
 
-    check('服务重启检测：轮询 /session 的 pid + startedAt，重启后自动刷新（不依赖刚好探到断开窗口）',
-      /var CONN_SESSION_POLL_MS = 1000;/.test(jsConn)
-        && /function serverMark\(d\) \{/.test(jsConn)
-        && /function connSessionProbe\(\)/.test(jsConn)
-        && /fetch\(API \+ '\/session', \{ cache: 'no-store', headers: headers \}\)/.test(jsConn)
-        && /if \(connMark && mark !== connMark\) \{ connReloadForRestart\(\); return; \}/.test(jsConn)
-        && /检测到镜像源服务已重启，正在刷新界面…/.test(jsConn)
-        && /scheduleConnSession\(\);/.test(jsConn),
-      '之前只靠 1 秒心跳捕获「连接断开」，服务 1~2 秒就重启完时经常什么都看不到');
+    check('重启后的收尾：管理界面重启等会话恢复后刷新；镜像源重启只更新状态、不刷新页面',
+      /kind === 'registry'/.test(jsConn)
+        && /kind === 'admin'/.test(jsConn)
+        && /kind === 'process'/.test(jsConn)
+        && /finish\('管理界面已重启，正在刷新界面…', 'reload'\)/.test(jsConn)
+        && /finish\('镜像源服务已重启完成'\)/.test(jsConn));
 
     check('断线时顶栏变红 + toast 提示，并持续自动重试、记录重试次数',
-      /setConnState\(false, connFails\)/.test(jsConn)
-        && /与镜像源服务的连接已断开，正在自动重试/.test(jsConn)
+      /setAdminConn\(false, connAdminFails\)/.test(jsConn)
+        && /管理界面连接已断开，正在自动重试/.test(jsConn)
         && /已重试 ' \+ fails \+ ' 次/.test(jsConn),
       '断线不能静默，用户要能立刻看到');
 
-    check('连接恢复后自动刷新管理界面（toast + location.reload），开机即启动监听',
-      /已重新连接到镜像源服务，正在刷新界面/.test(jsConn)
-        && /location\.reload\(\)/.test(jsConn)
-        && /startConnWatch\(\);/.test(jsConn)
-        && /setConnState\(true, 0\)/.test(jsConn),
-      '恢复后把页面刷新到最新状态');
+    /* 真接口：两个监听各司其职（管理界面监听 / 镜像源监听） */
+    try {
+      const sr = await fetch(BASE + '/__admin/api/session', { signal: AbortSignal.timeout(10000) });
+      const sj = await sr.json().catch(() => null);
+      const sd = (sj && sj.ok && sj.data) || {};
+      check('真接口：管理界面 /session 同时返回管理界面与镜像源服务两组状态（admin.ip/port + registry.reachable）',
+        sd.admin && sd.admin.ip && sd.admin.port && sd.registry && typeof sd.registry.reachable === 'boolean',
+        JSON.stringify({ admin: sd.admin, registry: sd.registry }));
+
+      const ra = await fetch(REG_BASE + '/__admin/api/session', { signal: AbortSignal.timeout(10000) });
+      check('真接口：管理 API 只在管理界面监听可用（镜像源监听上返回 403，管理入口不暴露给镜像源端口）',
+        ra.status === 403, `status=${ra.status}`);
+
+      const rp = await fetch(REG_BASE + '/-/ping', { signal: AbortSignal.timeout(10000) });
+      check('真接口：镜像源监听提供 registry 协议入口 /-/ping', rp.status === 200, `status=${rp.status}`);
+
+      const rh = await fetch(REG_BASE + '/', { signal: AbortSignal.timeout(10000), redirect: 'manual' });
+      check('真接口：本机访问镜像源首页会 302 跳转到管理界面监听地址（管理界面不挂在镜像源端口上）',
+        rh.status === 302 && String(rh.headers.get('location') || '').indexOf(':') > 0,
+        `status=${rh.status} location=${rh.headers.get('location')}`);
+    } catch (e) {
+      check('真接口：双监听探测失败', false, e.message);
+    }
   }
 
   console.log('\x1b[1m九之十三、顶栏「运行时长」实时刷新 + 无依赖导出提示（新）\x1b[0m');

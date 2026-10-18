@@ -23,7 +23,7 @@
     authPrompted: false,
     pkg: { q: '', source: 'all', tarballs: 'all', sort: '-updated', page: 1, size: 20, total: 0, items: [], selected: {}, loading: false },
     mig: { bundles: [], limits: null, scope: 'all', scan: null, scanSel: {}, scanFilter: '', scanPage: 1 },
-    cfg: { raw: null, baseline: null, path: '', revealed: false },
+    cfg: { raw: null, baseline: null, path: '', revealed: false, programRestartNeeded: false },
     logs: { lines: [], level: '' }
   };
 
@@ -1026,23 +1026,55 @@
   }
 
   /**
-   * 重启横幅的真实判据：把「进程实际监听的 ip:port」和「已保存到配置文件的 ip:port」对比，
-   * 不一致才提示重启；重启完成后自动消失（不再依赖一次性的显示开关）。
+   * 重启横幅的真实判据：把「进程实际的监听地址」与「已保存到配置文件的地址」对比。
+   * 镜像源监听、管理界面监听、程序级配置（存储目录）分开判断，分别提供对应的重启按钮：
+   *   - 镜像源监听地址变化 → 「重启镜像源服务」（只重启 registry 监听，管理界面不中断）
+   *   - 管理界面监听地址变化 → 「重启管理界面」（只重启管理界面监听，镜像源不中断）
+   *   - 存储目录等程序级配置变化 → 「重启程序」（整个进程重启）
+   * 改回与当前运行一致时横幅自动消失，不依赖一次性的显示开关。
    */
+  function restartMismatch() {
+    var out = { registry: false, admin: false, program: false, lines: [], adminListenError: '' };
+    var s = state.session, c = state.cfg.raw;
+    if (!s || !c) return out;
+    var reg = s.listen || {}, cfgS = c.server || {};
+    if ((reg.ip !== undefined || reg.port !== undefined) &&
+        (String(reg.ip) !== String(cfgS.ip) || Number(reg.port) !== Number(cfgS.port))) {
+      out.registry = true;
+      out.lines.push('镜像源监听地址 <b>' + esc(reg.ip || '?') + ':' + esc(String(reg.port || '?')) + '</b> 将改为 <b>' +
+        esc(cfgS.ip || '?') + ':' + esc(String(cfgS.port || '?')) + '</b>，<b>重启镜像源服务</b>后生效');
+    }
+    var adm = s.admin || {}, cfgA = c.admin || {};
+    if ((adm.ip !== undefined || adm.port !== undefined) &&
+        (String(adm.ip) !== String(cfgA.ip) || Number(adm.port) !== Number(cfgA.port))) {
+      out.admin = true;
+      out.lines.push('管理界面监听地址 <b>' + esc(adm.ip || '?') + ':' + esc(String(adm.port || '?')) + '</b> 将改为 <b>' +
+        esc(cfgA.ip || '?') + ':' + esc(String(cfgA.port || '?')) + '</b>，<b>重启管理界面</b>后生效');
+    }
+    if (adm.listenError) out.adminListenError = String(adm.listenError);
+    if (state.cfg.programRestartNeeded) {
+      out.program = true;
+      out.lines.push('存储目录等程序级配置已改动，<b>重启程序</b>后生效');
+    }
+    return out;
+  }
+
   function syncRestartBanner() {
     var banner = $('#cfg-restart');
     if (!banner) return;
-    var s = state.session, c = state.cfg.raw;
-    if (!s || !s.listen || !c || !c.server) { banner.hidden = true; return; }
-    var changed = String(s.listen.ip) !== String(c.server.ip) || Number(s.listen.port) !== Number(c.server.port);
-    banner.hidden = !changed;
-    if (changed) {
-      var msg = $('#cfg-restart-msg');
-      if (msg) {
-        msg.innerHTML = '配置已保存：监听地址将由 <b>' + esc(s.listen.ip) + ':' + esc(String(s.listen.port)) + '</b> 改为 <b>' +
-          esc(String(c.server.ip)) + ':' + esc(String(c.server.port)) + '</b>，重启服务后生效。';
-      }
+    var m = restartMismatch();
+    banner.hidden = !(m.registry || m.admin || m.program || m.adminListenError);
+    if (!banner.hidden) {
+      var msg = $('#cfg-restart-msg'), lines = [];
+      if (m.adminListenError) lines.push('<b>管理界面未启动</b>：' + esc(m.adminListenError));
+      m.lines.forEach(function (l) { lines.push(l); });
+      if (!lines.length) lines.push('配置已保存，<b>部分改动需要重启</b>后生效');
+      if (msg) msg.innerHTML = '配置已保存：' + lines.join('；') + '。';
     }
+    var bReg = $('#cfg-restart-now'), bAdm = $('#cfg-restart-admin'), bProc = $('#cfg-restart-process');
+    if (bReg) bReg.hidden = !m.registry;
+    if (bAdm) bAdm.hidden = !(m.admin || !!m.adminListenError);
+    if (bProc) bProc.hidden = !m.program;
   }
 
   function paintSession(d) {
@@ -1155,12 +1187,13 @@
     /* 服务状态 */
     var svc = clear($('#ov-service'));
     if (svc) {
-      var listen = d.listen || {};
+      var listen = d.listen || {}, admin = d.admin || {};
       [
         ['服务状态', '运行中'],
         ['版本', d.version || '—'],
         ['模式', d.mode === 'offline' ? '纯离线 offline' : (d.mode || '—')],
-        ['监听', (listen.ip || '?') + ':' + (listen.port || '?')],
+        ['镜像源监听', (listen.ip || '?') + ':' + (listen.port || '?')],
+        ['管理界面监听', admin.listenError ? '未启动（' + admin.listenError + '）' : ((admin.ip || '?') + ':' + (admin.port || '?') + '（仅本机）')],
         ['启动时间', dt(d.startedAt)],
         ['运行时长', fmtDur(d.uptimeSec)],
         ['Node', (d.node && (d.node.version + ' / ' + d.node.platform)) || '—'],
@@ -1180,6 +1213,7 @@
       ]));
     }
     addUrl('REGISTRY', false, d.registryUrl);
+    if (d.adminUrl) addUrl('ADMIN', true, d.adminUrl + '/');
     (d.lanUrls || []).forEach(function (u, i) { addUrl(i === 0 ? 'LAN' : 'LAN+' + i, true, u); });
     if (!urls.children.length) urls.appendChild(el('div', { class: 'muted', text: '未获取到地址信息' }));
 
@@ -4254,8 +4288,10 @@
     {
       title: '服务', en: 'SERVER', fields: [
         { k: 'mode', label: '运行模式', type: 'select', hint: 'offline = 纯离线，服务不再访问上游 registry；cache = 在线缓存，可回源上游。', options: [['cache', 'cache · 在线缓存（可回源上游）'], ['offline', 'offline · 纯离线（禁止外网）']] },
-        { k: 'server.ip', label: '监听 IP', type: 'text', hint: '0.0.0.0 允许局域网访问，127.0.0.1 仅本机。' },
-        { k: 'server.port', label: '监听端口', type: 'number' },
+        { k: 'server.ip', label: '镜像源监听 IP', type: 'text', hint: '镜像源服务（npm registry）的监听 IP：0.0.0.0 允许局域网访问，127.0.0.1 仅本机。' },
+        { k: 'server.port', label: '镜像源监听端口', type: 'number', hint: 'npm 客户端连接的端口，例如 .npmrc 里的 http://127.0.0.1:<端口>/。' },
+        { k: 'admin.ip', label: '管理界面监听 IP', type: 'text', hint: '只允许 127 网段的本地回环地址（如 127.0.0.1、127.0.0.2）；管理界面只有本机才能访问，不允许 0.0.0.0、::1、局域网地址或主机名。' },
+        { k: 'admin.port', label: '管理界面监听端口', type: 'number', hint: '管理界面网页端口，不能与镜像源监听端口相同。' },
         { k: 'server.openBrowserOnStart', label: '启动时自动打开浏览器', type: 'bool' }
       ]
     },
@@ -4577,12 +4613,18 @@
       state.cfg.baseline = JSON.parse(JSON.stringify(state.cfg.raw));
       state.cfg.revealed = false;   // 保存后返回的令牌是掩码，回到「未显示」状态，避免把掩码当令牌展示/复制
       paintConfig();
-      /* 是否需要重启：以「进程实际监听」对比「刚保存的配置」为准（d.restartRequired 只表示本次改动含 ip/port，
-         若改回当前监听值就等于不需要重启），提示语与横幅保持同一判据 */
+      /* 是否需要重启、重启哪一部分：监听地址/端口按「进程实际 vs 已保存配置」判断；
+         程序级配置（存储目录）由服务端 restart.program 标记，只能通过重启整个程序生效 */
+      if (d.restart) state.cfg.programRestartNeeded = !!d.restart.program;
       syncRestartBanner();
-      var need = !(($('#cfg-restart') || {}).hidden);
-      setText('cfg-status', need ? '已保存，需要重启服务' : '已保存并生效');
-      if (need) toast('配置已保存，部分改动需重启服务后生效', 'warn', 7000);
+      var m = restartMismatch();
+      var need = m.registry || m.admin || m.program || !!m.adminListenError;
+      var parts = [];
+      if (m.registry) parts.push('镜像源服务');
+      if (m.admin || m.adminListenError) parts.push('管理界面');
+      if (m.program) parts.push('程序');
+      setText('cfg-status', need ? '已保存，需要重启：' + parts.join('、') : '已保存并生效');
+      if (need) toast('配置已保存，需要重启' + parts.join('、') + '后生效', 'warn', 7000);
       else toast('配置已保存并生效', 'ok');
       loadSession().then(syncRestartBanner).catch(function () {});
     }, function (e) { btnBusy(btn, false); setText('cfg-status', '保存失败：' + e.message); handleErr(e); });
@@ -4684,12 +4726,13 @@
 
   function paintService(d) {
     var box = clear($('#svc-stats'));
+    var listen = d.listen || {}, admin = d.admin || {};
     if (box) {
       box.appendChild(statCard('服务状态', 'STATUS', '运行中', null, 'PID ' + (d.pid || '—'), 'is-cy'));
       var svcUptimeCard = statCard('运行时长', 'UPTIME', fmtDur(d.uptimeSec), null, '启动于 ' + dtShort(d.startedAt));
       svcUptimeCard.id = 'svc-uptime-card';
       box.appendChild(svcUptimeCard);
-      box.appendChild(statCard('监听端口', 'PORT', String((d.listen && d.listen.port) || '—'), null, 'IP ' + ((d.listen && d.listen.ip) || '—'), 'is-am'));
+      box.appendChild(statCard('镜像源端口', 'REGISTRY', String(listen.port || '—'), null, 'IP ' + (listen.ip || '—'), 'is-am'));
       box.appendChild(statCard('镜像包数', 'PACKAGES', fmtNum(d.stats && d.stats.packages), null, '版本 ' + fmtNum(d.stats && d.stats.versions)));
     }
     var info = clear($('#svc-info'));
@@ -4699,8 +4742,12 @@
         ['PID', d.pid || '—'],
         ['版本', d.version || '—'],
         ['模式', d.mode || '—'],
-        ['监听', ((d.listen && d.listen.ip) || '?') + ':' + ((d.listen && d.listen.port) || '?')],
+        ['镜像源监听', ((listen.ip) || '?') + ':' + ((listen.port) || '?')],
+        ['管理界面监听', admin.listenError
+          ? '未启动（' + admin.listenError + '）'
+          : (((admin.ip) || '?') + ':' + ((admin.port) || '?') + '（仅本机）')],
         ['Registry', d.registryUrl || '—'],
+        ['管理界面地址', (d.adminUrl ? d.adminUrl + '/' : '—')],
         ['启动时间', dt(d.startedAt)],
         ['配置文件', d.configPath || '—'],
         ['Node', (d.node && d.node.version) || '—'],
@@ -4709,69 +4756,148 @@
     }
   }
 
+  /* 服务控制：打开管理界面 / 重启镜像源服务 / 重启管理界面 / 重启程序 / 停止服务 */
   function serviceAction(kind) {
     if (kind === 'open') {
-      var url = (state.overview && state.overview.registryUrl) || (location.origin + '/');
-      window.open(url, '_blank');
-      toast('已打开 ' + url, 'ok');
+      var url = (state.overview && state.overview.adminUrl) || location.origin;
+      window.open(url + '/', '_blank');
+      toast('已打开管理界面 ' + url, 'ok');
       return;
     }
     var isStop = kind === 'shutdown';
-    confirmBox({
-      title: isStop ? '停止服务' : '重启服务',
-      danger: isStop,
-      confirmText: isStop ? '停止服务' : '立即重启',
-      message: isStop ? '确定要停止镜像源服务吗？' : '确定要重启镜像源服务吗？',
-      detail: isStop ? '停止后需要手动重新启动服务，所有客户端将无法安装依赖。' : '重启期间服务会短暂不可用（通常几秒）。'
-    }).then(function (ok) {
+    var isAdmin = kind === 'restart-admin';
+    var isProcess = kind === 'restart-process';
+    var title, confirmText, message, detail, apiPath, watchKind;
+    if (isStop) {
+      title = '停止服务'; confirmText = '停止服务';
+      message = '确定要停止镜像源服务吗？';
+      detail = '停止后需要手动重新启动，所有客户端将无法安装依赖，管理界面也会一起退出。';
+      apiPath = '/service/shutdown'; watchKind = 'shutdown';
+    } else if (isAdmin) {
+      title = '重启管理界面'; confirmText = '重启管理界面';
+      message = '确定要重启管理界面吗？';
+      detail = '只重启管理界面监听，镜像源服务不会中断；若修改了管理界面监听地址/端口，重启后页面会跳转到新地址。';
+      apiPath = '/service/restart-admin'; watchKind = 'admin';
+    } else if (isProcess) {
+      title = '重启程序'; confirmText = '重启程序';
+      message = '确定要重启整个程序吗？';
+      detail = '整个进程会重启（管理界面与镜像源服务都会短暂不可用，通常几秒），适用于存储目录等程序级配置的改动。';
+      apiPath = '/service/restart-process'; watchKind = 'process';
+    } else {
+      title = '重启镜像源服务'; confirmText = '重启镜像源服务';
+      message = '确定要重启镜像源服务吗？';
+      detail = '只重启镜像源监听（npm registry），管理界面不会中断；npm 客户端会短暂不可用（通常几秒）。';
+      apiPath = '/service/restart'; watchKind = 'registry';
+    }
+    confirmBox({ title: title, danger: isStop, confirmText: confirmText, message: message, detail: detail }).then(function (ok) {
       if (!ok) return;
       setText('svc-status', isStop ? '正在停止…' : '正在重启…');
-      api('/service/' + (isStop ? 'shutdown' : 'restart'), { method: 'POST', timeout: 20000 }).then(function () {
-        /* 重启期间服务会短暂不可用：立刻进入快探测窗口，才能看到「断开 → 恢复」并自动刷新页面 */
+      api(apiPath, { method: 'POST', timeout: 20000 }).then(function () {
+        /* 重启期间连接会短暂不可用：进入快探测窗口 */
         if (!isStop) connBoost(30000);
-        watchService(isStop);
+        watchService(watchKind);
       }, function (e) {
-        /* 重启时连接被切断是正常现象 */
-        if (!isStop && (e.code === 'NETWORK' || e.code === 'TIMEOUT')) { connBoost(30000); watchService(false); }
+        /* 重启时连接被切断是正常现象（管理界面重启 / 进程重启） */
+        if (!isStop && (e.code === 'NETWORK' || e.code === 'TIMEOUT')) { connBoost(30000); watchService(watchKind); }
         else { setText('svc-status', '操作失败：' + e.message); handleErr(e); }
       });
     });
   }
 
-  function watchService(isStop) {
+  /* 配置中「将要生效」的管理界面地址（只可能是 127 网段 IPv4，可直接拼 URL） */
+  function adminBaseFromCfg() {
+    var c = state.cfg && state.cfg.raw && state.cfg.raw.admin;
+    if (!c || !c.ip || !c.port) return '';
+    return 'http://' + c.ip + ':' + Number(c.port);
+  }
+
+  /**
+   * 等待某一类重启完成。三种重启的收尾方式不同：
+   *  - registry：管理界面不断，轮询到镜像源实例标记变化且可达 → 只更新状态，不刷新页面；
+   *  - admin：管理界面监听重启；地址没变时等会话恢复后刷新页面，地址变了则等新地址可达后跳转；
+   *  - process：整个进程重启，会话恢复后刷新页面；
+   *  - shutdown：进程退出，保持覆盖层并提示手动启动。
+   */
+  function watchService(kind) {
+    var isStop = kind === 'shutdown';
+    var titles = { shutdown: '服务已停止', registry: '镜像源服务正在重启', admin: '管理界面正在重启', process: '程序正在重启' };
+    var msgs = {
+      shutdown: '进程已退出。请在本机重新启动镜像源服务，然后点击下方按钮。',
+      registry: '只重启镜像源监听，管理界面保持连接，通常几秒钟；完成后自动更新状态（不会刷新页面）。',
+      admin: '只重启管理界面监听，镜像源服务不中断，通常几秒钟；完成后自动刷新或跳转到新地址。',
+      process: '整个程序正在重启，管理界面与镜像源都会短暂不可用；完成后自动刷新页面。'
+    };
     var ov = el('div', { class: 'overlay' }, [
       el('div', { class: 'spinner-lg' }),
-      el('h2', { text: isStop ? '服务已停止' : '服务正在重启' }),
-      el('p', { id: 'watch-msg', text: isStop ? '进程已退出。请在本机重新启动镜像源服务，然后点击下方按钮。' : '等待服务重新监听端口，通常几秒钟…' }),
+      el('h2', { text: titles[kind] || '服务正在重启' }),
+      el('p', { id: 'watch-msg', text: msgs[kind] || '等待服务恢复，通常几秒钟…' }),
       el('div', { class: 'dots', text: '· · ·' }),
-      isStop ? el('button', { class: 'btn', type: 'button', text: '重新连接', onclick: function () { tryReconnect(false); } }) : null
+      isStop ? el('button', { class: 'btn', type: 'button', text: '重新连接', onclick: function () { tryReconnect(); } }) : null
     ]);
     document.body.appendChild(ov);
     var t0 = Date.now();
-    var timer = setInterval(function () {
-      fetch(API + '/session', { cache: 'no-store', headers: getToken() ? { 'X-Mirror-Token': getToken() } : {} })
-        .then(function (r) { return r.json().catch(function () { return null; }); })
-        .then(function (j) {
-          if (j && j.ok) {
-            clearInterval(timer);
-            if (ov.parentNode) ov.parentNode.removeChild(ov);
-            toast(isStop ? '服务已恢复响应' : '服务重启完成', 'ok');
-            state.overview = null;
-            setText('svc-status', '服务已就绪（' + dtShort(new Date()) + '）');
-            loadSession().catch(function () {});
-            /* 重启完成：实际监听已与配置一致，收起“需重启”横幅；若正停在配置页则刷新表单 */
-            syncRestartBanner();
-            if (state.page === 'config') loadConfig(state.cfg.revealed).catch(function () {});
-            loadService();
-          }
-        }, function () { /* 还在重启 */ });
-      if (!isStop && Date.now() - t0 > 90000) {
-        clearInterval(timer);
-        var msg = $('#watch-msg');
-        if (msg) msg.textContent = '等待超过 90 秒仍未响应，请检查服务进程与端口占用，然后点「重新连接」。';
-        ov.appendChild(el('button', { class: 'btn', type: 'button', text: '重新连接', onclick: function () { tryReconnect(false); } }));
+    var startMark = null;
+    var timer = null;
+    function closeOv() { if (ov.parentNode) ov.parentNode.removeChild(ov); }
+    function finish(successMsg, mode) {
+      if (timer) clearInterval(timer);
+      closeOv();
+      if (mode === 'reload') {
+        toast(successMsg, 'ok', 4000);
+        setTimeout(function () { location.reload(); }, 700);
+        return;
       }
-    }, 2000);
+      toast(successMsg, 'ok', 4000);
+      state.overview = null;
+      setText('svc-status', '服务已就绪（' + dtShort(new Date()) + '）');
+      loadSession().then(syncRestartBanner).catch(function () {});
+      if (state.page === 'config') loadConfig(state.cfg.revealed).catch(function () {});
+      loadService();
+    }
+    function timeoutHint() {
+      if (timer) clearInterval(timer);
+      var m = $('#watch-msg');
+      if (m) m.textContent = '等待超过 90 秒仍未恢复，请检查服务进程与端口占用，然后点「重新连接」。';
+      if (!ov.querySelector('button')) {
+        ov.appendChild(el('button', { class: 'btn', type: 'button', text: '重新连接', onclick: function () { tryReconnect(); } }));
+      }
+    }
+    function poll() {
+      /* 管理界面地址变了：旧地址已经不可用，直接探测新地址（跨端口只判断是否可达，不读内容） */
+      if (kind === 'admin') {
+        var target = adminBaseFromCfg();
+        if (target && target !== location.origin) {
+          fetch(target + '/', { mode: 'no-cors', cache: 'no-store' }).then(function () {
+            if (timer) clearInterval(timer);
+            closeOv();
+            toast('管理界面已在新地址恢复，正在跳转…', 'ok', 4000);
+            setTimeout(function () { location.href = target + '/'; }, 700);
+          }, function () { /* 还没起来，继续等 */ });
+          return;
+        }
+      }
+      fetch(API + '/session', { cache: 'no-store', headers: tokenHeaders() })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (j) {
+          var d = j && j.ok ? j.data : null;
+          if (!d) return;
+          if (kind === 'registry') {
+            var reg = d.registry || {};
+            var mark = String(reg.startedAt || '');
+            if (startMark === null) { startMark = mark; return; }
+            if (reg.reachable && mark && mark !== startMark) { finish('镜像源服务已重启完成'); return; }
+            /* 重启极快、标记没来得及变化时：只要持续可达即视为完成 */
+            if (reg.reachable && Date.now() - t0 > 5000) { finish('镜像源服务已恢复'); return; }
+          } else if (kind === 'admin') {
+            finish('管理界面已重启，正在刷新界面…', 'reload');
+          } else if (kind === 'process') {
+            finish('程序已重启，正在刷新界面…', 'reload');
+          }
+        }, function () { /* 暂不可用，继续等下一轮 */ });
+      if (!isStop && Date.now() - t0 > 90000) timeoutHint();
+    }
+    poll();
+    timer = setInterval(poll, kind === 'registry' ? 400 : 1000);
   }
 
   function tryReconnect() {
@@ -5012,6 +5138,8 @@
     on('cfg-save', 'click', function () { saveConfig(this); });
     on('cfg-save-2', 'click', function () { saveConfig(this); });
     on('cfg-restart-now', 'click', function () { serviceAction('restart'); });
+    on('cfg-restart-admin', 'click', function () { serviceAction('restart-admin'); });
+    on('cfg-restart-process', 'click', function () { serviceAction('restart-process'); });
     on('npmrc-run', 'click', loadNpmrc);
     on('token-regen', 'click', regenToken);
 
@@ -5095,30 +5223,36 @@
   }
 
   /* ============================================================
-   * 与镜像源服务的连接状态
-   * 默认每 1 秒用 /-/ping 探测一次：断线时顶栏变红并自动重试（带重试次数提示），
-   * 恢复后 toast 提醒并刷新一次界面，让顶栏、列表、统计都回到最新状态。
-   * 点「重启服务」后切到 250ms 快探测 30 秒：服务重启只需要一两秒，
-   * 之前 4 秒一次的间隔很可能整段跳过「不可用窗口」，页面就永远看不到断开状态。
-   * 另外每 1 秒（与心跳同频）轮询一次 /session 的会话标记（pid + startedAt）：服务重启后标记必变，
-   * 就算心跳刚好错过了「不可用窗口」，也能发现重启并自动刷新页面。
-   * 服务重启、电脑休眠唤醒、网络恢复都能自动接上。
+   * 连接状态：管理界面探测 + 镜像源服务探测（两种探测分开显示）
+   * - 管理界面探测：每 1 秒向管理界面自己的 /__admin/api/session 发一次请求（同源）。
+   * - 镜像源服务探测：同一次请求的响应里带服务端对镜像源监听 /-/ping 的探测结果
+   *   （registry.reachable），所以两种状态分开显示、互不混淆。
+   * - 刷新规则：只有「管理界面」断连恢复、或管理界面实例标记（pid + admin.startedAt）变化时
+   *   才刷新页面；镜像源服务状态变化只更新顶栏灯和文案，不刷新页面。
+   * - 管理界面实例标记变化覆盖「重启管理界面」与「重启程序」：即使重启很快、
+   *   页面没捕捉到断开窗口，也能发现管理界面换了实例并刷新。
+   * - 点重启后进入 250ms 快探测窗口，尽量捕捉到短暂的不可用窗口。
    * ============================================================ */
-  var connDown = false;
-  var connFails = 0;
-  var connTimer = null;
-  var connProbing = false;
-  var connFastUntil = 0;
+  var connAdminDown = false;
+  var connAdminFails = 0;
+  var connAdminTimer = null;
+  var connAdminProbing = false;
+  var connAdminFastUntil = 0;
+  var connAdminMark = null;        // 上次看到的管理界面实例标记（pid@admin.startedAt）
+  var connAdminReloading = false;  // 已经决定刷新页面（避免重复 toast / reload）
+  var connSvcDown = false;
+  var connSvcFails = 0;
   var CONN_POLL_MS = 1000;          // 常规探测间隔
   var CONN_FAST_MS = 250;           // 重启/唤醒等关键时刻的快探测间隔
   var CONN_FAST_WINDOW_MS = 20000;  // 快探测持续时间
-  var CONN_SESSION_POLL_MS = 1000;  // 服务实例标记（pid + startedAt）轮询间隔（与心跳同频，文案统一为「每 1 秒探测一次」）
-  var connSessionTimer = null;
-  var connSessionPending = false;
-  var connMark = null;              // 上次看到的服务实例标记（pid@startedAt）
-  var connReloading = false;        // 已经决定刷新页面（避免重复 toast / reload）
 
-  function setConnState(ok, fails) {
+  function tokenHeaders() {
+    var headers = {}, token = getToken();
+    if (token) headers['X-Mirror-Token'] = token;
+    return headers;
+  }
+
+  function setAdminConn(ok, fails) {
     var chip = $('#chip-conn');
     if (!chip) return;
     chip.classList.toggle('is-cy', !!ok);
@@ -5126,131 +5260,140 @@
     var lamp = $('#chip-conn-lamp');
     if (lamp) lamp.className = 'lamp ' + (ok ? 'lamp-cy' : 'lamp-red');
     var txt = $('#chip-conn-text');
-    if (txt) txt.textContent = ok ? '已连接' : '连接断开';
+    if (txt) txt.textContent = ok ? '管理界面 · 已连接' : '管理界面 · 断开';
     setTip(chip, ok
-      ? '与镜像源服务连接正常（每 1 秒探测一次：心跳 + 服务实例标记；服务重启后自动刷新界面）'
-      : '与镜像源服务的连接已断开，正在自动重试（每 1 秒一次，已重试 ' + fails + ' 次）；恢复连接后会自动刷新界面');
+      ? '管理界面连接正常（每 1 秒同源探测一次：心跳 + 管理界面实例标记）；只有管理界面断连恢复后才会自动刷新界面'
+      : '管理界面连接已断开，正在自动重试（每 1 秒一次，已重试 ' + fails + ' 次）；恢复后会自动刷新界面');
   }
 
-  function pingOnce() {
+  /* state: 'ok' | 'down' | 'unknown'（管理界面断开时无法得知镜像源状态） */
+  function setSvcConn(state, fails) {
+    var chip = $('#chip-svc');
+    if (!chip) return;
+    chip.classList.toggle('is-cy', state === 'ok');
+    chip.classList.toggle('is-red', state === 'down');
+    chip.classList.toggle('is-idle', state === 'unknown');
+    var lamp = $('#chip-svc-lamp');
+    if (lamp) lamp.className = 'lamp ' + (state === 'ok' ? 'lamp-cy' : (state === 'down' ? 'lamp-red' : 'lamp-idle'));
+    var txt = $('#chip-svc-text');
+    if (txt) txt.textContent = state === 'ok' ? '镜像源服务 · 已连接' : (state === 'down' ? '镜像源服务 · 断开' : '镜像源服务 · 未知');
+    setTip(chip, state === 'ok'
+      ? '镜像源服务（npm registry）连接正常：由管理界面后台每 1 秒探测一次镜像源监听的本机 /-/ping；该状态恢复时不会刷新界面'
+      : (state === 'down'
+        ? '镜像源服务不可用（每 1 秒重试一次，已重试 ' + fails + ' 次）；管理界面仍正常，恢复后只更新状态、不刷新界面'
+        : '管理界面暂不可用，无法探测镜像源服务状态'));
+  }
+
+  /* 管理界面实例标记：进程 pid + 管理界面监听启动时间。重启管理界面/重启程序后必变，
+   * 用它判定「管理界面换过实例」比等心跳捕捉断开窗口可靠（重启往往不到一秒）。 */
+  function adminInstanceMark(d) {
+    if (!d) return '';
+    var admin = d.admin || {};
+    if (!d.pid && !admin.startedAt) return '';
+    return String(d.pid || '') + '@' + String(admin.startedAt || '');
+  }
+
+  function connReloadForAdmin(msg) {
+    if (connAdminReloading) return;
+    connAdminReloading = true;
+    setAdminConn(true, 0);
+    toast(msg, 'ok', 4000);
+    setTimeout(function () { location.reload(); }, 800);
+  }
+
+  /* 一次同源 /session 请求同时完成两种探测：
+   * 请求本身 = 管理界面探测；响应里的 registry.reachable = 镜像源服务探测。 */
+  function connProbe() {
+    if (connAdminReloading || connAdminProbing || document.hidden) { scheduleConnProbe(); return; }
+    connAdminProbing = true;
     var ctrl = (typeof AbortController === 'function') ? new AbortController() : null;
     var timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, 2000);
-    var opts = { cache: 'no-store' };
+    var opts = { cache: 'no-store', headers: tokenHeaders() };
     if (ctrl) opts.signal = ctrl.signal;
-    return fetch('/-/ping', opts).then(function (r) {
-      clearTimeout(timer);
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      return r.text();
-    }, function (e) { clearTimeout(timer); throw e; });
-  }
-
-  /* 服务实例标记：pid + startedAt。服务重启后这两个值必变，
-   * 用它判定「服务重启过」比等心跳捕获「连不上」的窗口可靠得多
-   * （重启往往一两秒完成，1 秒心跳经常整段跳过）。 */
-  function serverMark(d) {
-    if (!d) return '';
-    if (!d.pid && !d.startedAt) return '';
-    return String(d.pid || '') + '@' + String(d.startedAt || '');
-  }
-
-  function connReloadForRestart() {
-    if (connReloading) return;
-    connReloading = true;
-    setConnState(true, 0);
-    toast('检测到镜像源服务已重启，正在刷新界面…', 'ok', 4000);
-    setTimeout(function () { location.reload(); }, 700);
-  }
-
-  /* 只读轮询 /session 的 pid + startedAt：不经过 api()，避免触发忙碌指示与错误弹窗；
-   * 服务暂时不可用（重启过程中）时静默忽略，等下一轮。 */
-  function connSessionProbe() {
-    if (connReloading || connSessionPending || document.hidden) return;
-    connSessionPending = true;
-    var headers = {}, token = getToken();
-    if (token) headers['X-Mirror-Token'] = token;
-    fetch(API + '/session', { cache: 'no-store', headers: headers })
-      .then(function (r) { return r.ok ? r.json() : null; })
+    fetch(API + '/session', opts)
+      .then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      })
       .then(function (j) {
         var d = j && j.ok ? j.data : null;
-        var mark = serverMark(d);
-        if (!mark) return;
-        if (connMark && mark !== connMark) { connReloadForRestart(); return; }
-        connMark = mark;
+        if (!d) throw new Error('会话数据无效');
+        /* 管理界面探测成功 */
+        var wasDown = connAdminDown;
+        connAdminDown = false;
+        connAdminFails = 0;
+        setAdminConn(true, 0);
+        var mark = adminInstanceMark(d);
+        if (mark && connAdminMark && mark !== connAdminMark) {
+          connReloadForAdmin('管理界面已重启，正在刷新界面…');
+          return;
+        }
+        if (mark) connAdminMark = mark;
+        if (wasDown) connReloadForAdmin('管理界面已重新连接，正在刷新界面…');
+        /* 镜像源服务探测（来自同一次响应的服务端探测结果） */
+        var reg = d.registry || {};
+        if (reg.reachable) {
+          var wasSvcDown = connSvcDown;
+          connSvcDown = false;
+          connSvcFails = 0;
+          setSvcConn('ok', 0);
+          if (wasSvcDown) toast('镜像源服务已恢复连接', 'ok', 3000);
+        } else {
+          connSvcDown = true;
+          connSvcFails++;
+          setSvcConn('down', connSvcFails);
+          if (connSvcFails === 1) toast('镜像源服务不可用（管理界面仍正常），正在自动重试', 'err', 6000);
+        }
+      }, function () {
+        /* 管理界面探测失败：顶栏变红并重试；此时无法得知镜像源状态 */
+        connAdminFails++;
+        var firstDown = !connAdminDown;
+        connAdminDown = true;
+        setAdminConn(false, connAdminFails);
+        setSvcConn('unknown', 0);
+        connSvcDown = true;
+        if (firstDown) toast('管理界面连接已断开，正在自动重试；恢复后会自动刷新界面', 'err', 8000);
       })
-      .catch(function () { /* 服务不可用 / 未授权：忽略，下一轮再试 */ })
-      .then(function () { connSessionPending = false; });
+      .then(function () {
+        clearTimeout(timer);
+        connAdminProbing = false;
+        scheduleConnProbe();
+      }, function () {
+        clearTimeout(timer);
+        connAdminProbing = false;
+        scheduleConnProbe();
+      });
   }
 
-  function scheduleConnSession() {
-    if (connSessionTimer) clearTimeout(connSessionTimer);
-    connSessionTimer = setTimeout(function () {
-      connSessionProbe();
-      scheduleConnSession();
-    }, CONN_SESSION_POLL_MS);
+  function connProbeDelay() {
+    if (connAdminDown) return CONN_POLL_MS;
+    return Date.now() < connAdminFastUntil ? CONN_FAST_MS : CONN_POLL_MS;
   }
 
-  function connDelay() {
-    if (connDown) return CONN_POLL_MS;
-    return Date.now() < connFastUntil ? CONN_FAST_MS : CONN_POLL_MS;
+  function scheduleConnProbe() {
+    if (connAdminReloading) return;
+    if (connAdminTimer) clearTimeout(connAdminTimer);
+    connAdminTimer = setTimeout(connProbe, connProbeDelay());
   }
 
-  function scheduleConnTick() {
-    if (connTimer) clearTimeout(connTimer);
-    connTimer = setTimeout(connTick, connDelay());
-  }
-
-  function connTick() {
-    if (document.hidden) { scheduleConnTick(); return; }
-    if (connProbing) { scheduleConnTick(); return; }
-    connProbing = true;
-    pingOnce().then(function () {
-      var wasDown = connDown;
-      connDown = false;
-      connFails = 0;
-      setConnState(true, 0);
-      /* 断线恢复：刷新一次管理界面，避免页面停留在断线期间的旧数据上 */
-      if (wasDown) {
-        toast('已重新连接到镜像源服务，正在刷新界面…', 'ok', 3000);
-        setTimeout(function () { location.reload(); }, 800);
-      }
-    }, function () {
-      connFails++;
-      var firstDown = !connDown;
-      connDown = true;
-      setConnState(false, connFails);
-      if (firstDown) toast('与镜像源服务的连接已断开，正在自动重试；恢复连接后会自动刷新界面', 'err', 8000);
-    }).then(function () {
-      connProbing = false;
-      scheduleConnTick();
-    }, function () {
-      connProbing = false;
-      scheduleConnTick();
-    });
-  }
-
-  /* 进入「关键时刻」：改用 250ms 快探测一段时间（点重启/停止、窗口重新可见、网络恢复时），
-   * 这样能捕捉到服务短暂不可用的窗口，恢复后自动刷新页面。 */
+  /* 进入「关键时刻」：改用 250ms 快探测一段时间（点重启、窗口重新可见、网络恢复时） */
   function connBoost(ms) {
-    connFastUntil = Date.now() + (ms || CONN_FAST_WINDOW_MS);
-    if (connTimer) clearTimeout(connTimer);
-    connTick();
+    connAdminFastUntil = Date.now() + (ms || CONN_FAST_WINDOW_MS);
+    if (connAdminTimer) clearTimeout(connAdminTimer);
+    connProbe();
   }
 
   function startConnWatch() {
-    setConnState(true, 0);
-    connTick();
-    /* 会话标记轮询：服务重启（pid / startedAt 变了）后自动刷新界面，
-     * 不依赖「必须刚好探测到不可用窗口」 */
-    connSessionProbe();
-    scheduleConnSession();
+    setAdminConn(true, 0);
+    setSvcConn('unknown', 0);
+    connProbe();
     /* 休眠唤醒 / 网络恢复 / 窗口重新聚焦时不等下一个探测周期 */
-    window.addEventListener('online', function () { connBoost(5000); connSessionProbe(); });
+    window.addEventListener('online', function () { connBoost(5000); });
     document.addEventListener('visibilitychange', function () {
       if (document.hidden) return;
       connBoost(3000);
-      connSessionProbe();
     });
-    window.addEventListener('focus', function () { if (connDown) connBoost(3000); connSessionProbe(); });
+    window.addEventListener('focus', function () { connBoost(3000); });
   }
 
   function init() {

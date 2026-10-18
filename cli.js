@@ -3,8 +3,9 @@
 /*
  * 私人 npm 镜像源 —— 命令行工具
  * 用法：node cli.js <命令> [参数]
- * 命令：start | init | config | token | stop | restart | status | open | use | unuse |
- *       list | stats | export | import | import-cache | scan-cache | logs | doctor | help
+ * 命令：start | init | config | token | stop | restart | restart-admin | restart-process |
+ *       status | open | use | unuse | list | stats | export | import | import-cache |
+ *       scan-cache | logs | doctor | help
  */
 const fs = require('node:fs');
 const path = require('node:path');
@@ -70,10 +71,13 @@ function writePid(extra) {
   const cfg = config.get();
   util.writeJsonAtomic(PID_FILE, {
     pid: process.pid,
+    // ip/port 保持镜像源监听语义（兼容旧字段）：另一个监听看 adminUrl
     ip: cfg.server.ip,
     port: cfg.server.port,
     mode: cfg.mode,
-    url: require('./src/http-util').registryUrl(cfg),
+    url: adminLocalUrl(''),
+    registryUrl: localUrl(''),
+    adminUrl: adminLocalUrl(''),
     startedAt: util.nowIso(),
     ...extra,
   });
@@ -123,6 +127,29 @@ function localUrl(p = '/') {
   return `http://${ip}:${cfg.server.port}${p}`;
 }
 
+/** 管理界面地址：独立的 admin.ip/admin.port 监听（只允许 127.0.0.0/8 回环）。
+ * 兼容旧配置没有 admin 段、或异常配置写成 0.0.0.0/:: 的情况。 */
+function adminLocalUrl(p = '/') {
+  const cfg = config.get();
+  let ip = (cfg.admin && cfg.admin.ip) || '127.0.0.1';
+  if (!ip || ip === '0.0.0.0') ip = '127.0.0.1';
+  else if (ip === '::') ip = '::1';
+  const host = ip.includes(':') ? `[${ip}]` : ip;      // IPv6 回环加方括号
+  return `http://${host}:${cfg.admin.port}${p}`;
+}
+
+/** 探测端口能否被绑定：true=已被占用，false=空闲，'error:CODE'=其它错误 */
+function probePort(port, ip) {
+  return new Promise((resolve) => {
+    const net = require('node:net');
+    const s = net.createServer();
+    s.once('error', (e) => resolve(e.code === 'EADDRINUSE' ? true : 'error:' + e.code));
+    s.once('listening', () => s.close(() => resolve(false)));
+    try { s.listen(port, ip === '0.0.0.0' || ip === '::' ? undefined : ip); }
+    catch (e) { resolve('error:' + e.code); }
+  });
+}
+
 function human(n) { return util.formatBytes(n || 0); }
 
 // ---------------------------------------------------------------- 命令实现
@@ -135,12 +162,19 @@ commands.help = function () {
     '',
     `${C.cyan}启动与停止${C.reset}`,
     '  node cli.js start [--ip 127.0.0.1] [--port 4873] [--mode cache|proxy|offline] [--registry URL] [--no-open]',
-    '  node cli.js stop              停止正在运行的镜像源',
-    '  node cli.js restart           重启镜像源',
-    '  node cli.js status            查看运行状态',
+    '                                同时启动镜像源服务与管理界面两个监听（端口见下方「地址」）',
+    '  node cli.js stop              停止服务（管理界面与镜像源一起退出）',
+    '  node cli.js restart           重启镜像源服务（只重建镜像源监听，管理界面不中断）',
+    '  node cli.js restart-admin     重启管理界面（只重建管理界面监听，npm 安装不中断）',
+    '  node cli.js restart-process   重启整个程序（管理界面与镜像源都会短暂中断）',
+    '  node cli.js status            查看运行状态（管理界面与镜像源两个地址）',
     '  node cli.js open              在浏览器中打开管理界面',
     '  node cli.js prestart [--port N] [--json] [--no-open]',
     '                                启动前检查：服务已在本端口运行时不重复启动（启动脚本/开机自启内部使用）',
+    '',
+    `${C.cyan}地址${C.reset}`,
+    '  管理界面：http://<admin.ip>:<admin.port>/（仅 127.0.0.0/8 本机可访问，提供管理页面与 /__admin/api/*）',
+    '  镜像源  ：http://<server.ip>:<server.port>/（npm registry 协议，供 npm 客户端使用）',
     '',
     `${C.cyan}配置${C.reset}`,
     '  node cli.js init              初始化配置文件（打印访问令牌）',
@@ -168,7 +202,7 @@ commands.help = function () {
     '  node cli.js import-cache [--all] [--overwrite] [包名...]',
     '',
     `${C.cyan}排查${C.reset}`,
-    '  node cli.js doctor            环境自检（Node 版本、端口、目录、可离线性）',
+    '  node cli.js doctor            环境自检（Node 版本、镜像源/管理界面监听、端口、目录）',
     '  node cli.js logs [--lines 100] [--level info]',
     '',
   ].join('\n'));
@@ -180,12 +214,15 @@ commands.init = function () {
   const cfg = config.get();
   config.save({});
   log(`${existed ? '配置已存在，未覆盖' : '已创建配置文件'}：${config.CONFIG_FILE}`);
-  log(`  监听地址 : ${cfg.server.ip}:${cfg.server.port}`);
+  log(`  管理界面 : ${cfg.admin.ip}:${cfg.admin.port}  →  ${adminLocalUrl('/')}${C.dim}（仅本机可访问）${C.reset}`);
+  log(`  镜像源   : ${cfg.server.ip}:${cfg.server.port}  →  ${localUrl('/')}${C.dim}（npm 客户端 registry）${C.reset}`);
   log(`  运行模式 : ${cfg.mode}`);
   log(`  访问令牌 : ${C.bold}${cfg.security.token}${C.reset}`);
   log(`  数据目录 : ${config.storageDir()}`);
   log('');
-  log(`下一步：${C.cyan}node cli.js start${C.reset} 启动服务，然后浏览器打开 ${C.cyan}http://127.0.0.1:${cfg.server.port}${C.reset}`);
+  log(`下一步：${C.cyan}node cli.js start${C.reset} 启动服务`);
+  log(`  管理界面：${C.cyan}${adminLocalUrl('/')}${C.reset}${C.dim}（仅本机可访问）${C.reset}`);
+  log(`  镜像源  ：${C.cyan}${localUrl('/')}${C.reset}${C.dim}（npm 客户端 registry）${C.reset}`);
 };
 
 commands.config = function () {
@@ -272,21 +309,30 @@ commands.autostart = async function () {
 commands.doctor = async function () {
   config.load();
   const cfg = config.get();
+  // 配置文件原文：admin.ip 非法时 config 会静默回退 127.0.0.1，读原值才能在自检里提示「配置没生效」
+  let rawCfg = null;
+  try { rawCfg = util.readJson(config.CONFIG_FILE, null); } catch { /* 忽略 */ }
+  const rawAdmin = rawCfg && rawCfg.admin ? rawCfg.admin : null;
+  const rawServerPort = rawCfg && rawCfg.server ? Number(rawCfg.server.port) : null;
   log('');
   log(`${C.bold}环境自检${C.reset}`);
   log(`  Node 版本        : ${process.version}  ${Number(process.versions.node.split('.')[0]) >= 18 ? C.green + 'OK' + C.reset : C.red + '需要 >= 18' + C.reset}`);
   log(`  运行平台         : ${os.platform()} ${os.arch()}`);
   log(`  项目目录         : ${util.ROOT}`);
   log(`  数据目录         : ${config.storageDir()}  ${fs.existsSync(config.storageDir()) ? '已存在' : '尚未创建'}`);
-  log(`  监听地址         : ${cfg.server.ip}:${cfg.server.port}`);
-  const occupied = await new Promise((resolve) => {
-    const net = require('node:net');
-    const s = net.createServer();
-    s.once('error', (e) => resolve(e.code === 'EADDRINUSE' ? true : 'error:' + e.code));
-    s.once('listening', () => s.close(() => resolve(false)));
-    s.listen(cfg.server.port, cfg.server.ip === '0.0.0.0' || cfg.server.ip === '::' ? undefined : cfg.server.ip);
-  });
-  log(`  端口 ${String(cfg.server.port).padEnd(6)}     : ${occupied === true ? C.yellow + '已被占用（可能是镜像源已在运行）' + C.reset : occupied ? C.red + String(occupied) + C.reset : C.green + '空闲' + C.reset}`);
+  log(`  镜像源监听       : ${cfg.server.ip}:${cfg.server.port}  ${C.dim}→ ${localUrl('/')}${C.reset}`);
+  const occupied = await probePort(cfg.server.port, cfg.server.ip);
+  log(`  镜像源端口       : ${cfg.server.port}  ${occupied === true ? C.yellow + '已被占用（可能是镜像源已在运行）' + C.reset : occupied ? C.red + String(occupied) + C.reset : C.green + '空闲' + C.reset}`);
+  const adminIpOk = config.isAdminListenIp(cfg.admin.ip);
+  log(`  管理界面监听     : ${cfg.admin.ip}:${cfg.admin.port}  ${C.dim}→ ${adminLocalUrl('/')}${C.reset}${adminIpOk ? C.dim + '（仅本机可访问）' + C.reset : C.red + ' 非法地址' + C.reset}`);
+  if (!adminIpOk) log(`  ${C.red}管理界面只允许 127.0.0.0/8 本地回环地址，当前 ${cfg.admin.ip} 非法${C.reset}`);
+  const rawAdminIpBad = !!(rawAdmin && rawAdmin.ip !== undefined && !config.isAdminListenIp(rawAdmin.ip));
+  if (rawAdminIpBad) log(`  ${C.yellow}配置里的 admin.ip（${JSON.stringify(rawAdmin.ip)}）非法，已回退为 ${cfg.admin.ip}；管理界面只能监听 127.0.0.0/8${C.reset}`);
+  if (rawAdmin && rawAdmin.port !== undefined && rawServerPort && Number(rawAdmin.port) === rawServerPort) {
+    log(`  ${C.yellow}配置里的 admin.port（${rawAdmin.port}）与 server.port 相同，已自动改用 ${cfg.admin.port}${C.reset}`);
+  }
+  const adminOccupied = await probePort(cfg.admin.port, cfg.admin.ip);
+  log(`  管理界面端口     : ${cfg.admin.port}  ${adminOccupied === true ? C.yellow + '已被占用（可能是管理界面已在运行）' + C.reset : adminOccupied ? C.red + String(adminOccupied) + C.reset : C.green + '空闲' + C.reset}`);
   const d = npmcache.defaultCacheDir();
   let cacheText = '未找到';
   try {
@@ -325,6 +371,8 @@ commands.start = async function () {
     return;
   }
   writePid({ version: app.VERSION });
+  const adminErr = app.ctx.adminListenError;
+  log(`${C.green}● 启动完成${C.reset}  管理界面：${adminErr ? `${C.red}未启动（${adminErr}）${C.reset}` : adminLocalUrl('/')}  镜像源：${localUrl('/')}`);
   process.on('SIGINT', () => { clearPid(); app.requestShutdown(); });
   process.on('SIGTERM', () => { clearPid(); app.requestShutdown(); });
 };
@@ -332,9 +380,15 @@ commands.start = async function () {
 commands.status = async function () {
   const pid = readPid();
   try {
-    const d = await httpJson(localUrl('/__admin/api/overview'), { timeoutMs: 5000 });
+    const d = await httpJson(adminLocalUrl('/__admin/api/overview'), { timeoutMs: 5000 });
+    const adminUrl = String(d.adminUrl || adminLocalUrl('')).replace(/\/+$/, '');
+    const registryUrl = String(d.registryUrl || localUrl('')).replace(/\/+$/, '');
+    const regListen = d.listen && d.listen.ip ? `${d.listen.ip}:${d.listen.port}` : '';
+    const admListen = d.admin && d.admin.ip ? `${d.admin.ip}:${d.admin.port}` : '';
     log('');
-    log(`${C.green}● 运行中${C.reset}  ${d.registryUrl}  （模式：${d.mode}，PID ${d.node.pid}，已运行 ${Math.floor(d.uptimeSec / 60)} 分钟）`);
+    log(`${C.green}● 运行中${C.reset}  （模式：${d.mode}，PID ${d.node.pid}，已运行 ${Math.floor(d.uptimeSec / 60)} 分钟）`);
+    log(`  管理界面 : ${adminUrl}/${admListen ? `  （监听 ${admListen}，仅本机可访问）` : ''}`);
+    log(`  镜像源   : ${registryUrl}/${regListen ? `  （监听 ${regListen}）` : ''}`);
     log(`  包 ${d.stats.packages} 个 / 版本 ${d.stats.versions} 个 / tarball ${d.stats.tarballs} 个 / 占用 ${human(d.stats.storageBytes)} / 下载累计 ${d.stats.downloads}`);
     log(`  上游 ${d.upstream.registry} ${d.upstream.reachable ? C.green + '可达' + C.reset : C.yellow + '不可达' + C.reset}`);
     if (d.lanUrls && d.lanUrls.length) log(`  局域网地址：${d.lanUrls.join('  ')}`);
@@ -343,7 +397,21 @@ commands.status = async function () {
   } catch (e) {
     if (pid && pidAlive(pid.pid)) {
       log(`${C.yellow}○ 进程存在但接口无响应${C.reset}（PID ${pid.pid}，${e.message}）`);
-      log(`  可尝试：node cli.js stop 后再 node cli.js start`);
+      // 管理界面接口不通不代表镜像源挂了：再探一下镜像源，给出更准确的恢复建议
+      let registryAlive = false;
+      try {
+        const res = await fetch(localUrl('/-/ping'), {
+          headers: { 'X-Mirror-Token': config.get().security.token },
+          signal: AbortSignal.timeout(2000),
+        });
+        registryAlive = res.ok;
+      } catch { /* 忽略 */ }
+      if (registryAlive) {
+        log(`  镜像源服务仍在运行：${localUrl('/')}  ${C.dim}（管理界面监听不可用）${C.reset}`);
+        log(`  可尝试：node cli.js restart-process 重启整个程序（接口不通时会回退为按 PID 停止再启动）`);
+      } else {
+        log(`  可尝试：node cli.js stop 后再 node cli.js start`);
+      }
     } else {
       log(`${C.dim}○ 未运行${C.reset}（启动：node cli.js start）`);
     }
@@ -359,27 +427,45 @@ commands.prestart = async function () {
   const cfg = config.get();
   const pid = readPid();
   const wantPort = Number(flags.port) || Number(cfg.server.port) || 4873;
-  const probeHost = (ip) => (!ip || ip === '0.0.0.0' || ip === '::') ? '127.0.0.1' : ip;
-  /** 探测某个端口上是不是本镜像源在跑（能识别本服务即可，不依赖 pid 文件） */
-  const probe = async (port, ip) => {
+  const probeHost = (ip) => {
+    const h = (!ip || ip === '0.0.0.0') ? '127.0.0.1' : (ip === '::' ? '::1' : ip);
+    return h.includes(':') ? `[${h}]` : h;      // IPv6 加方括号，避免拼出非法 URL
+  };
+  const probeFetch = (url) => fetch(url, {
+    headers: { 'X-Mirror-Token': cfg.security.token },
+    signal: AbortSignal.timeout(2000),
+  });
+  /** 探测管理界面上的会话接口：返回本服务的数据，不是本服务/没响应时返回 null */
+  const probeAdmin = async () => {
     try {
-      const res = await fetch(`http://${probeHost(ip)}:${port}/__admin/api/session`, {
-        headers: { 'X-Mirror-Token': cfg.security.token },
-        signal: AbortSignal.timeout(2000),
-      });
+      const res = await probeFetch(adminLocalUrl('/__admin/api/session'));
       const j = await res.json();
       const d = j && j.ok === true ? j.data : null;
       return (d && d.version) ? d : null;      // 只认带 version 字段的本镜像响应
     } catch { return null; }
   };
-  let live = null;                             // { port, pid, data }
-  if (pid && pidAlive(pid.pid)) {
-    // pid 文件里的进程还活着：端口以它记录的为准（可能启动时用 --port 覆盖过配置）
+  /** 兜底探测镜像源：管理界面监听失败时，用它确认镜像源是否真的还在服务 */
+  const probeRegistry = async (port, ip) => {
+    try {
+      const res = await probeFetch(`http://${probeHost(ip)}:${port}/-/ping`);
+      return res.ok;
+    } catch { return false; }
+  };
+  let live = null;                             // { port, pid, admin }
+  const session = await probeAdmin();
+  if (session) {
+    // 管理界面能回答：镜像源监听端口以会话实际绑定的为准（pid 文件可能缺失或过期）
+    const sp = Number(session.listen && session.listen.port)
+      || Number(session.registry && session.registry.port)
+      || Number(cfg.server.port) || wantPort;
+    live = { port: sp, pid: Number(session.pid) || 0, admin: true };
+  } else if (pid && pidAlive(pid.pid)) {
+    // 管理界面无响应（例如监听失败）：按 pid 文件记录的镜像源端口确认它是否还在服务
     const pidPort = Number(pid.port) || wantPort;
-    live = { port: pidPort, pid: pid.pid, data: await probe(pidPort, pid.ip) };
-  } else {
-    const data = await probe(wantPort, cfg.server.ip);
-    if (data) live = { port: wantPort, pid: Number(data.pid) || 0, data };
+    if (await probeRegistry(pidPort, pid.ip)) live = { port: pidPort, pid: pid.pid, admin: false };
+  } else if (await probeRegistry(wantPort, cfg.server.ip)) {
+    // 连 pid 文件都没有时也兜底：本次要用的端口已经有镜像源在响应
+    live = { port: wantPort, pid: 0, admin: false };
   }
   const samePort = !!(live && live.port === wantPort);
   const out = {
@@ -388,7 +474,7 @@ commands.prestart = async function () {
     wantPort,
     port: live ? live.port : 0,
     pid: live ? live.pid : 0,
-    url: live ? `http://${probeHost(cfg.server.ip)}:${live.port}/` : '',
+    url: live ? adminLocalUrl('/') : '',
     configPort: Number(cfg.server.port) || 0,
   };
   if (flags.json) {
@@ -396,13 +482,13 @@ commands.prestart = async function () {
   } else if (!live) {
     log(`${C.dim}服务未在运行：可以正常启动。${C.reset}`);
   } else if (samePort) {
-    log(`${C.green}● 服务已经在运行${C.reset}：${out.url}（本次启动端口 ${wantPort} 与已运行端口一致，不再重复启动）`);
+    log(`${C.green}● 服务已经在运行${C.reset}：管理界面 ${adminLocalUrl('/')}，镜像源 ${localUrl('/')}（本次启动端口 ${wantPort} 与已运行端口一致，不再重复启动）`);
   } else {
-    log(`${C.yellow}● 服务已经在其它端口运行${C.reset}：端口 ${live.port}（本次要启动的是 ${wantPort}）。`);
+    log(`${C.yellow}● 服务已经在其它端口运行${C.reset}：镜像源端口 ${live.port}（本次要启动的是 ${wantPort}）。`);
     log(`  同一个 data 目录不支持同时运行两个实例，请先停止现有服务：node cli.js stop`);
   }
-  // 已在运行且允许打开界面时，直接打开管理界面（双击启动脚本的用户不用再手动找地址）
-  if (samePort && !flags['no-open'] && !process.env.MIRROR_AUTOSTART) {
+  // 已在运行且管理界面可用时，直接打开管理界面（双击启动脚本的用户不用再手动找地址）
+  if (samePort && !flags['no-open'] && live.admin && !process.env.MIRROR_AUTOSTART) {
     await commands.open();
   }
   if (live) process.exitCode = samePort ? 10 : 11;
@@ -412,7 +498,7 @@ commands.stop = async function () {
   const pid = readPid();
   let stopped = false;
   try {
-    await httpJson(localUrl('/__admin/api/service/shutdown'), { method: 'POST', timeoutMs: 8000 });
+    await httpJson(adminLocalUrl('/__admin/api/service/shutdown'), { method: 'POST', timeoutMs: 8000 });
     stopped = true;
     log(`${C.green}已发送停止指令${C.reset}，服务正在关闭…`);
   } catch (e) {
@@ -425,7 +511,7 @@ commands.stop = async function () {
         log(`${C.red}停止失败：${e2.message}${C.reset}`);
       }
     } else {
-      log(`${C.dim}镜像源未在运行${C.reset}`);
+      log(`${C.dim}服务未在运行${C.reset}`);
       return;
     }
   }
@@ -446,11 +532,36 @@ commands.stop = async function () {
 
 commands.restart = async function () {
   try {
-    await httpJson(localUrl('/__admin/api/service/restart'), { method: 'POST', timeoutMs: 8000 });
-    log(`${C.green}已发送重启指令${C.reset}，约 1 秒后恢复（端口不变）。`);
+    await httpJson(adminLocalUrl('/__admin/api/service/restart'), { method: 'POST', timeoutMs: 8000 });
+    log(`${C.green}已发送重启镜像源服务指令${C.reset}，约 1 秒后恢复（只重建镜像源监听，管理界面不中断，端口不变）。`);
     return;
   } catch (e) {
-    log(`${C.yellow}接口无响应（${e.message}），尝试完全重启…${C.reset}`);
+    log(`${C.yellow}管理接口无响应（${e.message}），尝试完全重启…${C.reset}`);
+  }
+  await commands.stop();
+  await util.sleep(600);
+  await commands.start();
+};
+
+commands['restart-admin'] = async function () {
+  try {
+    await httpJson(adminLocalUrl('/__admin/api/service/restart-admin'), { method: 'POST', timeoutMs: 8000 });
+    log(`${C.green}已发送重启管理界面指令${C.reset}，约 1 秒后恢复（只重建管理界面监听，npm 安装不中断）；浏览器刷新即可。`);
+    return;
+  } catch (e) {
+    log(`${C.red}重启管理界面失败：${e.message}${C.reset}`);
+    log(`  ${C.dim}管理界面接口不可用时无法单独重启管理界面监听，可执行 node cli.js restart-process 重启整个程序。${C.reset}`);
+    process.exitCode = 1;
+  }
+};
+
+commands['restart-process'] = async function () {
+  try {
+    await httpJson(adminLocalUrl('/__admin/api/service/restart-process'), { method: 'POST', timeoutMs: 8000 });
+    log(`${C.green}已发送重启程序指令${C.reset}，进程退出后会自动拉起新进程，管理界面与镜像源都会短暂中断（约 1~2 秒）。`);
+    return;
+  } catch (e) {
+    log(`${C.yellow}管理接口无响应（${e.message}），尝试完全重启…${C.reset}`);
   }
   await commands.stop();
   await util.sleep(600);
@@ -458,7 +569,7 @@ commands.restart = async function () {
 };
 
 commands.open = async function () {
-  const url = localUrl('/');
+  const url = adminLocalUrl('/');
   log(`管理界面：${url}`);
   try {
     const { spawn } = require('node:child_process');
@@ -1019,7 +1130,7 @@ commands.logs = function () {
   try {
     await fn();
   } catch (e) {
-    if (e && e.code === 'ECONNREFUSED') log(`${C.red}无法连接镜像源，请先启动：node cli.js start${C.reset}`);
+    if (e && e.code === 'ECONNREFUSED') log(`${C.red}无法连接管理界面（服务可能未启动），请先启动：node cli.js start${C.reset}`);
     else log(`${C.red}执行失败：${e && (e.stack || e.message)}${C.reset}`);
     process.exitCode = 1;
   }

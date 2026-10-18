@@ -13,7 +13,7 @@ const tokenMatches = authLib.tokenMatches;
 
 const {
   ok, fail, readJson, readBody, readBodyToFile, sendJson, streamFile, bodyToTempFile, tempFilePath,
-  baseFor, lanUrls, registryUrl,
+  baseFor, lanUrls, registryUrl, adminUrl,
 } = require('./http-util');
 const { parseLevelLine, validName } = require('./registry');
 const tasks = require('./tasks');
@@ -476,8 +476,17 @@ function dropBundleUpload(up) {
   try { fs.rmSync(up.dir, { recursive: true, force: true }); } catch { /* 忽略 */ }
 }
 
-async function handleAdmin(ctx) {
-  const { req, res, url, method, store, log } = ctx;
+/** 预检某个 ip:port 能否被本进程监听（重启监听前先确认，避免重启后起不来） */
+function checkBindable(ip, port) {
+  return new Promise((resolve) => {
+    const srv = net.createServer();
+    srv.once('error', () => resolve(false));
+    srv.once('listening', () => srv.close(() => resolve(true)));
+    try { srv.listen(port, ip === '0.0.0.0' || ip === '::' ? undefined : ip); } catch { resolve(false); }
+  });
+}
+
+async function handleAdmin(ctx) {  const { req, res, url, method, store, log } = ctx;
   const cfg = ctx.cfg();
   const pathname = url.pathname.replace(/\/+$/, '') || API;
   const rel = pathname.startsWith(API) ? pathname.slice(API.length) : '';
@@ -501,14 +510,37 @@ async function handleAdmin(ctx) {
       title: cfg.ui.title || '私人 npm 镜像源',
     };
     if (!authed) return ok(res, base);
+    // 镜像源服务探测：由后端从本机向镜像源监听发一个 /-/ping（页面受 CSP connect-src 'self'
+    // 限制，不能跨端口直接探测）。结果同时用于顶栏「镜像源服务」状态与「重启镜像源服务」后的恢复确认。
+    const probe = await ctx.probeRegistry();
     return ok(res, {
       ...base,
       pid: process.pid,
       startedAt: new Date(ctx.state.startedAt).toISOString(),
       registryUrl: ctx.registryUrl,
-      listen: { ip: ctx.listenIp || cfg.server.ip, port: ctx.listenPort || cfg.server.port },
+      adminUrl: ctx.adminUrl,
       configPath: require('./config').CONFIG_FILE,
       clientIp: ctx.clientIp(req),
+      // listen：镜像源监听（兼容旧字段名）
+      listen: { ip: ctx.registryListenIp, port: ctx.registryListenPort },
+      // admin：管理界面监听（前端用它对比配置里的 admin.*，判断是否需要重启管理界面）
+      admin: {
+        ip: ctx.adminListenIp,
+        port: ctx.adminListenPort,
+        startedAt: new Date(ctx.adminStartedAt).toISOString(),
+        listenError: ctx.adminListenError || '',
+      },
+      // registry：镜像源监听实例信息 + 实时探测结果（reachable=false 表示镜像源服务不可用）
+      registry: {
+        ip: ctx.registryListenIp,
+        port: ctx.registryListenPort,
+        startedAt: new Date(ctx.registryStartedAt).toISOString(),
+        reachable: !!probe.reachable,
+        latencyMs: probe.latencyMs,
+        checkedAt: probe.checkedAt,
+        target: probe.target,
+        error: probe.error || '',
+      },
     });
   }
   if (rel === '/session' && method === 'POST') {
@@ -540,8 +572,20 @@ async function handleAdmin(ctx) {
       title: cfg.ui && cfg.ui.title,
       uptimeSec: Math.floor((Date.now() - ctx.state.startedAt) / 1000),
       startedAt: new Date(ctx.state.startedAt).toISOString(),
-      listen: { ip: ctx.listenIp || cfg.server.ip, port: ctx.listenPort || cfg.server.port },
+      listen: { ip: ctx.registryListenIp, port: ctx.registryListenPort },
       registryUrl: ctx.registryUrl,
+      adminUrl: ctx.adminUrl,
+      admin: {
+        ip: ctx.adminListenIp,
+        port: ctx.adminListenPort,
+        startedAt: new Date(ctx.adminStartedAt).toISOString(),
+        listenError: ctx.adminListenError || '',
+      },
+      registry: {
+        ip: ctx.registryListenIp,
+        port: ctx.registryListenPort,
+        startedAt: new Date(ctx.registryStartedAt).toISOString(),
+      },
       lanUrls: cfg.server.ip === '0.0.0.0' || cfg.server.ip === '::' ? lanUrls(cfg.server.port) : [],
       upstream: { registry: cfg.upstream.registry, reachable: !!uc.reachable, reason: uc.reason || '', checkedAt: uc.at ? new Date(uc.at).toISOString() : null },
       stats: { ...stats, bundles: bs, storageBytesText: formatBytes(stats.storageBytes) },
@@ -1699,7 +1743,7 @@ async function handleAdmin(ctx) {
     const bad = (msg) => fail(res, 400, msg, 'EBADCFG');
     if (!isPlain(patch)) return bad('配置内容不合法：必须是对象');
     // 分段字段必须是对象；否则 save() 虽会忽略，但这里提前报错，界面能及时提示
-    for (const k of ['server', 'upstream', 'security', 'storage', 'log', 'ui']) {
+    for (const k of ['server', 'admin', 'upstream', 'security', 'storage', 'log', 'ui']) {
       if (patch[k] !== undefined && !isPlain(patch[k])) return bad(`配置项 ${k} 必须是对象`);
     }
     if (patch.mode !== undefined && !['cache', 'proxy', 'offline'].includes(String(patch.mode))) {
@@ -1721,6 +1765,33 @@ async function handleAdmin(ctx) {
         if (!Number.isInteger(p) || p < 1 || p > 65535) return bad('server.port 必须是 1-65535 的整数');
       }
       if (s.openBrowserOnStart !== undefined && typeof s.openBrowserOnStart !== 'boolean') return bad('server.openBrowserOnStart 必须是布尔值');
+    }
+    if (patch.admin) {
+      const a = patch.admin;
+      if (a.ip !== undefined) {
+        if (typeof a.ip !== 'string') return bad('管理界面监听 IP 必须是字符串');
+        const ip = a.ip.trim();
+        // 安全需求：管理界面访问的监听 IP 只能是 127 网段的本地回环地址
+        if (!config.isAdminListenIp(ip)) {
+          return bad('管理界面监听 IP 只能是 127.0.0.0/8 网段的本地回环地址（例如 127.0.0.1；不允许 0.0.0.0、::1、局域网地址或主机名）');
+        }
+        a.ip = ip;
+      }
+      if (a.port !== undefined) {
+        const p = Number(a.port);
+        if (!Number.isInteger(p) || p < 1 || p > 65535) return bad('管理界面监听端口 admin.port 必须是 1-65535 的整数');
+        a.port = p;
+      }
+    }
+    // 管理界面监听端口不能与镜像源监听端口相同：合并后再校验（可能只改了其中一个配置）
+    {
+      const cur = config.get();
+      const merged = config.deepMerge(cur, patch);
+      const finalServerPort = Number(merged.server && merged.server.port !== undefined ? merged.server.port : cur.server.port);
+      const finalAdminPort = Number(merged.admin && merged.admin.port !== undefined ? merged.admin.port : (cur.admin && cur.admin.port));
+      if (Number.isInteger(finalServerPort) && Number.isInteger(finalAdminPort) && finalServerPort === finalAdminPort) {
+        return bad(`管理界面监听端口不能与镜像源监听端口相同（当前都配置为 ${finalServerPort}）`);
+      }
     }
     if (patch.upstream) {
       const u = patch.upstream;
@@ -1797,9 +1868,11 @@ async function handleAdmin(ctx) {
     const after = config.save(patch);
     if (log) { log.level = after.log.level; log.info('配置已更新'); }
     ctx.state.upstreamCheck = null;   // 上游可能变了，重新探测
-    const restartRequired = config.requiresRestart(before, after);
+    // 分项重启标记：registry=需重启镜像源服务 / admin=需重启管理界面 / program=需重启整个程序
+    const restart = config.restartChanges(before, after);
+    const restartRequired = restart.registry || restart.admin || restart.program;
     ctx.state.restartRequired = restartRequired;
-    return ok(res, { config: config.publicConfig(false), restartRequired, requiresRestart: restartRequired });
+    return ok(res, { config: config.publicConfig(false), restartRequired, requiresRestart: restartRequired, restart });
   }
 
   /* 加速镜像源「测试连通性」：只读探测，不落盘、不改配置；地址规则与 PUT /config 的 accelerators 校验一致 */
@@ -2095,20 +2168,47 @@ async function handleAdmin(ctx) {
     const config = require('./config');
     const c = config.get();
     // 先确认端口可用，避免重启后起不来。
-    // 注意：若目标地址与当前监听地址相同，端口当然被自己占用，此时必须跳过预检。
-    const net = require('node:net');
-    const sameAsCurrent = String(c.server.ip) === String(ctx.listenIp) && Number(c.server.port) === Number(ctx.listenPort);
+    // 注意：若目标地址与当前镜像源监听地址相同，端口当然被自己占用，此时必须跳过预检。
+    const sameAsCurrent = String(c.server.ip) === String(ctx.registryListenIp) && Number(c.server.port) === Number(ctx.registryListenPort);
     if (!sameAsCurrent) {
-      const canBind = await new Promise((resolve) => {
-        const srv = net.createServer();
-        srv.once('error', () => resolve(false));
-        srv.once('listening', () => srv.close(() => resolve(true)));
-        try { srv.listen(c.server.port, c.server.ip === '0.0.0.0' ? undefined : c.server.ip); } catch { resolve(false); }
-      });
+      const canBind = await checkBindable(c.server.ip, c.server.port);
       if (!canBind) return fail(res, 409, `端口 ${c.server.port} 当前被占用，请先修改端口或关闭占用进程`, 'EADDRINUSE');
     }
-    if (log) log.warn('收到重启指令，正在重启服务');
-    sendJson(res, 200, { ok: true, data: { restarting: true } });
+    if (log) log.warn('收到「重启镜像源服务」指令，正在重建镜像源监听');
+    sendJson(res, 200, { ok: true, data: { restarting: true, target: 'registry' } });
+    // 只重建镜像源监听：管理界面监听不受影响（管理界面不会断线，也不会触发页面刷新）
+    setTimeout(() => { ctx.requestRestartRegistry().catch(() => { /* 失败已写日志，前端通过探测结果提示 */ }); }, 200);
+    return true;
+  }
+
+  /* 重启管理界面：只重建管理界面监听（admin.ip:admin.port），镜像源服务不受影响。
+   * 页面会在监听重建期间短暂断连，恢复后自动刷新（这是唯一会触发管理界面刷新的重启操作）。 */
+  if (rel === '/service/restart-admin' && method === 'POST') {
+    const config = require('./config');
+    const c = config.get();
+    const sameAsCurrent = String(c.admin.ip) === String(ctx.adminListenIp) && Number(c.admin.port) === Number(ctx.adminListenPort);
+    if (!sameAsCurrent) {
+      const canBind = await checkBindable(c.admin.ip, c.admin.port);
+      if (!canBind) return fail(res, 409, `管理界面端口 ${c.admin.port} 当前被占用，请先修改端口或关闭占用进程`, 'EADDRINUSE');
+    }
+    if (log) log.warn('收到「重启管理界面」指令，正在重建管理界面监听');
+    sendJson(res, 200, { ok: true, data: { restarting: true, target: 'admin' } });
+    setTimeout(() => { ctx.requestRestartAdmin().catch(() => { /* 失败已写日志 */ }); }, 200);
+    return true;
+  }
+
+  /* 重启整个程序：进程级重启（旧进程退出并拉起新进程），让 storage.dir 等进程级配置生效。
+   * 管理界面与镜像源都会短暂中断，页面断连恢复后自动刷新。 */
+  if (rel === '/service/restart-process' && method === 'POST') {
+    const config = require('./config');
+    const c = config.get();
+    const sameAsCurrent = String(c.server.ip) === String(ctx.registryListenIp) && Number(c.server.port) === Number(ctx.registryListenPort);
+    if (!sameAsCurrent) {
+      const canBind = await checkBindable(c.server.ip, c.server.port);
+      if (!canBind) return fail(res, 409, `端口 ${c.server.port} 当前被占用，请先修改端口或关闭占用进程`, 'EADDRINUSE');
+    }
+    if (log) log.warn('收到「重启程序」指令，正在重启整个进程');
+    sendJson(res, 200, { ok: true, data: { restarting: true, target: 'process' } });
     setTimeout(() => ctx.requestRestart(), 200);
     return true;
   }
