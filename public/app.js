@@ -1991,7 +1991,7 @@
       el('div', { class: 'fill-col-head' }, [headEl, cnt]),
       box
     ]);
-    var map = {}, max = Math.max(1, Math.min(32, conc || 6));
+    var map = {}, max = Math.max(1, Math.min(64, conc || 6));
 
     function paint(pkgs, ended) {
       var running = [];
@@ -2062,7 +2062,7 @@
       setHead: function (t) { if (t) headEl.textContent = t; },
       /* 并发数在任务快照里（导出/导入可能 4~10 路），弹窗建栏时还不知道，拿到快照后再放宽行数上限 */
       setMax: function (n) {
-        var v = Math.max(1, Math.min(32, Number(n) || 1));
+        var v = Math.max(1, Math.min(64, Number(n) || 1));
         if (v !== max) max = v;
       }
     };
@@ -2088,7 +2088,7 @@
       el('div', { class: 'fill-col-head' }, [headEl, cnt]),
       box
     ]);
-    var map = {}, max = Math.max(1, Math.min(32, conc || 6));
+    var map = {}, max = Math.max(1, Math.min(64, conc || 6));
 
     function paint(downloads, ended) {
       var list = (Array.isArray(downloads) ? downloads : []).slice(0, max);
@@ -3495,7 +3495,7 @@
         ctl.uploadId = init.uploadId;
         var chunkSize = Number(init.chunkSize) || file.size;
         var chunkCount = Math.max(1, Number(init.chunkCount) || 1);
-        var concurrency = Math.max(1, Math.min(16, Number(init.concurrency) || 4));
+        var concurrency = Math.max(1, Math.min(64, Number(init.concurrency) || 4));
         var loadedByIndex = new Array(chunkCount);
         var next = 0;
         reportProgress(0, chunkCount, loadedByIndex, file.size);
@@ -4027,11 +4027,11 @@
         { k: 'storage.dir', label: '存储目录', type: 'text' },
         { k: 'storage.maxUploadMB', label: '单包上传上限（MB）', type: 'number', hint: '网页上传单个 .tgz 安装包的上限，1-4096。' },
         { k: 'storage.maxBundleUploadMB', label: '离线包上传上限（MB）', type: 'number', hint: '网页上传整机备份（离线包）的上限，1-65536；服务端流式落盘，不占内存。更大的包建议直接放进 data/bundles 目录后再用「导入」按钮。' },
-        { k: 'storage.bundleExportConcurrency', label: '离线包导出并发', type: 'number', hint: '导出整机备份时并行压缩的线程数，1-16，默认 4。设 1 回到单线程；机器核数多时可调大。' },
-        { k: 'storage.bundleImportConcurrency', label: '离线包导入并发', type: 'number', hint: '导入整机备份时同时处理的包数，1-16，默认 4。设 1 回到串行；机械硬盘或 CPU 较忙时调小更稳。' },
-        { k: 'storage.bundleImportExtractConcurrency', label: '离线包解包并发', type: 'number', hint: '解压并把文件写盘的并发路数，1-16，默认 8。机械硬盘上并发太高反而慢，可调低到 2-4。' },
+        { k: 'storage.bundleExportConcurrency', label: '离线包导出并发', type: 'number', hint: '导出整机备份时并行压缩的线程数，1-64，默认 4。设 1 回到单线程；机器核数多（如 18 核 22 线程）可调到接近逻辑处理器数。' },
+        { k: 'storage.bundleImportConcurrency', label: '离线包导入并发', type: 'number', hint: '导入整机备份时的总并行路数，1-64，默认 4。设 1 回到串行；剩余包少于路数时空闲路会抢同一包里的版本。机械硬盘或 CPU 较忙时调小更稳。' },
+        { k: 'storage.bundleImportExtractConcurrency', label: '离线包解包并发', type: 'number', hint: '解压并把文件写盘的并发路数，1-64，默认 8。机械硬盘上并发太高反而慢，可调低到 2-4；SSD 多核可调大到 16-32。' },
         { k: 'storage.bundleUploadChunkMB', label: '分片上传 · 每片大小（MB）', type: 'number', hint: '网页上传离线包时每片的大小，1-64，默认 8。片越小进度越细，但请求次数变多。' },
-        { k: 'storage.bundleUploadConcurrency', label: '分片上传 · 并发数', type: 'number', hint: '同时上传几个分片，1-16，默认 4。浏览器对同一域名通常最多 6 条连接，设太大反而排队。' }
+        { k: 'storage.bundleUploadConcurrency', label: '分片上传 · 并发数', type: 'number', hint: '同时上传几个分片，1-64，默认 4。浏览器对同一域名通常最多 6 条连接，设太大反而排队；反向代理开 HTTP/2 后调大才有明显收益。' }
       ]
     },
     {

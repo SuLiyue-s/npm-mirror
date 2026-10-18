@@ -531,12 +531,12 @@ async function get(p, { json = false } = {}) {
     const cliSrc = fs.readFileSync(path.join(__dirname, '..', 'cli.js'), 'utf8');
 
     // ① 配置项：默认值、范围校验、界面字段
-    check('配置有离线包导出/导入并发项（storage.bundleExportConcurrency / bundleImportConcurrency，默认 4）',
+    check('配置有离线包导出/导入并发项（storage.bundleExportConcurrency / bundleImportConcurrency，默认 4，上限 64）',
       /bundleExportConcurrency:\s*4/.test(configSrc) && /bundleImportConcurrency:\s*4/.test(configSrc)
-        && /clampInt\(st\.bundleExportConcurrency, 1, 16, 4\)/.test(configSrc)
-        && /clampInt\(st\.bundleImportConcurrency, 1, 16, 4\)/.test(configSrc));
-    check('PUT /config 校验并发项必须是 1-16 的整数',
-      /bundleExportConcurrency', 'bundleImportConcurrency'/.test(apiSrc) && /1-16 的整数/.test(apiSrc));
+        && /clampInt\(st\.bundleExportConcurrency, 1, 64, 4\)/.test(configSrc)
+        && /clampInt\(st\.bundleImportConcurrency, 1, 64, 4\)/.test(configSrc));
+    check('PUT /config 校验并发项必须是 1-64 的整数',
+      /bundleExportConcurrency', 'bundleImportConcurrency'/.test(apiSrc) && /1-64 的整数/.test(apiSrc));
     check('配置页「存储」段有「离线包导出并发 / 离线包导入并发」两个字段',
       /k: 'storage\.bundleExportConcurrency'/.test(js.text) && /k: 'storage\.bundleImportConcurrency'/.test(js.text)
         && /离线包导出并发/.test(js.text) && /离线包导入并发/.test(js.text));
@@ -589,10 +589,10 @@ async function get(p, { json = false } = {}) {
         && /rel === '\/bundles\/upload\/complete'/.test(apiSrc) && /rel === '\/bundles\/upload\/abort'/.test(apiSrc)
         && /function assembleBundleUpload\s*\(/.test(apiSrc) && /function bundleUploadFirstMissing\s*\(/.test(apiSrc)
         && /EINCOMPLETE/.test(apiSrc) && /EBADCHUNK/.test(apiSrc));
-    check('分片上传配置项（每片默认 8MB / 1-64，并发默认 4 / 1-16）与 PUT 校验',
+    check('分片上传配置项（每片默认 8MB / 1-64，并发默认 4 / 1-64）与 PUT 校验',
       /bundleUploadChunkMB:\s*8/.test(configSrc) && /bundleUploadConcurrency:\s*4/.test(configSrc)
         && /clampInt\(st\.bundleUploadChunkMB, 1, 64, 8\)/.test(configSrc)
-        && /clampInt\(st\.bundleUploadConcurrency, 1, 16, 4\)/.test(configSrc)
+        && /clampInt\(st\.bundleUploadConcurrency, 1, 64, 4\)/.test(configSrc)
         && /m < 1 \|\| m > 64/.test(apiSrc)
         && js.text.includes("k: 'storage.bundleUploadChunkMB'") && js.text.includes("k: 'storage.bundleUploadConcurrency'"));
     check('前端分片上传按 init 返回的并发数开固定 lane 池，全部传完才 complete；失败重试并 abort 清理',
@@ -602,14 +602,14 @@ async function get(p, { json = false } = {}) {
 
     // ② 多并发解包：extractTarGz 的写入器池
     check('解包支持多并发：写入器池（最多 N 个未收尾的写流同时写）+ 目录缓存 + 结束统一等待收尾',
-      /concurrency = 1,/.test(tarSrc) && /const writeConc = Math\.max\(1, Math\.min\(32/.test(tarSrc)
+      /concurrency = 1,/.test(tarSrc) && /const writeConc = Math\.max\(1, Math\.min\(64/.test(tarSrc)
         && /async function drainWrites\s*\(/.test(tarSrc) && /const dirCache = new Set/.test(tarSrc)
         && /if \(writeSlots\.size >= writeConc\) await reapOneWrite\(\)/.test(tarSrc));
-    check('导入把配置里的解包并发传给 extractTarGz（默认 8，1-16）',
-      /extractConcurrency = 4,/.test(bundleSrc) && /concurrency: Math\.max\(1, Math\.min\(32/.test(bundleSrc)
+    check('导入把配置里的解包并发传给 extractTarGz（默认 8，1-64）',
+      /extractConcurrency = 4,/.test(bundleSrc) && /concurrency: Math\.max\(1, Math\.min\(64/.test(bundleSrc)
         && /extractConcurrency: Math\.max\(1, Number\(cfg\.storage\.bundleImportExtractConcurrency\) \|\| 8\)/.test(apiSrc)
         && /bundleImportExtractConcurrency:\s*8/.test(configSrc)
-        && /clampInt\(st\.bundleImportExtractConcurrency, 1, 16, 8\)/.test(configSrc));
+        && /clampInt\(st\.bundleImportExtractConcurrency, 1, 64, 8\)/.test(configSrc));
 
     // ③ 每个包的并行路数：调度器 lane 计数 → inFlight.lanes → 右栏「· N 路」
     check('每个在跑的包带上「当前分到几路」（调度器 lanes 计数随 inFlight 上报）',

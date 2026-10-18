@@ -135,10 +135,10 @@ node cli.js import npm-mirror-all.tgz
 | `security.trustLocalhost` | `true` | 本机回环地址免令牌 |
 | `storage.dir` / `storage.maxUploadMB` | `data/storage` / `500` | 包存储目录 / 单包上传上限（MB，1-4096） |
 | `storage.maxBundleUploadMB` | `4096` | 网页上传整机备份（离线包）的上限（MB，1-65536）。上传走流式落盘，不占内存；更大的包可放进 `data/bundles` 后用界面「导入」 |
-| `storage.bundleExportConcurrency` | `4` | 导出整机备份时的并行压缩线程数（1-16）。整数备份大、机器核数多时可调大，设 1 回到单线程 |
-| `storage.bundleImportConcurrency` | `4` | 导入整机备份时的总并行路数（1-16）。包多时每路各管一个包；剩余包少于路数时，空闲的路会自动抢同一个包里还没导入的版本。设 1 回到串行，机械硬盘或 CPU 忙时调小更稳 |
-| `storage.bundleImportExtractConcurrency` | `8` | 离线包解包（解压 + 写盘）的并发路数（1-16）。机械硬盘上并发太高反而慢，可调低到 2-4 |
-| `storage.bundleUploadChunkMB` / `storage.bundleUploadConcurrency` | `8` / `4` | 网页上传离线包的分片大小（MB，1-64）与并发上传路数（1-16）。浏览器同域约 6 个连接，太大反而排队 |
+| `storage.bundleExportConcurrency` | `4` | 导出整机备份时的并行压缩线程数（1-64）。整数备份大、机器核数多时可调大（高核机器可调到接近逻辑处理器数），设 1 回到单线程 |
+| `storage.bundleImportConcurrency` | `4` | 导入整机备份时的总并行路数（1-64）。包多时每路各管一个包；剩余包少于路数时，空闲的路会自动抢同一个包里还没导入的版本。设 1 回到串行，机械硬盘或 CPU 忙时调小更稳 |
+| `storage.bundleImportExtractConcurrency` | `8` | 离线包解包（解压 + 写盘）的并发路数（1-64）。机械硬盘上并发太高反而慢，可调低到 2-4；SSD 多核可调大到 16-32 |
+| `storage.bundleUploadChunkMB` / `storage.bundleUploadConcurrency` | `8` / `4` | 网页上传离线包的分片大小（MB，1-64）与并发上传路数（1-64）。浏览器同域约 6 个连接，太大反而排队 |
 | `log.level` / `log.maxDays` | `info` / `7` | 日志级别 / 保留天数 |
 | `ui.title` | `私人 npm 镜像源` | 管理界面标题 |
 

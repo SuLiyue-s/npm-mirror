@@ -575,7 +575,7 @@ function makeReader(stream) {
  *   filter(relPath, {size, mtime}) -> boolean   是否解出
  *   onEntry(relPath, writtenBytes)              每个文件解出后的回调
  *   maxTotalBytes / maxEntries / maxEntryBytes / maxPaxBytes  覆盖默认上限
- *   concurrency                                 并发写盘的文件数（默认 1，建议 4~16；tar 流仍是单流顺序读）
+ *   concurrency                                 并发写盘的文件数（默认 1，建议 4~32，SSD/多核可到 64；tar 流仍是单流顺序读）
  */
 async function extractTarGz(file, destDir, opts = {}) {
   const {
@@ -602,7 +602,7 @@ async function extractTarGz(file, destDir, opts = {}) {
   /* 多并发写盘：tar.gz 的 gzip 解压是单流顺序读，但「open/write/close 每个条目」可以流水化。
    * 单文件写流收尾（close）期间不阻塞主循环继续读下一条目，最多同时保留 concurrency 个未收尾写流，
    * 小文件很多的离线包（几万个 tarball）在这里能省掉大量串行等待。 */
-  const writeConc = Math.max(1, Math.min(32, Math.floor(Number(concurrency)) || 1));
+  const writeConc = Math.max(1, Math.min(64, Math.floor(Number(concurrency)) || 1));
   const writeSlots = new Set();  // { out, target, done: Promise<{err}> }
   let pendingWriteErr = null;
   const dirCache = new Set([destDir]);

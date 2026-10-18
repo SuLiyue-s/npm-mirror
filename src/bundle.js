@@ -692,7 +692,7 @@ async function importBundle({
         emit({ phase: 'extract', bytes: extracted, totalBytes, current: rel });
       },
       // 解包不再逐文件串行：读 tar 是单流，但写盘/建目录可以多路并行收尾
-      concurrency: Math.max(1, Math.min(32, Math.floor(Number(extractConcurrency)) || 1)),
+      concurrency: Math.max(1, Math.min(64, Math.floor(Number(extractConcurrency)) || 1)),
       maxTotalBytes: Math.max(2 * 1024 * 1024 * 1024, bundleSize * 4),
       maxEntries: 2000000,
     });
@@ -715,7 +715,7 @@ async function importBundle({
     /* 并行路数：配置多少就用多少，不再被「包数」min 掉（原来 workerCount=min(并发,包数)，
      * 包数少于并发时多余的并行路直接不存在）。包数少于路数时，多出来的 lane 会去抢
      * 同一个包里剩余的版本任务一起做，让空闲路一起导入剩余的包。 */
-    const laneCount = Math.max(1, Math.min(32, Math.floor(Number(concurrency)) || 1));
+    const laneCount = Math.max(1, Math.min(64, Math.floor(Number(concurrency)) || 1));
     let nextPkg = 0;
     let startedPkgs = 0;
     const states = [];                 // 本次导入打开过的包状态（顺序 = 包顺序）

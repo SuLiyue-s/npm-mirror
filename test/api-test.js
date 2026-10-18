@@ -2265,29 +2265,39 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
     }
 
     // B) 并发配置项：字段暴露、默认值、非法值、改大后任务并发度跟着变
-    // 注意：这是用户可改的配置（可能已被改成 10 之类），断言只要求「字段在 1~16 合法范围 + 代码默认值是 4」，
+    // 注意：这是用户可改的配置（可能已被改成 10 之类），断言只要求「字段在 1~64 合法范围 + 代码默认值是 4」，
     // 并在小节结束处恢复成进来时的原值，别把测试改动留在用户配置里。
     const cfgModD4 = require('../src/config');
     const dflt4 = cfgModD4.defaults();
     const cfg0 = await api('/__admin/api/config');
     const st0 = (((cfg0.json || {}).data || {}).config || {}).storage || {};
     const numIn = (v, lo, hi) => Number.isFinite(Number(v)) && Number(v) >= lo && Number(v) <= hi;
-    check('GET /config 暴露离线包导出/导入并发（字段在 1~16 之间，代码默认 4）',
-      numIn(st0.bundleExportConcurrency, 1, 16) && numIn(st0.bundleImportConcurrency, 1, 16)
+    check('GET /config 暴露离线包导出/导入并发（字段在 1~64 之间，代码默认 4）',
+      numIn(st0.bundleExportConcurrency, 1, 64) && numIn(st0.bundleImportConcurrency, 1, 64)
         && Number(dflt4.storage.bundleExportConcurrency) === 4 && Number(dflt4.storage.bundleImportConcurrency) === 4,
       JSON.stringify(st0));
     const badC1 = await api('/__admin/api/config', { method: 'PUT', body: { storage: { bundleExportConcurrency: 0 } } });
     check('PUT /config storage.bundleExportConcurrency=0 → 400',
       badC1.status === 400 && /bundleExportConcurrency/.test(badC1.text), `status=${badC1.status}`);
-    const badC2 = await api('/__admin/api/config', { method: 'PUT', body: { storage: { bundleImportConcurrency: 17 } } });
-    check('PUT /config storage.bundleImportConcurrency=17 → 400',
+    const badC2 = await api('/__admin/api/config', { method: 'PUT', body: { storage: { bundleImportConcurrency: 65 } } });
+    check('PUT /config storage.bundleImportConcurrency=65 → 400（上限 64）',
       badC2.status === 400 && /bundleImportConcurrency/.test(badC2.text), `status=${badC2.status}`);
     const okC = await api('/__admin/api/config', {
       method: 'PUT', body: { storage: { bundleExportConcurrency: 6, bundleImportConcurrency: 6 } },
     });
-    check('PUT /config 把导出/导入并发改成 6 生效',
-      okC.status === 200 && Number(((((okC.json || {}).data || {}).config || {}).storage || {}).bundleExportConcurrency) === 6,
-      `status=${okC.status}`);
+    // 高核机器（如 18 核 22 线程）要能调到 16 以上：确认 22 这种值能被接受并回显
+    const highC = await api('/__admin/api/config', {
+      method: 'PUT', body: { storage: { bundleExportConcurrency: 22, bundleImportConcurrency: 22 } },
+    });
+    check('PUT /config 把导出/导入并发改成 6 / 22 都生效（上限已提到 64，高核机器能调到逻辑处理器数）',
+      okC.status === 200 && Number(((((okC.json || {}).data || {}).config || {}).storage || {}).bundleExportConcurrency) === 6
+        && highC.status === 200
+        && Number(((((highC.json || {}).data || {}).config || {}).storage || {}).bundleImportConcurrency) === 22,
+      `status6=${okC.status} status22=${highC.status}`);
+    // 改回 6 供下面的并行导出/导入任务断言使用
+    await api('/__admin/api/config', {
+      method: 'PUT', body: { storage: { bundleExportConcurrency: 6, bundleImportConcurrency: 6 } },
+    });
 
     const st4 = new Store4({ dir: cfgMod4.storageDir(), logger: quietLog4 });
     await st4.init();
@@ -2421,9 +2431,9 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
     const stBeforeNew = (((cfgNow.json || {}).data || {}).config || {}).storage || {};
     const dfltNew = cfgModNew.defaults().storage;
     const inRangeNew = (v, lo, hi) => Number.isFinite(Number(v)) && Number(v) >= lo && Number(v) <= hi;
-    check('GET /config 暴露分片上传/解包并发新配置（1~64 / 1~16，代码默认 8/4/8）',
-      inRangeNew(stBeforeNew.bundleUploadChunkMB, 1, 64) && inRangeNew(stBeforeNew.bundleUploadConcurrency, 1, 16)
-        && inRangeNew(stBeforeNew.bundleImportExtractConcurrency, 1, 16)
+    check('GET /config 暴露分片上传/解包并发新配置（均为 1~64，代码默认 8/4/8）',
+      inRangeNew(stBeforeNew.bundleUploadChunkMB, 1, 64) && inRangeNew(stBeforeNew.bundleUploadConcurrency, 1, 64)
+        && inRangeNew(stBeforeNew.bundleImportExtractConcurrency, 1, 64)
         && Number(dfltNew.bundleUploadChunkMB) === 8 && Number(dfltNew.bundleUploadConcurrency) === 4
         && Number(dfltNew.bundleImportExtractConcurrency) === 8,
       JSON.stringify(stBeforeNew));
@@ -2431,10 +2441,10 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
     const badNew2 = await api('/__admin/api/config', { method: 'PUT', body: { storage: { bundleUploadChunkMB: 65 } } });
     check('PUT /config storage.bundleUploadChunkMB=0 或 65 → 400', badNew1.status === 400 && badNew2.status === 400,
       `0→${badNew1.status} 65→${badNew2.status}`);
-    const badNew3 = await api('/__admin/api/config', { method: 'PUT', body: { storage: { bundleUploadConcurrency: 17 } } });
+    const badNew3 = await api('/__admin/api/config', { method: 'PUT', body: { storage: { bundleUploadConcurrency: 65 } } });
     const badNew4 = await api('/__admin/api/config', { method: 'PUT', body: { storage: { bundleImportExtractConcurrency: 0 } } });
-    check('PUT /config storage.bundleUploadConcurrency=17 / bundleImportExtractConcurrency=0 → 400',
-      badNew3.status === 400 && badNew4.status === 400, `17→${badNew3.status} 0→${badNew4.status}`);
+    check('PUT /config storage.bundleUploadConcurrency=65 / bundleImportExtractConcurrency=0 → 400',
+      badNew3.status === 400 && badNew4.status === 400, `65→${badNew3.status} 0→${badNew4.status}`);
 
     try {
       const putNew = await api('/__admin/api/config', {

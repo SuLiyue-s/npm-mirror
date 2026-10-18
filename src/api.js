@@ -1250,7 +1250,7 @@ async function handleAdmin(ctx) {
     if (log) log.info(`开始分片上传离线包 ${name}（${formatBytes(size)}，${chunkCount} 片 × ${formatBytes(chunkSize)}）`);
     return ok(res, {
       uploadId: id, name, size, chunkSize, chunkCount,
-      concurrency: clamp(Number(cfg.storage.bundleUploadConcurrency) || 4, 1, 16),
+      concurrency: clamp(Number(cfg.storage.bundleUploadConcurrency) || 4, 1, 64),
       maxSizeMB: maxMB,
     });
   }
@@ -1490,7 +1490,7 @@ async function handleAdmin(ctx) {
         const m = Number(st.maxBundleUploadMB);
         if (!Number.isInteger(m) || m < 1 || m > 65536) return bad('storage.maxBundleUploadMB 必须是 1-65536 的整数');
       }
-      // 分片上传：每片大小（MB）单独限制 1-64，其余并发路数统一 1-16
+      // 分片上传：每片大小（MB）1-64；导出/导入/解包/分片上传的并发路数统一 1-64（给 32 核 64 线程档留余量）
       if (st.bundleUploadChunkMB !== undefined) {
         const m = Number(st.bundleUploadChunkMB);
         if (!Number.isInteger(m) || m < 1 || m > 64) return bad('storage.bundleUploadChunkMB 必须是 1-64 的整数（每片 MB 数）');
@@ -1498,7 +1498,7 @@ async function handleAdmin(ctx) {
       for (const k of ['bundleExportConcurrency', 'bundleImportConcurrency', 'bundleImportExtractConcurrency', 'bundleUploadConcurrency']) {
         if (st[k] !== undefined) {
           const n = Number(st[k]);
-          if (!Number.isInteger(n) || n < 1 || n > 16) return bad(`storage.${k} 必须是 1-16 的整数`);
+          if (!Number.isInteger(n) || n < 1 || n > 64) return bad(`storage.${k} 必须是 1-64 的整数`);
         }
       }
       if (st.dir !== undefined) {
