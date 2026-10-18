@@ -7,6 +7,8 @@
 # 流程：复制一份项目到 tmp\tray-e2e-<时间> → 用真实的「启动镜像源.cmd」在独立控制台里启动
 #   → 断言：服务在线、命令行窗口被隐藏、托盘日志正常
 #   → 模拟左键打开窗口（ShowWindow 校验窗口可显示）
+#   → 场景 A：强杀托盘进程（模拟图标被关掉/崩掉，服务仍在跑）→ 再跑一次启动镜像源.cmd
+#     → 断言：托盘补注册成功、接管原来的隐藏命令行窗口、服务没受影响
 #   → 用 node cli.js stop 停服务（等价于双击「停止镜像源.cmd」）
 #   → 断言：托盘自动退出并关掉命令行窗口
 #
@@ -30,6 +32,8 @@ foreach ($f in 'cli.js', 'package.json', '启动镜像源.cmd') { Copy-Item (Joi
 New-Item -ItemType Directory -Path (Join-Path $dir 'data') -Force | Out-Null
 $cfg = @{
   server   = @{ ip = '127.0.0.1'; port = $Port; openBrowserOnStart = $false }
+  # 管理界面用 端口+1：和真实实例（默认 4873/4874）完全隔离，否则托盘会探到真实实例的管理端口
+  admin    = @{ ip = '127.0.0.1'; port = ($Port + 1); openBrowserOnStart = $false }
   mode     = 'offline'
   storage  = @{ dir = 'data/storage' }
   security = @{ token = 'tray-e2e-token'; requirePublish = $false; trustLocalhost = $true }
@@ -47,6 +51,7 @@ public static class MirrorE2E {
   [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder sb, int max);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int cmd);
+  [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hWnd);
   public static IntPtr FindByTitle(string title) {
     IntPtr found = IntPtr.Zero;
     EnumWindows((h, l) => {
@@ -109,6 +114,39 @@ if ($hwnd -ne [IntPtr]::Zero) {
 }
 "console_can_show=$showOk"
 
+# ---------- 场景 A：托盘被关掉/崩掉、但服务还在跑 → 再跑一次启动脚本应补注册托盘 ----------
+"== 场景 A：强杀托盘进程（模拟图标没了），再跑一次 启动镜像源.cmd 应补注册托盘"
+function Read-TrayPid {
+  $f = Join-Path $dir 'data\logs\tray.pid'
+  if (Test-Path $f) { try { return [int]((Get-Content $f -Raw | ConvertFrom-Json).pid) } catch { return 0 } }
+  return 0
+}
+$firstTrayPid = Read-TrayPid
+$trayKilled = $false
+if ($firstTrayPid -gt 0) {
+  Stop-Process -Id $firstTrayPid -Force -ErrorAction SilentlyContinue
+  Start-Sleep -Milliseconds 800
+  $trayKilled = -not [bool](Get-Process -Id $firstTrayPid -ErrorAction SilentlyContinue)
+}
+$serviceUpAfterTrayKilled = Test-Up
+"first_tray_pid=$firstTrayPid  tray_killed=$trayKilled  service_up_after_tray_killed=$serviceUpAfterTrayKilled"
+
+# 模拟用户再双击一次「启动镜像源.cmd」：用普通可见窗口启动（和真实双击一致；
+# 补注册模式的托盘会把它当成临时宿主窗口，就绪后隐藏，并接管上面那个原来被隐藏的控制台）。
+$restoreProc = Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', '启动镜像源.cmd', '--no-open' -WorkingDirectory $dir -PassThru
+$restoreDeadline = (Get-Date).AddSeconds(90)
+$restored = $false
+while ((Get-Date) -lt $restoreDeadline) {
+  $logRestore = Read-TrayLog
+  if ($logRestore -match '服务已在运行，接管原命令行窗口' -or $logRestore -match '服务已在运行，但没有找到原来的命令行窗口') { $restored = $true; break }
+  Start-Sleep -Milliseconds 500
+}
+$restoredTrayPid = Read-TrayPid
+$restoredTrayAlive = [bool]($restoredTrayPid -gt 0 -and $restoredTrayPid -ne $firstTrayPid -and (Get-Process -Id $restoredTrayPid -ErrorAction SilentlyContinue))
+$adoptedConsole = [bool]((Read-TrayLog) -match '服务已在运行，接管原命令行窗口')
+$serviceStillUp = Test-Up
+"restore_logged=$restored  adopted_console=$adoptedConsole  restored_tray_pid=$restoredTrayPid  restored_tray_alive=$restoredTrayAlive  service_still_up=$serviceStillUp"
+
 "== 停止镜像源（等价于双击「停止镜像源.cmd」）"
 Push-Location $dir
 $stopOut = (& node cli.js stop 2>&1 | Out-String)
@@ -119,10 +157,11 @@ $trayExited = $false
 $windowClosed = $false
 $deadline = (Get-Date).AddSeconds(45)
 while ((Get-Date) -lt $deadline) {
-  $h = Get-MirrorWindow
+  # 用启动时记下的窗口句柄判断是否已被关闭（不能按标题再找：本机可能还有别处同标题的
+  # 隐藏窗口，例如真实实例的宿主窗口，会把关闭误判成没关）。
+  $windowClosed = -not [MirrorE2E]::IsWindow($hwnd)
   $log = Read-TrayLog
   $trayExited = [bool]($log -match '托盘自动退出|托盘退出')
-  $windowClosed = ($h -eq [IntPtr]::Zero)
   if ($trayExited -and $windowClosed) { break }
   Start-Sleep -Milliseconds 500
 }
@@ -140,6 +179,12 @@ try {
   if ($cmdProc -and -not $cmdProc.HasExited) { Stop-Process -Id $cmdProc.Id -Force -ErrorAction SilentlyContinue }
 } catch { }
 try {
+  if ($restoreProc -and -not $restoreProc.HasExited) { Stop-Process -Id $restoreProc.Id -Force -ErrorAction SilentlyContinue }
+} catch { }
+try {
+  if ($restoredTrayPid -gt 0) { Stop-Process -Id $restoredTrayPid -Force -ErrorAction SilentlyContinue }
+} catch { }
+try {
   $pidFile = Join-Path $dir 'data\mirror.pid'
   if (Test-Path $pidFile) {
     $p = Get-Content $pidFile -Raw | ConvertFrom-Json
@@ -152,10 +197,15 @@ $result = [ordered]@{
   consoleHidden = $hidden
   consoleCanShow = $showOk
   trayLogHasHidden = [bool]($log1 -match '命令行窗口已隐藏=True')
+  trayKilled = $trayKilled
+  serviceSurvivedTrayKill = $serviceUpAfterTrayKilled
+  restoreLogged = $restored
+  adoptedConsole = $adoptedConsole
+  restoredTrayAlive = $restoredTrayAlive
   serviceDown = $serviceDown
   trayExited = $trayExited
   consoleWindowClosed = $windowClosed
-  pass = [bool]($up -and $hidden -and $showOk -and $trayExited -and $windowClosed -and $serviceDown)
+  pass = [bool]($up -and $hidden -and $showOk -and $trayKilled -and $serviceUpAfterTrayKilled -and $restored -and $adoptedConsole -and $restoredTrayAlive -and $trayExited -and $windowClosed -and $serviceDown)
 }
 "== RESULT: $($result | ConvertTo-Json -Compress)"
 "（隔离副本保留在 $dir，方便看 data\logs\tray.log；不需要时可直接删除）"

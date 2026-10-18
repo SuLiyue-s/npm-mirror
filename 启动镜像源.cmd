@@ -16,15 +16,36 @@ rem 启动前检查：服务已经在跑（且端口与本次启动端口一致�
 rem 否则会去抢同一个端口（必然失败），还会重复注册一个托盘图标。
 node "%~dp0cli.js" prestart %*
 set "PRESTART_CODE=%errorlevel%"
+rem 托盘宿主：等镜像源就绪后隐藏本窗口、注册托盘图标（没有 PowerShell 就退回普通窗口）
+rem 注意：这里不要传 -Root "%~dp0"——cmd 把结尾反斜杠原样交给 PowerShell 会把参数引号吃掉，
+rem       导致托盘拿错目录直接退出。tray.ps1 内部默认用自己所在目录的上一级作为项目根目录。
+set "MIRROR_TRAY_AVAILABLE=0"
+where powershell.exe >nul 2>nul
+if not errorlevel 1 if exist "%~dp0tools\tray.ps1" set "MIRROR_TRAY_AVAILABLE=1"
 if "%PRESTART_CODE%"=="10" (
-  rem 已经在本次端口上运行：prestart 已经（在允许时）打开了管理界面，这里直接结束
+  rem 已经在本次端口上运行：prestart 已经（在允许时）打开了管理界面。
+  rem 托盘图标可能被用户关掉了、或上次启动时没起来：这里补拉起一个托盘宿主。
+  rem tray.ps1 有单实例保护（MIRROR_TRAY_RESTORE=1 表示补注册），托盘其实还在时会立刻退出，不会出现两个图标。
+  rem 注意必须前台运行 powershell：让本窗口一直当托盘宿主，托盘就绪后自己把窗口隐藏。
+  rem 如果改成后台 start /b 再马上退出，本窗口一关，托盘进程会被系统一起结束——图标就又没了。
   if defined MIRROR_AUTOSTART (
     if not exist "%~dp0data\logs" mkdir "%~dp0data\logs"
-    echo [%date% %time%] 开机自启检测到镜像源已在运行，跳过本次启动>>"%~dp0data\logs\autostart.log"
+    echo [%date% %time%] 开机自启检测到镜像源已在运行，跳过本次启动；已顺带补拉起托盘>>"%~dp0data\logs\autostart.log"
   ) else (
     echo.
-    echo [已在运行] 镜像源服务已经在运行，本次没有重复启动。
-    timeout /t 2 >nul
+    echo [已在运行] 镜像源服务已经在运行，本次没有重复启动；托盘图标已检查（缺失会自动补上）。
+    if "%MIRROR_TRAY_AVAILABLE%"=="0" (
+      echo [提示] 没有找到 PowerShell 或 tools\tray.ps1，托盘图标不可用。
+      timeout /t 2 >nul
+    )
+  )
+  if "%MIRROR_TRAY_AVAILABLE%"=="1" (
+    set "MIRROR_TRAY_RESTORE=1"
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\tray.ps1"
+    if errorlevel 1 if not defined MIRROR_AUTOSTART (
+      echo [提示] 托盘启动失败，详见 data\logs\tray.log
+      pause
+    )
   )
   exit /b 0
 )
@@ -40,14 +61,11 @@ if "%PRESTART_CODE%"=="11" (
   )
   exit /b 1
 )
-rem 托盘宿主：等镜像源就绪后隐藏本窗口、注册托盘图标（没有 PowerShell 就退回普通窗口）
-rem 注意：这里不要传 -Root "%~dp0"——cmd 把结尾反斜杠原样交给 PowerShell 会把参数引号吃掉，
-rem       导致托盘拿错目录直接退出。tray.ps1 内部默认用自己所在目录的上一级作为项目根目录。
-where powershell.exe >nul 2>nul
-if errorlevel 1 (
-  echo [提示] 没有找到 PowerShell，托盘图标不可用，本窗口保持显示。
-) else (
+rem 托盘宿主（上面对 PowerShell / tray.ps1 的检测结果在 MIRROR_TRAY_AVAILABLE 里）
+if "%MIRROR_TRAY_AVAILABLE%"=="1" (
   start "" /b powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\tray.ps1"
+) else (
+  echo [提示] 没有找到 PowerShell 或 tools\tray.ps1，托盘图标不可用，本窗口保持显示。
 )
 if defined MIRROR_AUTOSTART (
   rem 开机自启是隐藏窗口：把服务输出写进日志，服务没起来时便于排查

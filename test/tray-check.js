@@ -27,7 +27,8 @@ const ROOT = path.join(__dirname, '..');
 const BASE = (() => {
   const i = process.argv.indexOf('--base');
   if (i > 0 && process.argv[i + 1]) return process.argv[i + 1].replace(/\/+$/, '');
-  return `http://127.0.0.1:${cfg.server.port}`;
+  // 管理页面和管理 API 在独立的 admin 监听上（默认 127.0.0.1:4874），与会话/图标检查一致
+  return `http://127.0.0.1:${(cfg.admin && cfg.admin.port) || cfg.server.port}`;
 })();
 
 let pass = 0; let fail = 0; let skipped = 0;
@@ -131,6 +132,25 @@ function readIco(buf) {
       /\$SW_RESTORE = 9/.test(tray) &&
       /if \(-not \[MirrorTrayNative\]::IsWindowVisible\(\$script:ConsoleHwnd\)\)/.test(tray) &&
       /ShowWindow\(\$script:ConsoleHwnd, \$SW_RESTORE\)/.test(tray));
+    check('单实例保护：多个托盘宿主同时启动时只注册一个图标（退出码 10 补拉托盘时不会出现两个图标）',
+      /PrivateNpmMirrorTrayHost/.test(tray) &&
+      /已有托盘宿主在运行，本次不再重复注册托盘图标（退出）/.test(tray) &&
+      /AbandonedMutexException/.test(tray));
+    check('补注册托盘（服务已在运行、图标被关掉/崩掉）时接管「原来那个被隐藏的」命令行窗口，而不是本次临时窗口',
+      /MIRROR_TRAY_RESTORE/.test(tray) &&
+      /FindHiddenConsoleByTitle/.test(tray) &&
+      /服务已在运行，接管原命令行窗口/.test(tray) &&
+      /服务已在运行，但没有找到原来的命令行窗口/.test(tray));
+    check('写 data\\logs\\tray.pid 便于定位托盘宿主（退出时只清自己写的那条记录）',
+      /tray\.pid/.test(tray) && /\[int\]\$jp\.pid -eq \$PID/.test(tray));
+    check('退出镜像源：接口停不掉时按 data\\mirror.pid 兜底强制结束进程，再关窗口退托盘',
+      /服务进程仍在运行（PID \{0\}），强制结束/.test(tray) &&
+      /Stop-Process -Id \$targetPid -Force/.test(tray) &&
+      /function Test-ProcessAlive/.test(tray));
+    check('健康检查连续失败时重读配置再确认（管理界面端口在配置里改过后不会一直按旧端口误判）',
+      /连续失败：可能是管理界面端口刚在配置里改过/.test(tray));
+    check('托盘图标注册成功后写日志（用户反馈「图标不见了」时 data\\logs\\tray.log 有据可查）',
+      /托盘图标已注册/.test(tray));
   }
 
   // ---------- 二、项目图标 ----------
@@ -185,8 +205,17 @@ function readIco(buf) {
       /data\\logs\\autostart\.log/.test(cmdSrc));
     check('启动脚本先跑 cli.js prestart 做启动前检查（服务已在运行就不再抢同一个端口）',
       /cli\.js" prestart/.test(cmdSrc) && /PRESTART_CODE/.test(cmdSrc));
-    check('启动脚本：已在同端口运行（退出码 10）直接结束——不启动第二份、不注册第二个托盘',
+    check('启动脚本：已在同端口运行（退出码 10）时补拉起托盘恢复图标，不再启动第二份服务',
       /"%PRESTART_CODE%"=="10"/.test(cmdSrc) && /本次没有重复启动/.test(cmdSrc) && /exit \/b 0/.test(cmdSrc));
+    // 只取退出码 10 那个分支的正文（外层右括号顶格，嵌套块的右括号都带缩进）
+    const branch10 = ((cmdSrc.match(/if "%PRESTART_CODE%"=="10" \(([\s\S]*?)\r?\n\)/) || [])[1] || '');
+    check('启动脚本：退出码 10 分支里补拉托盘，且用前台 powershell——后台启动后窗口一关会连托盘进程一起结束',
+      /MIRROR_TRAY_RESTORE=1/.test(branch10) &&
+      /powershell\.exe -NoProfile/.test(branch10) &&
+      !/start "" \/b powershell\.exe/.test(branch10));
+    check('启动脚本：托盘可用性检测统一提到退出码分支之前（正常启动与补注册共用 MIRROR_TRAY_AVAILABLE）',
+      /set "MIRROR_TRAY_AVAILABLE=0"/.test(cmdSrc) &&
+      /if not errorlevel 1 if exist "%~dp0tools\\tray\.ps1" set "MIRROR_TRAY_AVAILABLE=1"/.test(cmdSrc));
     check('启动脚本：已在其它端口运行（退出码 11）提示先停止，不强行启动第二份',
       /"%PRESTART_CODE%"=="11"/.test(cmdSrc) && /已经在其它端口运行/.test(cmdSrc) && /exit \/b 1/.test(cmdSrc));
     check('开机自启模式下检测到已在运行只写 data\\logs\\autostart.log（隐藏窗口不弹窗、不 pause）',

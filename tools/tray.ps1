@@ -60,6 +60,10 @@ function Write-TrayLog([string]$Text) {
   } catch { /* 日志写不进去不影响主流程 */ }
 }
 
+# 启动脚本在「服务已经在运行」时补拉起托盘（恢复被关掉/崩掉的图标），此时会设置 MIRROR_TRAY_RESTORE=1。
+# 用它区分「补注册」和「正常启动」：正常启动时服务是随后才起来的，不能只看 data\mirror.pid 判断。
+$script:RestoreMode = ($env:MIRROR_TRAY_RESTORE -eq '1')
+
 # ---------- Win32 ----------
 if (-not ('MirrorTrayNative' -as [type])) {
   Add-Type -TypeDefinition @'
@@ -80,6 +84,25 @@ public static class MirrorTrayNative {
   [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
   [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
   [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern uint GetConsoleTitle(StringBuilder lpConsoleTitle, uint nSize);
+  // 按窗口标题找「另一个已被隐藏的」经典控制台窗口（类名 ConsoleWindowClass）：
+  // 场景：服务还在运行、托盘图标却被关掉/崩掉，用户再双击 启动镜像源.cmd 补注册托盘。
+  // 原来那个跑着服务的命令行窗口是隐藏的，而本次双击出来的临时窗口是可见的（标题相同），
+  // 所以这里只认「不可见」的那个，避免接管到马上就会关闭的临时窗口。
+  public static IntPtr FindHiddenConsoleByTitle(string title, IntPtr exclude) {
+    IntPtr firstMatch = IntPtr.Zero;
+    EnumWindows(delegate(IntPtr h, IntPtr l) {
+      if (h == exclude) return true;
+      if (IsWindowVisible(h)) return true;
+      var cls = new StringBuilder(256);
+      GetClassName(h, cls, 256);
+      if (cls.ToString() != "ConsoleWindowClass") return true;
+      var sb = new StringBuilder(1024);
+      GetWindowText(h, sb, 1024);
+      if (sb.ToString() == title) { firstMatch = h; return false; }
+      return true;
+    }, IntPtr.Zero);
+    return firstMatch;
+  }
 
   // 按窗口标题找顶层窗口：优先返回可见的，找不到再退回任意匹配。
   // （实测 FindWindow(null, 标题) 在提权控制台窗口上返回 0，所以用 EnumWindows 自己找。）
@@ -139,6 +162,9 @@ $script:Cfg = Read-MirrorConfig
 $script:Port = $script:Cfg.port
 $script:AdminPort = $script:Cfg.adminPort
 $script:Token = $script:Cfg.token
+# 启动脚本给命令行窗口设置的标题（必须与 启动镜像源.cmd 的 title 一致）：
+# 补注册托盘时靠它找到「原来那个跑着服务、现在被隐藏的」命令行窗口。
+$script:ConsoleTitle = '私人 npm 镜像源 - 运行中'
 
 # 管理界面地址（管理页面 + /__admin/api/*）
 function Get-ServiceUrl([string]$Path) {
@@ -179,12 +205,16 @@ function Get-MirrorPid {
   return 0
 }
 
+# 指定 PID 的进程是否还活着
+function Test-ProcessAlive([int]$ProcessId) {
+  if ($ProcessId -le 0) { return $false }
+  try { $null = Get-Process -Id $ProcessId -ErrorAction Stop; return $true } catch { return $false }
+}
+
 # 服务进程是否真的还活着：健康检查失败时用它做二次确认，
 # 只要进程还活着就绝不能关控制台窗口（关窗口 = 直接杀进程，就是「点关闭后服务被结束」的根因）。
 function Test-MirrorProcessAlive {
-  $p = Get-MirrorPid
-  if (-not $p) { return $false }
-  try { return [bool](Get-Process -Id $p -ErrorAction Stop) } catch { return $false }
+  return (Test-ProcessAlive (Get-MirrorPid))
 }
 
 # ---------- 命令行窗口 ----------
@@ -416,6 +446,40 @@ if ($SelfTest) {
   exit 0
 }
 
+# ---------- 单实例保护：同一份程序同时只允许一个托盘宿主，保证右下角永远只有一个项目图标 ----------
+# 启动脚本在「服务已经在运行」时也会补拉起托盘（用来恢复被关掉/崩掉的图标）；
+# 如果托盘其实还在，这里直接退出即可（本次启动的只是一个临时控制台，脚本结束它会自己关掉）。
+# 互斥体名字带上项目根目录的哈希：同一份程序重复启动只会有一个图标，
+# 而测试用的隔离副本（复制到别的目录、用不同端口）和真实实例互不影响。
+$script:TrayMutex = $null
+$script:TrayMutexOwned = $false
+try {
+  $sha1 = [System.Security.Cryptography.SHA1]::Create()
+  try {
+    $rootHash = [System.BitConverter]::ToString($sha1.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Root.ToLowerInvariant()))).Replace('-', '').Substring(0, 12)
+  } finally { $sha1.Dispose() }
+  $script:TrayMutexName = 'Local\PrivateNpmMirrorTrayHost-' + $rootHash
+  $script:TrayMutex = [System.Threading.Mutex]::new($false, $script:TrayMutexName)
+  try { $script:TrayMutexOwned = $script:TrayMutex.WaitOne(0) }
+  catch [System.Threading.AbandonedMutexException] { $script:TrayMutexOwned = $true }
+} catch {
+  # 单实例只是防重复注册图标，不是托盘的必需能力：拿不到互斥体时退回无保护运行
+  Write-TrayLog ('单实例互斥体不可用（{0}），继续按无保护方式运行' -f $_.Exception.Message)
+  $script:TrayMutexOwned = $true
+}
+if (-not $script:TrayMutexOwned) {
+  Write-TrayLog '已有托盘宿主在运行，本次不再重复注册托盘图标（退出）'
+  exit 0
+}
+
+# 记录自己的 PID：方便排查/测试定位托盘宿主（被强杀时文件会残留，下次启动覆盖）
+try {
+  $logDir = Join-Path $Root 'data\logs'
+  if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
+  $pidJson = ('{{"pid":{0},"startedAt":"{1}"}}' -f $PID, (Get-Date).ToString('o'))
+  [System.IO.File]::WriteAllText((Join-Path $logDir 'tray.pid'), $pidJson, (New-Object System.Text.UTF8Encoding($false)))
+} catch { Write-TrayLog ('写入 data\logs\tray.pid 失败：{0}' -f $_.Exception.Message) }
+
 # ---------- 等管理界面就绪（就绪前保持命令行窗口可见，启动失败的报错不会被吞掉） ----------
 Write-TrayLog ('托盘宿主启动：root={0} registryPort={1} adminPort={2} wait={3}s' -f $Root, $script:Port, $script:AdminPort, $WaitSeconds)
 $deadline = (Get-Date).AddSeconds([Math]::Max(5, $WaitSeconds))
@@ -429,11 +493,30 @@ if (-not $ready) {
   exit 1
 }
 
-$script:ConsoleHwnd = Resolve-HostWindow
-if ($script:ConsoleHwnd -ne [IntPtr]::Zero) {
-  Write-TrayLog ('命令行窗口：hwnd={0} class={1}' -f $script:ConsoleHwnd.ToInt64(), (Get-WindowClass $script:ConsoleHwnd))
-} else {
-  Write-TrayLog '没找到命令行窗口（无法隐藏/显示，托盘图标仍可用）'
+# ---------- 命令行窗口：正常启动用本窗口；服务已在运行时接管它原来那个已被隐藏的窗口 ----------
+# 场景：服务还在跑（比如托盘图标被关掉/崩掉、或「停止镜像源.cmd」只停了托盘），用户再双击 启动镜像源.cmd：
+# 启动脚本在 prestart=10 分支会补拉起托盘（前台运行，这个 cmd 窗口先当宿主，托盘就绪后把它隐藏）。
+# 这里按标题找到原来那个「跑着服务、已被隐藏」的命令行窗口接管，「打开控制台」打开的才是真正跑服务的窗口。
+$script:ConsoleHwnd = [IntPtr]::Zero
+$script:AdoptedConsole = $false
+if ($script:RestoreMode) {
+  # exclude 本进程自己的控制台（本次双击出来的临时窗口），只接管「另一个被隐藏的」控制台
+  $adoptHwnd = [MirrorTrayNative]::FindHiddenConsoleByTitle($script:ConsoleTitle, [MirrorTrayNative]::GetConsoleWindow())
+  if ($adoptHwnd -ne [IntPtr]::Zero) {
+    $script:ConsoleHwnd = $adoptHwnd
+    $script:AdoptedConsole = $true
+    Write-TrayLog ('服务已在运行，接管原命令行窗口：hwnd={0}（本次只补注册托盘，不重复启动服务）' -f $adoptHwnd.ToInt64())
+  } else {
+    Write-TrayLog '服务已在运行，但没有找到原来的命令行窗口（可能已被关闭或运行在 Windows Terminal 里）'
+  }
+}
+if ($script:ConsoleHwnd -eq [IntPtr]::Zero) {
+  $script:ConsoleHwnd = Resolve-HostWindow
+  if ($script:ConsoleHwnd -ne [IntPtr]::Zero) {
+    Write-TrayLog ('命令行窗口：hwnd={0} class={1}' -f $script:ConsoleHwnd.ToInt64(), (Get-WindowClass $script:ConsoleHwnd))
+  } else {
+    Write-TrayLog '没找到命令行窗口（无法隐藏/显示，托盘图标仍可用）'
+  }
 }
 $script:Closing = $false
 $script:HealthFail = 0
@@ -457,34 +540,54 @@ function Stop-Tray([bool]$CloseConsole) {
     try { [void][MirrorTrayNative]::PostMessage($script:ConsoleHwnd, $WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero) } catch { /* 忽略 */ }
   }
   try { $script:Context.ExitThread() } catch { /* 忽略 */ }
+  # 清掉自己的 tray.pid（只删自己写的那个，避免误删新托盘的记录）
+  try {
+    $pidFile = Join-Path $Root 'data\logs\tray.pid'
+    if (Test-Path $pidFile) {
+      $jp = Get-Content $pidFile -Raw | ConvertFrom-Json
+      if ([int]$jp.pid -eq $PID) { Remove-Item $pidFile -Force -ErrorAction SilentlyContinue }
+    }
+  } catch { /* 忽略 */ }
   [System.Environment]::Exit(0)
 }
 
-# ---------- 退出镜像源：先优雅停服务（管理接口 → 整个程序退出），再关窗口、退托盘 ----------
+# ---------- 退出镜像源：停服务（管理接口 + 进程兜底）→ 关窗口、退托盘 ----------
 function Stop-MirrorAndExit {
   if ($script:Closing) { return }
   Write-TrayLog '用户选择「退出镜像源」：请求停止整个程序（镜像源服务 + 管理界面）'
+  # 端口/令牌可能刚在管理界面改过：先重读一次配置，避免还按旧端口/旧令牌去调停止接口
+  try {
+    $cfg = Read-MirrorConfig
+    $script:Cfg = $cfg
+    $script:Port = $cfg.port
+    $script:AdminPort = $cfg.adminPort
+    $script:Token = $cfg.token
+  } catch { Write-TrayLog ('重新读取配置失败，沿用启动时配置：{0}' -f $_.Exception.Message) }
+  $targetPid = Get-MirrorPid
   try {
     if (Test-Service) {
       $headers = @{ 'X-Mirror-Token' = $script:Token }
       Invoke-WebRequest -UseBasicParsing -Method Post -Uri (Get-ServiceUrl '/__admin/api/service/shutdown') -Headers $headers -TimeoutSec 8 | Out-Null
+      Write-TrayLog '已请求服务优雅退出（/__admin/api/service/shutdown）'
+    } else {
+      Write-TrayLog '管理接口当前不可达，改为按 data\mirror.pid 结束进程'
     }
   } catch { Write-TrayLog ('停止接口调用失败：{0}' -f $_.Exception.Message) }
-  # 最多等 10 秒让服务自己退干净
+  # 以「进程是否真的退出」为准：接口可能先回 200 而进程还在收尾；
+  # 旧版只等管理接口不可用就关窗口，遇到「接口停不掉」时会留下一个没人管的 node 进程。
+  if ($targetPid -le 0) { $targetPid = Get-MirrorPid }
   for ($i = 0; $i -lt 40; $i++) {
-    if (-not (Test-Service)) { break }
+    if ($targetPid -gt 0) { if (-not (Test-ProcessAlive $targetPid)) { break } }
+    elseif (-not (Test-Service)) { break }
     Start-Sleep -Milliseconds 250
   }
-  if (Test-Service) {
-    # 接口停不掉时按 pid 文件兜底
+  if ($targetPid -gt 0 -and (Test-ProcessAlive $targetPid)) {
+    Write-TrayLog ('服务进程仍在运行（PID {0}），强制结束' -f $targetPid)
     try {
-      $pidFile = Join-Path $Root 'data\mirror.pid'
-      if (Test-Path $pidFile) {
-        $p = Get-Content $pidFile -Raw -Encoding UTF8 | ConvertFrom-Json
-        if ($p -and $p.pid) { Stop-Process -Id ([int]$p.pid) -Force -ErrorAction SilentlyContinue }
-      }
-    } catch { /* 忽略 */ }
-    Start-Sleep -Milliseconds 500
+      Stop-Process -Id $targetPid -Force -ErrorAction Stop
+      Write-TrayLog ('已强制结束服务进程 PID {0}' -f $targetPid)
+    } catch { Write-TrayLog ('强制结束服务进程失败：{0}' -f $_.Exception.Message) }
+    Start-Sleep -Milliseconds 300
   }
   Stop-Tray -CloseConsole $true
 }
@@ -501,6 +604,7 @@ $notify.Icon = $script:Icon
 $notify.Text = ('私人 npm 镜像源 · 运行中（{0}）' -f (Get-ServiceUrl '/'))
 $notify.Visible = $true
 $script:Notify = $notify
+Write-TrayLog ('托盘图标已注册：{0}（左键打开管理界面，右键选择操作）' -f $iconPath)
 
 # 顺便把命令行窗口的标题栏/任务栏图标也换成项目图标（不换 Windows Terminal 的标签页图标）
 try {
@@ -560,6 +664,20 @@ $timer.add_Tick({
   }
   $script:HealthFail++
   if ($script:HealthFail -ge 5) {
+    # 连续失败：可能是管理界面端口刚在配置里改过（例如先改 admin.port、再点「重启管理界面」），
+    # 重读一次配置换成新端口再确认，避免一直按旧端口探活而误判成「服务已停止」。
+    try {
+      $cfg = Read-MirrorConfig
+      $script:Cfg = $cfg
+      $script:Port = $cfg.port
+      $script:AdminPort = $cfg.adminPort
+      $script:Token = $cfg.token
+    } catch { /* 配置读不了就按旧值继续 */ }
+    if (Test-Service) {
+      $script:HealthFail = 0
+      if (-not $script:Closing -and $script:Notify) { $script:Notify.Text = ('私人 npm 镜像源 · 运行中（{0}）' -f (Get-ServiceUrl '/')) }
+      return
+    }
     if (Test-MirrorProcessAlive) {
       Write-TrayLog ('服务响应超时，但进程仍在运行（PID {0}），继续等待，不关闭窗口' -f (Get-MirrorPid))
       $script:HealthFail = 0
@@ -575,10 +693,20 @@ $timer.Start()
 
 # ---------- 隐藏命令行窗口，进入托盘常驻 ----------
 $hidden = Set-ConsoleVisible $false
-Write-TrayLog ('服务已就绪，命令行窗口已隐藏={0}' -f $hidden)
-if (-not $hidden) {
-  # 隐藏失败（极少见：例如宿主是 Windows Terminal）时不至于让用户没法操作
-  Write-TrayLog '未能隐藏命令行窗口：托盘仍可用，右键菜单会显示「隐藏控制台」'
+if ($script:AdoptedConsole) {
+  # 补注册托盘时，本次双击出来的临时窗口只用来当宿主，不能留在桌面上；
+  # 真正由托盘管理的是被接管的那个原来的隐藏窗口。
+  $ownHwnd = [MirrorTrayNative]::GetConsoleWindow()
+  if ($ownHwnd -ne [IntPtr]::Zero -and $ownHwnd -ne $script:ConsoleHwnd) {
+    try { [void][MirrorTrayNative]::ShowWindow($ownHwnd, $SW_HIDE) } catch { /* 忽略 */ }
+  }
+  Write-TrayLog ('服务已就绪，已接管原有命令行窗口（原窗口隐藏={0}），本次启动的临时窗口已隐藏' -f $hidden)
+} else {
+  Write-TrayLog ('服务已就绪，命令行窗口已隐藏={0}' -f $hidden)
+  if (-not $hidden) {
+    # 隐藏失败（极少见：例如宿主是 Windows Terminal）时不至于让用户没法操作
+    Write-TrayLog '未能隐藏命令行窗口：托盘仍可用，右键菜单会显示「隐藏控制台」'
+  }
 }
 
 [System.Windows.Forms.Application]::Run($script:Context)
