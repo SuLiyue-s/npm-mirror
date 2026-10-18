@@ -26,7 +26,7 @@
     </span>
   </div>
   <div class="topbar-chips">
-    <span class="chip chip-conn is-cy" id="chip-conn" data-tip="与镜像源服务的连接状态（每 4 秒探测一次；断线恢复后自动刷新界面）"><span class="lamp lamp-cy" id="chip-conn-lamp"></span><span id="chip-conn-text">已连接</span></span>
+    <span class="chip chip-conn is-cy" id="chip-conn" data-tip="与镜像源服务的连接状态（每 1 秒探测一次，点「重启服务」后会临时加密；断线恢复后自动刷新界面）"><span class="lamp lamp-cy" id="chip-conn-lamp"></span><span id="chip-conn-text">已连接</span></span>
     <span class="chip" id="chip-mode" data-tip="运行模式"><span class="lamp lamp-idle"></span><b>—</b></span>
     <span class="chip" id="chip-uptime" data-tip="服务运行时长">运行 —</span>
     <span class="chip" id="chip-version" data-tip="服务端版本">v—</span>
@@ -279,11 +279,17 @@
           <div class="form-row" id="exp-added-row" hidden>
             <label>添加时间</label>
             <div class="row-inline">
+              <select id="exp-added-by" class="mini-sel" data-tip="按包：包第一次进本地镜像的时间；按版本：每个版本的 tarball 写入本地的时间（旧包只更新版本时只导出这些新版本）">
+                <option value="package">按包添加时间（整包）</option>
+                <option value="version">按版本添加时间（只导出新版本）</option>
+              </select>
+            </div>
+            <div class="row-inline">
               <input id="exp-added-from" class="dt-input is-empty" type="text" readonly placeholder="yyyy-mm-dd hh:mm" autocomplete="off" aria-label="起始添加时间" aria-haspopup="dialog" data-tip="点击选择起始添加时间（本机时区）" />
               <span class="muted">至</span>
               <input id="exp-added-to" class="dt-input is-empty" type="text" readonly placeholder="yyyy-mm-dd hh:mm" autocomplete="off" aria-label="结束添加时间" aria-haspopup="dialog" data-tip="点击选择结束添加时间（本机时区）" />
             </div>
-            <div class="muted">只导出「首次添加进本地镜像」的时间落在这段时间内的包（含起止，按本机时区）；留空一端表示不限。</div>
+            <div class="muted" id="exp-added-hint">只导出「首次添加进本地镜像」的时间落在这段时间内的包（含起止，按本机时区）；留空一端表示不限。</div>
           </div>
           <div class="form-row">
             <label for="exp-name">自定义文件名</label>

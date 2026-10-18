@@ -1300,7 +1300,17 @@ async function handleAdmin(ctx) {
         return fail(res, 400, e.message, e.code || 'EBADTIME');
       }
     }
-    const addedRangeOpts = addedRange ? { addedFrom: addedRange.from, addedTo: addedRange.to } : {};
+    /* 「按添加时间」的时间口径：package=按包首次入库时间（默认，命中整包）；
+     * version=按每个版本 tarball 写入本地的时间，旧包里只有新版本落在区间内时只导出这些版本。 */
+    let addedBy = null;
+    if (scope === 'added') {
+      try {
+        addedBy = ctx.bundle.normalizeAddedBy(body.addedBy);
+      } catch (e) {
+        return fail(res, 400, e.message, e.code || 'EBADMODE');
+      }
+    }
+    const addedRangeOpts = addedRange ? { addedFrom: addedRange.from, addedTo: addedRange.to, addedBy } : {};
     // 指定导出选中的包时，默认把它们的（递归）依赖也一起导出；显式传 withDeps:false 可关闭
     const withDeps = scope === 'selected' && (body.withDeps === undefined ? true : !!body.withDeps);
     // 镜像里没有的依赖：默认在 cache/proxy 模式下自动下载并入库（离线模式只会提示）；显式 autoFetchDeps:false 可关闭
@@ -1451,8 +1461,8 @@ async function handleAdmin(ctx) {
       });
       return ok(res, r);
     } catch (e) {
-      // 400：范围/版本参数用法错误；409：没有可导出内容、或点名的版本本地没有且补不到
-      const status = (e.code === 'EBADSCOPE' || e.code === 'EBADVERSION') ? 400
+      // 400：范围/版本/时间口径参数用法错误；409：没有可导出内容、或点名的版本本地没有且补不到
+      const status = (e.code === 'EBADSCOPE' || e.code === 'EBADVERSION' || e.code === 'EBADMODE') ? 400
         : (e.code === 'EMPTY' || e.code === 'EVERSIONMISSING') ? 409 : 500;
       return fail(res, status, e.message, e.code || 'EEXPORT');
     }

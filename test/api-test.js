@@ -2526,6 +2526,95 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
     }
   }
 
+  // D) 按版本添加时间导出（scope=added, addedBy=version）
+  {
+    const bundleModBy = require('../src/bundle');
+    const { Store: StoreBy } = require('../src/store');
+    const quietLogBy = { info() {}, warn() {}, error() {}, debug() {} };
+    const workBy = fs.mkdtempSync(path.join(os.tmpdir(), 'mirror-added-by-version-'));
+    const exportedBy = [];
+    try {
+      const stBy = new StoreBy({ dir: path.join(workBy, 'storage'), logger: quietLogBy });
+      await stBy.init();
+      const NAME_BY = 'mirror-selftest-added-version';
+      const mkVerTarball = async (version) => {
+        const srcDir = path.join(workBy, 'src', NAME_BY, version, 'package');
+        util.ensureDir(srcDir);
+        fs.writeFileSync(path.join(srcDir, 'package.json'), JSON.stringify({ name: NAME_BY, version }));
+        const tgz = path.join(workBy, NAME_BY + '-' + version + '.tgz');
+        await tar.packTarGz(tgz, [{ name: 'package/package.json', source: path.join(srcDir, 'package.json') }], { gzip: true });
+        return stBy.putTarball(NAME_BY, version, fs.readFileSync(tgz));
+      };
+      const putOld = await mkVerTarball('1.0.0');
+      const putNew = await mkVerTarball('2.0.0');
+      stBy.save(NAME_BY, {
+        name: NAME_BY,
+        'dist-tags': { latest: '2.0.0' },
+        versions: {
+          '1.0.0': { name: NAME_BY, version: '1.0.0', dist: { tarball: BASE + '/' + NAME_BY + '/-/' + putOld.file, integrity: putOld.integrity, shasum: putOld.shasum } },
+          '2.0.0': { name: NAME_BY, version: '2.0.0', dist: { tarball: BASE + '/' + NAME_BY + '/-/' + putNew.file, integrity: putNew.integrity, shasum: putNew.shasum } },
+        },
+      }, {
+        source: 'private', createdAt: '2026-09-01T00:00:00.000Z',
+        files: { '1.0.0': putOld.file, '2.0.0': putNew.file },
+        sizes: { '1.0.0': putOld.sizeBytes, '2.0.0': putNew.sizeBytes },
+      });
+      // 版本入库时间用 tarball 文件的 mtime 表示：旧版本 2026-03，新版本 2026-09-15
+      fs.utimesSync(stBy.tarballPath(NAME_BY, '1.0.0'), new Date('2026-03-01T00:00:00.000Z'), new Date('2026-03-01T00:00:00.000Z'));
+      fs.utimesSync(stBy.tarballPath(NAME_BY, '2.0.0'), new Date('2026-09-15T00:00:00.000Z'), new Date('2026-09-15T00:00:00.000Z'));
+
+      const rVer = await bundleModBy.exportBundle({
+        store: stBy, scope: 'added', addedBy: 'version',
+        addedFrom: '2026-08-01T00:00:00.000Z', addedTo: '2026-10-01T00:00:00.000Z',
+        autoFetchDeps: false, logger: quietLogBy,
+      });
+      exportedBy.push(rVer.file);
+      const manVer = await bundleModBy.readBundleManifest(rVer.path);
+      const manPkgVer = (manVer.packages || [])[0] || {};
+      check('「按版本添加时间」导出：旧包只导出区间内新增的版本（版本时间取自 tarball 文件 mtime）',
+        rVer.packages === 1 && rVer.versions === 1 && rVer.tarballs === 1
+        && rVer.versionFiltered === true && rVer.addedBy === 'version'
+        && manVer.addedTimeRange && manVer.addedTimeRange.by === 'version'
+        && (manPkgVer.versions || []).length === 1 && manPkgVer.versions[0].version === '2.0.0',
+        'packages=' + rVer.packages + ' versions=' + rVer.versions + ' tarballs=' + rVer.tarballs + ' by=' + (manVer.addedTimeRange || {}).by);
+
+      const dirBy = util.safePkgDir(NAME_BY);
+      const packedDoc = JSON.parse((await tar.readTarEntry(rVer.path, 'storage/' + dirBy + '/packument.json')).toString('utf8'));
+      const packedMeta = JSON.parse((await tar.readTarEntry(rVer.path, 'storage/' + dirBy + '/meta.json')).toString('utf8'));
+      const vfBy = manVer.versionFilter || {};
+      check('按版本导出的 bundle 已裁剪：packument/meta 只含该版本、dist-tags.latest 不悬空、manifest.versionFilter 记录版本',
+        Object.keys(packedDoc.versions || {}).length === 1 && !!packedDoc.versions['2.0.0']
+        && packedDoc['dist-tags'].latest === '2.0.0'
+        && JSON.stringify(Object.keys(packedMeta.files || {})) === JSON.stringify(['2.0.0'])
+        && JSON.stringify(vfBy[NAME_BY] || []) === JSON.stringify(['2.0.0']),
+        'versions=' + JSON.stringify(Object.keys(packedDoc.versions || {})) + ' latest=' + (packedDoc['dist-tags'] || {}).latest + ' files=' + JSON.stringify(Object.keys(packedMeta.files || {})));
+
+      const rPkgMode = await bundleModBy.exportBundle({
+        store: stBy, scope: 'added', addedBy: 'package',
+        addedFrom: '2026-08-01T00:00:00.000Z', addedTo: '2026-10-01T00:00:00.000Z',
+        autoFetchDeps: false, logger: quietLogBy,
+      });
+      exportedBy.push(rPkgMode.file);
+      check('「按包添加时间」口径下同一区间仍导出整包（两个版本全带），两种口径可切换',
+        rPkgMode.packages === 1 && rPkgMode.versions === 2 && rPkgMode.tarballs === 2
+        && rPkgMode.versionFiltered === false && rPkgMode.addedBy === 'package',
+        'packages=' + rPkgMode.packages + ' versions=' + rPkgMode.versions + ' tarballs=' + rPkgMode.tarballs);
+
+      const badBy = await api('/__admin/api/bundles/export', {
+        method: 'POST', body: { scope: 'added', addedFrom: '2026-01-01T00:00:00.000Z', addedBy: 'nope' }, timeoutMs: 15000,
+      });
+      check('POST /bundles/export {scope:added, addedBy:非法值} → 400 EBADMODE',
+        badBy.status === 400 && badBy.json && badBy.json.code === 'EBADMODE',
+        'status=' + badBy.status + ' ' + String(badBy.text || '').slice(0, 140));
+      await stBy.close();
+    } finally {
+      for (const f of exportedBy) {
+        try { fs.unlinkSync(path.join(util.rootPath('data', 'bundles'), f)); } catch { /* 忽略 */ }
+      }
+      try { fs.rmSync(workBy, { recursive: true, force: true }); } catch { /* 忽略 */ }
+    }
+  }
+
   section('六之四之五、只导出指定版本（含依赖按所选版本解析）');
   {
     const bundleModVer = require('../src/bundle');

@@ -28,7 +28,7 @@ const C = {
 // 避免 `import --overwrite pkg.tgz` 这类写法把后面的位置参数误吞成开关的值。
 const VALUE_FLAGS = new Set([
   'ip', 'port', 'mode', 'registry', 'q', 'source', 'sort', 'size', 'scope', 'out',
-  'cache', 'depth', 'limit', 'version', 'lines', 'level',
+  'cache', 'depth', 'limit', 'version', 'lines', 'level', 'added-by', 'from', 'to',
 ]);
 const raw = process.argv.slice(2);
 let command = 'start';
@@ -157,8 +157,10 @@ commands.help = function () {
     '                                递归添加：连它的依赖、依赖的依赖一起加进来（npm: 别名会解析到真实包）',
     '  node cli.js remove <包名> [--version 1.2.3] [--yes]   删除包或单个版本',
     '  node cli.js stats             统计包/版本/占用空间',
-    '  node cli.js export [--scope all|private|upstream|selected|added] [--from 时间] [--to 时间] [--out 文件名] [--no-deps] [--no-fetch-deps] [包名[@版本]...]',
+    '  node cli.js export [--scope all|private|upstream|selected|added] [--from 时间] [--to 时间] [--added-by package|version] [--out 文件名] [--no-deps] [--no-fetch-deps] [包名[@版本]...]',
     '                                导出选中包时默认连带递归依赖；镜像里没有的依赖在 cache/proxy 模式下自动下载入库再打包',
+    '    --added-by package|version   按添加时间导出时的口径：package=按包首次入库时间（默认，整包）；',
+    '                                version=按每个版本 tarball 写入本地的时间，旧包里只导出这段时间内新增的版本',
     '    --versions "vue@3.4.1,react@18.2.0"（或重复写 --version 包名@版本）只导出点名的版本；连带依赖时按这些版本的 dependencies 声明解析出确定版本，导出体积更小',
     '  node cli.js import <文件.tgz|文件.json> [--overwrite]',
     '  node cli.js scan-cache [--cache 目录] [--any-registry] [--refresh]',
@@ -601,6 +603,14 @@ commands.export = async function () {
   const autoFetchDeps = !flags['no-fetch-deps'];
   const addedFrom = scope === 'added' ? flags.from : undefined;
   const addedTo = scope === 'added' ? flags.to : undefined;
+  /* 「按添加时间」的时间口径：package 按包首次入库（默认）；version 按每个版本 tarball 写入本地的时间 */
+  const addedBy = scope === 'added' ? (flags['added-by'] || 'package') : undefined;
+  if (scope === 'added' && addedBy !== 'package' && addedBy !== 'version') {
+    log(`${C.red}--added-by 只能是 package 或 version${C.reset}`);
+    store.close();
+    process.exitCode = 1;
+    return;
+  }
   /* 「只导出指定版本」：支持 --version 包名@版本（可重复）、--versions "a@1,b@2" 与位置参数 包名@精确版本。
    * 范围为 ^ / ~ 之类的范围写法会先按本地元数据挑一个满足范围的版本，再作为确定版本导出。 */
   const pinnedList = [];
@@ -654,7 +664,7 @@ commands.export = async function () {
   const t0 = Date.now();
   try {
     if (withDeps) log(`${C.dim}导出选中包时会连带依赖；镜像里没有的依赖会在联网模式下自动下载（--no-deps / --no-fetch-deps 可关闭）。${C.reset}`);
-    if (scope === 'added') log(`${C.dim}只导出添加时间在 ${addedFrom || '(不限)'} ~ ${addedTo || '(不限)'} 之间的包（本地镜像首次入库时间，闭区间）。${C.reset}`);
+    if (scope === 'added') log(`${C.dim}只导出添加时间在 ${addedFrom || '(不限)'} ~ ${addedTo || '(不限)'} 之间的${addedBy === 'version' ? '版本（按版本 tarball 写入本地的时间；旧包只带新增版本）' : '包（按包首次入库时间）'}，闭区间。${C.reset}`);
     const r = await bundle.exportBundle({
       store,
       ctx,
@@ -667,6 +677,7 @@ commands.export = async function () {
       logger: lg,
       addedFrom,
       addedTo,
+      addedBy,
       concurrency: Math.max(1, Number(config.get().storage.bundleExportConcurrency) || 4),
       // 导出前的收集/统计阶段并发读盘
       localScanConcurrency: Math.max(1, Number(config.get().storage.localScanConcurrency) || 8),

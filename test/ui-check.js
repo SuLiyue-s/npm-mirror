@@ -825,7 +825,7 @@ async function get(p, { json = false } = {}) {
     check('后端支持 scope=added：按 meta.createdAt 闭区间筛选、manifest 记录 addedTimeRange，参数非法返回 400',
       /else if \(scope === 'added'\) \{/.test(bundleAdd)
         && /pkgAddedInRange\(store\.index\.get\(n\), addedRange\.from, addedRange\.to\)/.test(bundleAdd)
-        && /addedTimeRange: addedRange \? \{ from: addedRange\.fromIso, to: addedRange\.toIso \} : null/.test(bundleAdd)
+        && /addedTimeRange: addedRange \? \{ from: addedRange\.fromIso, to: addedRange\.toIso, by: addedBy \} : null/.test(bundleAdd)
         && /ALLOWED_SCOPE = \['all', 'private', 'upstream', 'selected', 'added'\]/.test(apiAdd)
         && /ctx\.bundle\.normalizeAddedRange\(\{ addedFrom: body\.addedFrom, addedTo: body\.addedTo \}\)/.test(apiAdd)
         && /fail\(res, 400, e\.message, e\.code \|\| 'EBADTIME'\)/.test(apiAdd));
@@ -1234,7 +1234,8 @@ async function get(p, { json = false } = {}) {
       /id="chip-conn"/.test(htmlConn)
         && /id="chip-conn-text">已连接</.test(htmlConn)
         && /chip-conn is-cy/.test(htmlConn)
-        && /id="chip-conn-lamp"/.test(htmlConn),
+        && /id="chip-conn-lamp"/.test(htmlConn)
+        && /每 1 秒探测一次/.test(htmlConn),
       '要能一眼看出当前是否还连着镜像源服务');
 
     check('断线样式：红底红灯 + 轻微呼吸，与项目配色一致',
@@ -1243,13 +1244,22 @@ async function get(p, { json = false } = {}) {
         && /@keyframes conn-blink/.test(cssConn),
       '用现有 --cy/--red 变量，不引入新配色');
 
-    check('每 4 秒探测一次 /-/ping（AbortController 3 秒超时，页面隐藏时跳过，不干扰前台操作）',
+    check('默认每 1 秒探测一次 /-/ping（AbortController 2 秒超时，页面隐藏时跳过，不干扰前台操作）',
       /fetch\(\'\/-\/ping\'/.test(jsConn)
         && /new AbortController\(\)/.test(jsConn)
-        && /if \(ctrl\) ctrl\.abort\(\); \}, 3000\)/.test(jsConn)
-        && /setInterval\(connTick, 4000\)/.test(jsConn)
-        && /if \(document\.hidden\) return;/.test(jsConn),
+        && /if \(ctrl\) ctrl\.abort\(\); \}, 2000\)/.test(jsConn)
+        && /var CONN_POLL_MS = 1000;/.test(jsConn)
+        && /setTimeout\(connTick, connDelay\(\)\)/.test(jsConn)
+        && /if \(document\.hidden\) \{ scheduleConnTick\(\); return; \}/.test(jsConn),
       '探测用只读 /-/ping，不能带令牌、不能写配置');
+
+    check('点「重启服务」后切到 250ms 快探测 20~30 秒：服务重启的短暂不可用窗口也能被捕捉到并及时刷新页面',
+      /function connBoost\(ms\)/.test(jsConn)
+        && /var CONN_FAST_MS = 250;/.test(jsConn)
+        && /var CONN_FAST_WINDOW_MS = 20000;/.test(jsConn)
+        && /connBoost\(30000\)/.test(jsConn)
+        && /if \(connProbing\) \{ scheduleConnTick\(\); return; \}/.test(jsConn),
+      '之前 4 秒一次，服务几秒就重启完了，页面根本看不到断开状态');
 
     check('断线时顶栏变红 + toast 提示，并持续自动重试、记录重试次数',
       /setConnState\(false, connFails\)/.test(jsConn)
@@ -1294,6 +1304,45 @@ async function get(p, { json = false } = {}) {
         && (jsUp.match(/所选版本没有运行时依赖，只打包了选中的包/g) || []).length >= 2
         && /payload\.withDeps !== false && r\.withDeps && !r\.depsAdded/.test(jsUp),
       '避免用户误以为依赖导出坏了（如 playwright-core 这类零依赖包）');
+  }
+
+  console.log('\x1b[1m九之十四、导出「按添加时间」支持按包 / 按版本两种口径（新）\x1b[0m');
+  {
+    const htmlBy = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
+    const jsBy = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
+    const bundleBy = fs.readFileSync(path.join(__dirname, '..', 'src', 'bundle.js'), 'utf8');
+    const apiBy = fs.readFileSync(path.join(__dirname, '..', 'src', 'api.js'), 'utf8');
+    const cliBy = fs.readFileSync(path.join(__dirname, '..', 'cli.js'), 'utf8');
+
+    check('迁移备份-「按添加时间」增加口径下拉：按包添加时间（整包）/ 按版本添加时间（只导出新版本）',
+      /id="exp-added-by"/.test(htmlBy)
+        && /<option value="package">按包添加时间（整包）<\/option>/.test(htmlBy)
+        && /<option value="version">按版本添加时间（只导出新版本）<\/option>/.test(htmlBy)
+        && /id="exp-added-hint"/.test(htmlBy),
+      '旧包只更新了版本时，不必把全部版本重新导出再导入');
+
+    check('前端把口径带进导出请求，并随口径更新说明文案与结果文案',
+      /payload\.addedBy = bySel && bySel\.value === 'version' \? 'version' : 'package';/.test(jsBy)
+        && /只导出「每个版本的 tarball 写入本地镜像」的时间落在这段时间内的版本/.test(jsBy)
+        && /按版本，旧包只含新增版本/.test(jsBy),
+      '用户要能明确知道这次导出的时间口径');
+
+    check('后端：版本口径用本地 tarball 文件 mtime 作为版本入库时间，区间内版本生成白名单并写入 manifest.addedTimeRange.by',
+      /function normalizeAddedBy\(addedBy\)/.test(bundleBy)
+        && /async function versionAddedInRange\(store, name, version, from, to\)/.test(bundleBy)
+        && /await fsp\.stat\(abs\)/.test(bundleBy)
+        && /async function collectAddedVersionPins\(store,/.test(bundleBy)
+        && /addedBy: addedRange \? addedBy : null,/.test(bundleBy)
+        && /addedTimeRange: addedRange \? \{ from: addedRange\.fromIso, to: addedRange\.toIso, by: addedBy \}/.test(bundleBy),
+      '版本时间用文件写入时间近似，不需要改数据格式/迁移');
+
+    check('接口层校验 addedBy（只允许 package/version，非法 400 EBADMODE）；CLI 支持 --added-by',
+      /normalizeAddedBy\(body\.addedBy\)/.test(apiBy)
+        && /e\.code === 'EBADMODE'/.test(apiBy)
+        && /'added-by'/.test(cliBy)
+        && /--added-by package\|version/.test(cliBy)
+        && /addedBy,\n\s+concurrency: Math\.max/.test(cliBy),
+      '配置文件/脚本两处入口语义一致');
   }
 
   console.log('\x1b[1m十之五、概览页「上游与来源分布」条形图渲染\x1b[0m');

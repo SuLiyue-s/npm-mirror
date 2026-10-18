@@ -4059,7 +4059,7 @@
           return;
         }
         var msg = '已导出 ' + r.file + '：' + fmtNum(r.packages) + ' 包 / ' + fmtNum(r.versions) + ' 版本 / ' + fmtNum(r.tarballs) + ' tarball / ' + fmtBytes(r.sizeBytes);
-        if (payload.scope === 'added') msg = '已按添加时间导出（' + (payload.addedFrom ? '从 ' + dtShort(payload.addedFrom) : '起始不限') + ' 到 ' + (payload.addedTo ? dtShort(payload.addedTo) : '现在') + '）：' + fmtNum(r.packages) + ' 包 / ' + fmtNum(r.versions) + ' 版本 / ' + fmtNum(r.tarballs) + ' tarball / ' + fmtBytes(r.sizeBytes);
+        if (payload.scope === 'added') msg = '已按添加时间导出（' + (payload.addedBy === 'version' ? '按版本，旧包只含新增版本' : '按包') + '；' + (payload.addedFrom ? '从 ' + dtShort(payload.addedFrom) : '起始不限') + ' 到 ' + (payload.addedTo ? dtShort(payload.addedTo) : '现在') + '）：' + fmtNum(r.packages) + ' 包 / ' + fmtNum(r.versions) + ' 版本 / ' + fmtNum(r.tarballs) + ' tarball / ' + fmtBytes(r.sizeBytes);
         if (r.versionFiltered && r.versionFilter) msg += '（只导出指定版本：' + fmtNum(Object.keys(r.versionFilter).length) + ' 个包）';
         if (r.depsAdded) msg += '（其中连带依赖 ' + fmtNum(r.depsAdded) + ' 个' + (r.depsFetched ? '，自动下载 ' + fmtNum(r.depsFetched) + ' 个' : '') + '）';
         if (payload.withDeps !== false && r.withDeps && !r.depsAdded && !(r.missingDeps && r.missingDeps.length)) {
@@ -4707,10 +4707,12 @@
       if (!ok) return;
       setText('svc-status', isStop ? '正在停止…' : '正在重启…');
       api('/service/' + (isStop ? 'shutdown' : 'restart'), { method: 'POST', timeout: 20000 }).then(function () {
+        /* 重启期间服务会短暂不可用：立刻进入快探测窗口，才能看到「断开 → 恢复」并自动刷新页面 */
+        if (!isStop) connBoost(30000);
         watchService(isStop);
       }, function (e) {
         /* 重启时连接被切断是正常现象 */
-        if (!isStop && (e.code === 'NETWORK' || e.code === 'TIMEOUT')) watchService(false);
+        if (!isStop && (e.code === 'NETWORK' || e.code === 'TIMEOUT')) { connBoost(30000); watchService(false); }
         else { setText('svc-status', '操作失败：' + e.message); handleErr(e); }
       });
     });
@@ -4870,6 +4872,19 @@
       if (arow) arow.hidden = state.mig.scope !== 'added';
       paintSelbar();
     });
+    /* 「按添加时间」的时间口径：package=按包首次入库；version=按每个版本 tarball 写入本地的时间 */
+    var addedBySel = $('#exp-added-by');
+    if (addedBySel) {
+      var syncAddedHint = function () {
+        var hint = $('#exp-added-hint');
+        if (!hint) return;
+        hint.textContent = addedBySel.value === 'version'
+          ? '只导出「每个版本的 tarball 写入本地镜像」的时间落在这段时间内的版本（含起止，按本机时区）；旧包里没更新的版本不会重复导出，导入后只补这些新版本。时间以本地文件写入时间为准。'
+          : '只导出「首次添加进本地镜像」的时间落在这段时间内的包（含起止，按本机时区）；留空一端表示不限。';
+      };
+      addedBySel.addEventListener('change', syncAddedHint);
+      syncAddedHint();
+    }
     on('exp-ver-template', 'click', function () { fillExportVersionTemplate(this); });
     on('exp-ver-clear', 'click', function () { var ta = $('#exp-versions'); if (ta) ta.value = ''; });
     /* 「按添加时间」的两个时间框：换成项目风格的自绘日期时间弹层
@@ -4912,13 +4927,16 @@
         if (fms !== null && tms !== null && fms > tms) { toast('起始时间不能晚于结束时间', 'warn'); return; }
         payload.addedFrom = fms !== null ? new Date(fms).toISOString() : null;
         payload.addedTo = tms !== null ? new Date(tms).toISOString() : null;
+        var bySel = $('#exp-added-by');
+        payload.addedBy = bySel && bySel.value === 'version' ? 'version' : 'package';
         var fShow = (fromEl && fromEl.value || '').trim();
         var tShow = (toEl && toEl.value || '').trim();
-        addedLabel = (fShow || '不限') + ' ~ ' + (tShow || '不限');
+        addedLabel = (fShow || '不限') + ' ~ ' + (tShow || '不限')
+          + (payload.addedBy === 'version' ? '（按版本添加时间）' : '（按包添加时间）');
       }
       var btn = $('#exp-run');
       var vn = payload.versions ? Object.keys(payload.versions).length : 0;
-      if (addedLabel) setText('exp-status', '正在挑选添加时间在 ' + addedLabel + ' 之间的包并打包，包较多时可能耗时较久…');
+      if (addedLabel) setText('exp-status', '正在挑选添加时间在 ' + addedLabel + ' 内的' + (payload.addedBy === 'version' ? '版本' : '包') + '并打包，包较多时可能耗时较久…');
       else if (vn) setText('exp-status', '正在按指定版本打包（' + vn + ' 个包' + (payload.withDeps ? ' + 按这些版本解析出的依赖' : '') + '），包较多时可能耗时较久…');
       else setText('exp-status', payload.withDeps ? '正在打包（含递归依赖），包较多时可能耗时较久…' : '正在打包，包较多时可能耗时较久…');
       runBundleExport(payload, btn);
@@ -5055,12 +5073,20 @@
 
   /* ============================================================
    * 与镜像源服务的连接状态
-   * 每 4 秒用 /-/ping 探测一次：断线时顶栏变红并自动重试（带重试次数提示），
+   * 默认每 1 秒用 /-/ping 探测一次：断线时顶栏变红并自动重试（带重试次数提示），
    * 恢复后 toast 提醒并刷新一次界面，让顶栏、列表、统计都回到最新状态。
+   * 点「重启服务」后切到 250ms 快探测 30 秒：服务重启只需要一两秒，
+   * 之前 4 秒一次的间隔很可能整段跳过「不可用窗口」，页面就永远看不到断开状态。
    * 服务重启、电脑休眠唤醒、网络恢复都能自动接上。
    * ============================================================ */
   var connDown = false;
   var connFails = 0;
+  var connTimer = null;
+  var connProbing = false;
+  var connFastUntil = 0;
+  var CONN_POLL_MS = 1000;          // 常规探测间隔
+  var CONN_FAST_MS = 250;           // 重启/唤醒等关键时刻的快探测间隔
+  var CONN_FAST_WINDOW_MS = 20000;  // 快探测持续时间
 
   function setConnState(ok, fails) {
     var chip = $('#chip-conn');
@@ -5072,13 +5098,13 @@
     var txt = $('#chip-conn-text');
     if (txt) txt.textContent = ok ? '已连接' : '连接断开';
     setTip(chip, ok
-      ? '与镜像源服务连接正常（每 4 秒探测一次）'
-      : '与镜像源服务的连接已断开，正在自动重试（已重试 ' + fails + ' 次）；恢复连接后会自动刷新界面');
+      ? '与镜像源服务连接正常（每 1 秒探测一次）'
+      : '与镜像源服务的连接已断开，正在自动重试（每 1 秒一次，已重试 ' + fails + ' 次）；恢复连接后会自动刷新界面');
   }
 
   function pingOnce() {
     var ctrl = (typeof AbortController === 'function') ? new AbortController() : null;
-    var timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, 3000);
+    var timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, 2000);
     var opts = { cache: 'no-store' };
     if (ctrl) opts.signal = ctrl.signal;
     return fetch('/-/ping', opts).then(function (r) {
@@ -5088,8 +5114,20 @@
     }, function (e) { clearTimeout(timer); throw e; });
   }
 
+  function connDelay() {
+    if (connDown) return CONN_POLL_MS;
+    return Date.now() < connFastUntil ? CONN_FAST_MS : CONN_POLL_MS;
+  }
+
+  function scheduleConnTick() {
+    if (connTimer) clearTimeout(connTimer);
+    connTimer = setTimeout(connTick, connDelay());
+  }
+
   function connTick() {
-    if (document.hidden) return;
+    if (document.hidden) { scheduleConnTick(); return; }
+    if (connProbing) { scheduleConnTick(); return; }
+    connProbing = true;
     pingOnce().then(function () {
       var wasDown = connDown;
       connDown = false;
@@ -5106,16 +5144,30 @@
       connDown = true;
       setConnState(false, connFails);
       if (firstDown) toast('与镜像源服务的连接已断开，正在自动重试；恢复连接后会自动刷新界面', 'err', 8000);
+    }).then(function () {
+      connProbing = false;
+      scheduleConnTick();
+    }, function () {
+      connProbing = false;
+      scheduleConnTick();
     });
+  }
+
+  /* 进入「关键时刻」：改用 250ms 快探测一段时间（点重启/停止、窗口重新可见、网络恢复时），
+   * 这样能捕捉到服务短暂不可用的窗口，恢复后自动刷新页面。 */
+  function connBoost(ms) {
+    connFastUntil = Date.now() + (ms || CONN_FAST_WINDOW_MS);
+    if (connTimer) clearTimeout(connTimer);
+    connTick();
   }
 
   function startConnWatch() {
     setConnState(true, 0);
     connTick();
-    setInterval(connTick, 4000);
-    /* 休眠唤醒 / 网络恢复时不等下一个探测周期 */
-    window.addEventListener('online', function () { if (connDown) connTick(); });
-    document.addEventListener('visibilitychange', function () { if (!document.hidden) connTick(); });
+    /* 休眠唤醒 / 网络恢复 / 窗口重新聚焦时不等下一个探测周期 */
+    window.addEventListener('online', function () { connBoost(5000); });
+    document.addEventListener('visibilitychange', function () { if (!document.hidden) connBoost(3000); });
+    window.addEventListener('focus', function () { if (connDown) connBoost(3000); });
   }
 
   function init() {

@@ -80,6 +80,71 @@ function pkgAddedInRange(meta, from, to) {
   return true;
 }
 
+/**
+ * 「按添加时间」导出的时间口径：
+ * - package：按包首次进本地镜像的时间（meta.createdAt），命中就导出整包；
+ * - version：按每个版本的 tarball 写入本地镜像的时间（文件 mtime），旧包里只有新版本落在区间内时
+ *   只导出这些版本，避免把老版本全部重新导一遍。
+ */
+function normalizeAddedBy(addedBy) {
+  if (addedBy === undefined || addedBy === null || addedBy === '') return 'package';
+  const v = String(addedBy);
+  if (v === 'package' || v === 'version') return v;
+  const err = new Error('「添加时间口径」只能是 package（按包）或 version（按版本）');
+  err.code = 'EBADMODE';
+  err.status = 400;
+  throw err;
+}
+
+/**
+ * 版本是否落在添加时间区间内（闭区间）。
+ * 本镜像没有单独记录每个版本的入库时间，用该版本 tarball 文件的写入时间（mtime）作为
+ * 「这个版本添加进本地镜像」的近似时间：tarball 就是那个时刻下载/导入写进磁盘的，语义一致且无需改数据格式。
+ */
+async function versionAddedInRange(store, name, version, from, to) {
+  const abs = store.tarballPath(name, version);
+  if (!abs) return false;
+  let st = null;
+  try { st = await fsp.stat(abs); } catch { return false; }
+  if (!st.isFile()) return false;
+  const t = st.mtimeMs;
+  if (from !== null && t < from) return false;
+  if (to !== null && t > to) return false;
+  return true;
+}
+
+/**
+ * 按「版本添加时间」挑出区间内的版本：Map<包名, Set<版本>>。
+ * 只枚举 meta.files 里已缓存的版本（逐个 fsp.stat 看 mtime）——大镜像要扫几万个文件，
+ * 走 localScanConcurrency 并发 + 每 100 个包发一次进度，避免统计阶段像卡死。
+ */
+async function collectAddedVersionPins(store, { from, to, concurrency = 8, isCanceled, onProgress } = {}) {
+  const conc = Math.max(1, Math.min(64, Math.floor(Number(concurrency)) || 8));
+  const names = Array.from(store.index.keys());
+  const total = names.length;
+  let scanned = 0;
+  const rows = await mapLimit(names, conc, async (name) => {
+    if (isCanceled && isCanceled()) return null;
+    const meta = store.index.get(name);
+    const files = (meta && meta.files) || {};
+    const kept = [];
+    for (const v of Object.keys(files)) {
+      if (await versionAddedInRange(store, name, v, from, to)) kept.push(v);
+    }
+    scanned++;
+    if (onProgress && (scanned % 100 === 0 || scanned === total)) {
+      try { onProgress(scanned, total); } catch { /* 进度回调只是旁路信息 */ }
+    }
+    return kept.length ? [name, new Set(kept.sort(compareVersions))] : null;
+  });
+  const pins = new Map();
+  for (const row of rows) {
+    if (!row || row.__error || !Array.isArray(row)) continue;
+    pins.set(row[0], row[1]);
+  }
+  return pins;
+}
+
 
 function bundleDir() { return rootPath('data', 'bundles'); }
 function tmpRoot() { return rootPath('data', 'tmp'); }
@@ -626,6 +691,9 @@ async function autoFillDeps({ ctx, store, roots, logger, emit = () => {}, isCanc
  * @param {string} [o.scope='all'] 'all' | 'private' | 'upstream' | 'selected' | 'added'
  * @param {string|number} [o.addedFrom] scope='added' 的起始时间（ISO 字符串或毫秒，闭区间）
  * @param {string|number} [o.addedTo] scope='added' 的结束时间（ISO 字符串或毫秒，闭区间）
+ * @param {string} [o.addedBy='package'] scope='added' 的时间口径：
+ *   'package' 按包首次入库时间（meta.createdAt，命中整包导出）；
+ *   'version' 按每个版本 tarball 写入本地的时间（文件 mtime，旧包只导出区间内的新版本）
  * @param {function} [o.onProgress] 进度回调：
  *   { phase:'collect-start', total }                      开始统计要导出的包
  *   { phase:'deps-fetch', status, total, done, message }   正在自动补齐缺失依赖（status=resolve/download/skipped）
@@ -643,7 +711,7 @@ async function exportBundle({
   store, ctx = null, scope = 'all', names = [], fileName, withDeps = false,
   autoFetchDeps = true, autoDeps = null, logger, onProgress, isCanceled, concurrency = 1,
   localScanConcurrency = 8, onlyVersions = null,
-  addedFrom = null, addedTo = null,
+  addedFrom = null, addedTo = null, addedBy = 'package',
 }) {
   const emit = (ev) => {
     if (!onProgress) return;
@@ -660,15 +728,38 @@ async function exportBundle({
   const localScanConc = Math.max(1, Math.min(64, Math.floor(Number(localScanConcurrency)) || 8));
   const all = Array.from(store.index.keys());
   let addedRange = null;
+  /* 按「版本添加时间」导出时内部生成的版本白名单（来源是本地 tarball 文件 mtime） */
+  let addedVersionPins = null;
+  /* 版本口径要先把全量包的版本文件扫一遍，collect-start 提前发过就不再重复发 */
+  let collectStarted = false;
   let targets = all;
   if (scope === 'private') targets = all.filter(n => { const m = store.index.get(n); return m.source === 'private' || m.private; });
   else if (scope === 'upstream') targets = all.filter(n => { const m = store.index.get(n); return m.source !== 'private' && !m.private; });
   else if (scope === 'selected') targets = names.filter(n => store.index.has(n));
   else if (scope === 'added') {
-    /* 「按添加时间」导出：只挑首次进本地镜像的时间（meta.createdAt）落在区间内的包。
-     * 时间边界按闭区间处理；起始/结束可以只给一个。 */
+    /* 「按添加时间」导出：时间边界按闭区间处理，起始/结束可以只给一个。
+     * 口径由 addedBy 决定：package=按包首次入库时间（meta.createdAt）；
+     * version=按每个版本 tarball 写入本地的时间（文件 mtime），只导出区间内的版本。 */
+    addedBy = normalizeAddedBy(addedBy);
     addedRange = normalizeAddedRange({ addedFrom, addedTo });
-    targets = all.filter(n => pkgAddedInRange(store.index.get(n), addedRange.from, addedRange.to));
+    if (addedBy === 'version') {
+      /* 扫全量包的版本文件 mtime 可能比较久：先把 collect-start 发出去，界面能立刻看到进度而不是像卡死 */
+      emit({ phase: 'collect-start', total: all.length, message: '正在按「版本添加时间」扫描本地已缓存的版本…' });
+      collectStarted = true;
+      addedVersionPins = await collectAddedVersionPins(store, {
+        from: addedRange.from, to: addedRange.to, concurrency: localScanConc, isCanceled,
+        onProgress: (scanned, totalN) => emit({ phase: 'collect', packages: scanned, total: totalN }),
+      });
+      if (!addedVersionPins.size) {
+        const err = new Error('所选时间段内没有新添加的包版本（按本机时区、含起止；版本时间以本地 tarball 文件写入时间为准；可放宽范围或留空一端再试）');
+        err.code = 'EMPTY';
+        err.status = 409;
+        throw err;
+      }
+      targets = Array.from(addedVersionPins.keys());
+    } else {
+      targets = all.filter(n => pkgAddedInRange(store.index.get(n), addedRange.from, addedRange.to));
+    }
   }
   targets = Array.from(new Set(targets)).sort();
 
@@ -697,6 +788,9 @@ async function exportBundle({
       throw err;
     }
   }
+  /* 按版本添加时间导出：内部生成的版本白名单直接当作 versionFilter，
+   * 后面的「只遍历点名版本 + 裁剪 packument/meta」逻辑全部复用。 */
+  if (addedVersionPins) versionFilter = addedVersionPins;
   if (withDeps && scope === 'selected' && roots.length) {
     const closureOpts = { concurrency: localScanConc, isCanceled };
     if (versionFilter) closureOpts.versions = versionFilter;
@@ -757,7 +851,7 @@ async function exportBundle({
     throw err;
   }
 
-  emit({ phase: 'collect-start', total: targets.length });
+  if (!collectStarted) emit({ phase: 'collect-start', total: targets.length });
   /* 先把每个包的条目收进各自的列表，最后再「跨包轮流交织」展开成 entries。
    * 原因：并行打包是共享一个条目游标领取任务，如果同一包的条目连在一起，几路压缩会同时落在
    * 同一个包上，进度弹窗右栏就只剩 1~2 个包（用户反馈收尾只剩 1 个）。交织后并发的几路分属
@@ -891,7 +985,7 @@ async function exportBundle({
     scope,
     withDeps: !!withDeps,
     roots,
-    addedTimeRange: addedRange ? { from: addedRange.fromIso, to: addedRange.toIso } : null,
+    addedTimeRange: addedRange ? { from: addedRange.fromIso, to: addedRange.toIso, by: addedBy } : null,
     versionFilter: versionFilterSummary,
     stats: { packages: manifestPackages.length, versions, tarballs, tarballBytes: bytes, depsAdded, depsFetched: autoFetch ? autoFetch.downloaded.length : 0, depsMissing: missingDeps.length },
     // 自动补依赖的结果摘要（失败明细放顶层，限制条数，避免 manifest 过大）
@@ -1009,6 +1103,7 @@ async function exportBundle({
     versions,
     tarballs,
     scope,
+    addedBy: addedRange ? addedBy : null,
     withDeps: !!withDeps,
     roots: roots.length,
     depsAdded,
@@ -1615,5 +1710,6 @@ module.exports = {
   importPackumentJson, readBundleManifest, listBundles, safeFileName,
   depTargetName, collectDepClosure, collectDepClosureForVersions, autoFillDeps, AUTO_DEPS, DEPS_MAX_PACKAGES,
   parseVersionSpecLine, normalizeVersionFilter,
-  parseTimeBound, normalizeAddedRange, pkgAddedInRange,
+  parseTimeBound, normalizeAddedRange, normalizeAddedBy, pkgAddedInRange,
+  versionAddedInRange, collectAddedVersionPins,
 };
