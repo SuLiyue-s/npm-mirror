@@ -4346,14 +4346,15 @@
     return String(text || '').split(/\r?\n/).map(function (s) { return s.trim(); }).filter(function (s) { return s.length > 0; });
   }
 
-  function mkTextarea(opts) {
-    var ta = el('textarea', { class: 'mono', 'data-cfg': opts.key, rows: opts.rows || '3', placeholder: opts.placeholder || '' });
+  /* 把 textarea 包进 .ta-wrap 并在右下角放项目风格的自绘拖拽角标（隐藏浏览器原生 resize 把手）。
+   * 返回 wrap 容器；mkTextarea（配置页动态创建）与 enhanceTextarea（页面静态 textarea）共用同一套拖动逻辑。 */
+  function attachTaGrip(ta) {
     var grip = el('span', { class: 'ta-grip', title: '拖动调整高度' });
-    var wrap = el('div', { class: 'ta-wrap' }, [ta, grip]);
-    ta.addEventListener('blur', function () {
-      var norm = normalizeLineList(ta.value).join('\n');
-      if (norm !== ta.value) ta.value = norm;
-    });
+    var wrap = el('div', { class: 'ta-wrap' }, []);
+    var parent = ta.parentNode;
+    if (parent) parent.insertBefore(wrap, ta);
+    wrap.appendChild(ta);
+    wrap.appendChild(grip);
     var drag = null;
     grip.addEventListener('pointerdown', function (e) {
       e.preventDefault();
@@ -4372,6 +4373,25 @@
     };
     grip.addEventListener('pointerup', endDrag);
     grip.addEventListener('pointercancel', endDrag);
+    return wrap;
+  }
+
+  /* 把页面上已有的静态 textarea 换成本项目自绘角标（幂等：已经包过就直接返回）。
+   * 之前只有配置页「加速镜像源」这种动态创建的 textarea 走了 mkTextarea，
+   * 迁移页「指定版本」是静态 HTML，一直露着浏览器原生 resize 角标。 */
+  function enhanceTextarea(ta) {
+    if (!ta) return null;
+    if (ta.parentNode && ta.parentNode.classList && ta.parentNode.classList.contains('ta-wrap')) return ta.parentNode;
+    return attachTaGrip(ta);
+  }
+
+  function mkTextarea(opts) {
+    var ta = el('textarea', { class: 'mono', 'data-cfg': opts.key, rows: opts.rows || '3', placeholder: opts.placeholder || '' });
+    ta.addEventListener('blur', function () {
+      var norm = normalizeLineList(ta.value).join('\n');
+      if (norm !== ta.value) ta.value = norm;
+    });
+    var wrap = attachTaGrip(ta);
     return { wrap: wrap, textarea: ta };
   }
 
@@ -4885,6 +4905,9 @@
       addedBySel.addEventListener('change', syncAddedHint);
       syncAddedHint();
     }
+    /* 迁移页「指定版本」多行框：静态 HTML 里的 textarea 也换成本项目自绘的拖拽角标
+     *（配置页的动态 textarea 走 mkTextarea，这里补上静态输入框，避免又露出浏览器原生把手） */
+    enhanceTextarea($('#exp-versions'));
     on('exp-ver-template', 'click', function () { fillExportVersionTemplate(this); });
     on('exp-ver-clear', 'click', function () { var ta = $('#exp-versions'); if (ta) ta.value = ''; });
     /* 「按添加时间」的两个时间框：换成项目风格的自绘日期时间弹层

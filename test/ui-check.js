@@ -1345,6 +1345,37 @@ async function get(p, { json = false } = {}) {
       '配置文件/脚本两处入口语义一致');
   }
 
+  console.log('\x1b[1m九之十五、导出面板表单布局与自绘拖拽角标（新）\x1b[0m');
+  {
+    const htmlExp = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
+    const jsExp = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
+    const cssExp = fs.readFileSync(path.join(__dirname, '..', 'public', 'style.css'), 'utf8');
+
+    check('「指定版本」静态多行框复用项目自绘拖拽角标（不再露出浏览器原生 resize 把手）',
+      /function attachTaGrip\(ta\)/.test(jsExp)
+        && /function enhanceTextarea\(ta\)/.test(jsExp)
+        && /if \(ta\.parentNode && ta\.parentNode\.classList && ta\.parentNode\.classList\.contains\('ta-wrap'\)\) return ta\.parentNode;/.test(jsExp)
+        && /enhanceTextarea\(\$\('#exp-versions'\)\);/.test(jsExp)
+        && /\.ta-wrap textarea\{display:block;width:100%;resize:none;/.test(cssExp),
+      '静态 textarea 之前没走 mkTextarea，一直显示浏览器原生角标；现在与配置页一致');
+
+    check('导出面板改两列网格：指定版本多行框、自定义文件名输入框都铺满右列（不再窄窄一条）',
+      /<div class="panel exp-panel">[\s\S]{0,120}?<h3 class="panel-title">导出备份/.test(htmlExp)
+        && /\.exp-panel \.form-row\{[\s\S]{0,220}?grid-template-columns:104px minmax\(0,1fr\)/.test(cssExp)
+        && /\.exp-panel \.form-row>\*\{grid-column:2;justify-self:stretch;min-width:0\}/.test(cssExp)
+        && /id="exp-versions"/.test(htmlExp)
+        && /id="exp-name"/.test(htmlExp),
+      'textarea 默认宽度只有 20 来个字符，表单右列铺满后宽度才正常');
+
+    check('「添加时间」行与上方口径下拉右边缘对齐，两个时间框等宽',
+      /\.exp-panel #exp-added-row \.row-inline\{display:grid;grid-template-columns:minmax\(0,1fr\) auto minmax\(0,1fr\)/.test(cssExp)
+        && /\.exp-panel #exp-added-from,\.exp-panel #exp-added-to\{max-width:none\}/.test(cssExp)
+        && /id="exp-added-by"/.test(htmlExp)
+        && /id="exp-added-from"/.test(htmlExp)
+        && /id="exp-added-to"/.test(htmlExp),
+      '原来两个时间框各限宽 250px，右侧边与上方下拉对不齐、两框宽度也可能不同');
+  }
+
   console.log('\x1b[1m十之五、概览页「上游与来源分布」条形图渲染\x1b[0m');
   {
     const jsBars = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');

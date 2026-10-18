@@ -507,6 +507,25 @@ textarea{resize:vertical;min-height:66px;line-height:1.6}
 }
 .ta-grip:hover,.ta-grip.is-drag{color:var(--cy);opacity:1}
 
+/* 迁移页「导出备份」表单：两列网格（标签 | 控件），右列统一铺满。
+   这样「指定版本」多行框、自定义文件名输入框、添加时间下拉与两个时间框的右边缘互相对齐；
+   添加时间行改三列网格（时间框 | 至 | 时间框），两个时间框等宽。 */
+.exp-panel .form-row{
+  display:grid;grid-template-columns:104px minmax(0,1fr);gap:6px 12px;
+  align-items:center;margin-bottom:10px;
+}
+.exp-panel .form-row>*{grid-column:2;justify-self:stretch;min-width:0}
+.exp-panel .form-row>label:first-child{grid-column:1;justify-self:start;font-size:11.5px;color:var(--txt-dim)}
+.exp-panel .form-row>.segbar{justify-self:start}
+.exp-panel .form-row>.checkline,.exp-panel .form-row>.muted{justify-self:start}
+.exp-panel .form-row>.row-inline{width:100%}
+/* 单行文本框在网格里显式铺满（input 的 width:auto 是浏览器默认尺寸，不会被 stretch 拉满） */
+.exp-panel .form-row>input[type=text],.exp-panel .form-row>textarea{width:100%}
+.exp-panel #exp-added-row .row-inline>input{width:100%}
+.exp-panel #exp-added-row .row-inline{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);align-items:center;gap:8px;flex-wrap:nowrap}
+.exp-panel #exp-added-row .row-inline>.csel,.exp-panel #exp-added-row .row-inline>select{width:100%}
+.exp-panel #exp-added-from,.exp-panel #exp-added-to{max-width:none}
+
 /* 加速镜像源「测试连通性」：按钮 + 汇总 + 逐源结果（可用/不可用、耗时、失败原因） */
 .acc-test{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:6px}
 .acc-test .acc-sum{font-family:var(--mono);font-size:10.5px;color:var(--txt-dim)}
