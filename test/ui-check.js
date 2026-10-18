@@ -1224,6 +1224,47 @@ async function get(p, { json = false } = {}) {
       '离线机器上也能直接导出精确版本');
   }
 
+  console.log('\x1b[1m九之十二、顶栏「与镜像源连接状态」+ 断线恢复自动刷新（新）\x1b[0m');
+  {
+    const htmlConn = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
+    const jsConn = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
+    const cssConn = fs.readFileSync(path.join(__dirname, '..', 'public', 'style.css'), 'utf8');
+
+    check('顶栏有连接状态 chip（默认已连接：青灯 + 「已连接」文案，可悬停看说明）',
+      /id="chip-conn"/.test(htmlConn)
+        && /id="chip-conn-text">已连接</.test(htmlConn)
+        && /chip-conn is-cy/.test(htmlConn)
+        && /id="chip-conn-lamp"/.test(htmlConn),
+      '要能一眼看出当前是否还连着镜像源服务');
+
+    check('断线样式：红底红灯 + 轻微呼吸，与项目配色一致',
+      /\.chip-conn\{min-width:96px\}/.test(cssConn)
+        && /\.chip-conn\.is-red\{animation:conn-blink/.test(cssConn)
+        && /@keyframes conn-blink/.test(cssConn),
+      '用现有 --cy/--red 变量，不引入新配色');
+
+    check('每 4 秒探测一次 /-/ping（AbortController 3 秒超时，页面隐藏时跳过，不干扰前台操作）',
+      /fetch\(\'\/-\/ping\'/.test(jsConn)
+        && /new AbortController\(\)/.test(jsConn)
+        && /if \(ctrl\) ctrl\.abort\(\); \}, 3000\)/.test(jsConn)
+        && /setInterval\(connTick, 4000\)/.test(jsConn)
+        && /if \(document\.hidden\) return;/.test(jsConn),
+      '探测用只读 /-/ping，不能带令牌、不能写配置');
+
+    check('断线时顶栏变红 + toast 提示，并持续自动重试、记录重试次数',
+      /setConnState\(false, connFails\)/.test(jsConn)
+        && /与镜像源服务的连接已断开，正在自动重试/.test(jsConn)
+        && /已重试 ' \+ fails \+ ' 次/.test(jsConn),
+      '断线不能静默，用户要能立刻看到');
+
+    check('连接恢复后自动刷新管理界面（toast + location.reload），开机即启动监听',
+      /已重新连接到镜像源服务，正在刷新界面/.test(jsConn)
+        && /location\.reload\(\)/.test(jsConn)
+        && /startConnWatch\(\);/.test(jsConn)
+        && /setConnState\(true, 0\)/.test(jsConn),
+      '恢复后把页面刷新到最新状态');
+  }
+
   console.log('\x1b[1m十之五、概览页「上游与来源分布」条形图渲染\x1b[0m');
   {
     const jsBars = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');

@@ -2688,6 +2688,91 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
       try { fs.rmSync(workVer, { recursive: true, force: true }); } catch { /* 忽略 */ }
     }
 
+    // B2) 回归：依赖闭包按版本解析出的依赖版本 tarball 未缓存时，不能被静默漏导。
+    //     现象：只导出指定版本 + withDeps 时，依赖版本被算进 versionFilter（元数据有版本）却没有 tarball，
+    //     导入端会跳过它 —— 用户看到的症状是「只导出了选中的包，依赖包的版本没导出」。
+    const workVer2 = fs.mkdtempSync(path.join(os.tmpdir(), 'mirror-version-depcheck-'));
+    const exportedVer2 = [];
+    try {
+      const stV2 = new StoreVer({ dir: path.join(workVer2, 'storage'), logger: quietLogVer });
+      await stV2.init();
+      const mkPutV2 = async (name, version, depsMap) => {
+        const srcDir = path.join(workVer2, 'src', name, version, 'package');
+        util.ensureDir(srcDir);
+        fs.writeFileSync(path.join(srcDir, 'package.json'), JSON.stringify({ name, version, dependencies: depsMap || {} }));
+        const tgz = path.join(workVer2, name + '-' + version + '.tgz');
+        await tar.packTarGz(tgz, [{ name: 'package/package.json', source: path.join(srcDir, 'package.json') }], { gzip: true });
+        return stV2.putTarball(name, version, fs.readFileSync(tgz));
+      };
+      const mkDistV2 = (name, version, put) => ({ tarball: BASE + '/' + name + '/-/' + put.file, integrity: put.integrity, shasum: put.shasum });
+      // 依赖包：元数据里有 2.0.0 / 2.5.0 两个版本，但只有 2.0.0 的 tarball 缓存（2.5.0 模拟「只有元数据」）
+      const putE20 = await mkPutV2('mirror-selftest-vere', '2.0.0');
+      stV2.save('mirror-selftest-vere', {
+        name: 'mirror-selftest-vere',
+        'dist-tags': { latest: '2.5.0' },
+        versions: {
+          '2.0.0': { name: 'mirror-selftest-vere', version: '2.0.0', dist: mkDistV2('mirror-selftest-vere', '2.0.0', putE20) },
+          '2.5.0': { name: 'mirror-selftest-vere', version: '2.5.0', dist: { tarball: BASE + '/mirror-selftest-vere/-/mirror-selftest-vere-2.5.0.tgz' } },
+        },
+      }, { source: 'private', files: { '2.0.0': putE20.file }, sizes: { '2.0.0': putE20.sizeBytes } });
+      // 根包：1.0.0 依赖 depE ^2.0.0（按范围会解析出最高的 2.5.0，而它的 tarball 本地没有）
+      const putR = await mkPutV2('mirror-selftest-verg', '1.0.0', { 'mirror-selftest-vere': '^2.0.0' });
+      stV2.save('mirror-selftest-verg', {
+        name: 'mirror-selftest-verg',
+        'dist-tags': { latest: '1.0.0' },
+        versions: {
+          '1.0.0': {
+            name: 'mirror-selftest-verg', version: '1.0.0',
+            dependencies: { 'mirror-selftest-vere': '^2.0.0' },
+            dist: mkDistV2('mirror-selftest-verg', '1.0.0', putR),
+          },
+        },
+      }, { source: 'private', files: { '1.0.0': putR.file }, sizes: { '1.0.0': putR.sizeBytes } });
+
+      // B2-1) 无联网上下文：必须报 EVERSIONMISSING，而不是静默导出「有元数据、没 tarball」的假依赖版本
+      let depErr = null;
+      try {
+        await bundleModVer.exportBundle({
+          store: stV2, scope: 'selected', names: ['mirror-selftest-verg'], withDeps: true,
+          autoFetchDeps: false, onlyVersions: { 'mirror-selftest-verg': ['1.0.0'] }, logger: quietLogVer,
+        });
+      } catch (e) { depErr = e; }
+      check('依赖按版本解析出的版本 tarball 未缓存时，离线导出不会静默漏导 → EVERSIONMISSING（错误信息带依赖包@版本）',
+        !!depErr && depErr.code === 'EVERSIONMISSING' && /mirror-selftest-vere@2\.5\.0/.test(depErr.message || ''),
+        depErr ? depErr.code + ' ' + depErr.message : '没有抛错（会静默漏导，属于 bug）');
+
+      // B2-2) 有联网上下文：校验阶段从上游补齐依赖版本 tarball，导出包 tarballs 数 = 版本数
+      const fetchedDep = [];
+      const fakeCtxVer = {
+        cfg: () => ({ mode: 'cache' }),
+        upstream: {},
+        registry: {
+          ensureTarballEx: async (ctx2, name, version) => {
+            fetchedDep.push(name + '@' + version);
+            await mkPutV2(name, version);
+          },
+        },
+      };
+      const rDep = await bundleModVer.exportBundle({
+        store: stV2, ctx: fakeCtxVer, scope: 'selected', names: ['mirror-selftest-verg'], withDeps: true,
+        autoFetchDeps: false, onlyVersions: { 'mirror-selftest-verg': ['1.0.0'] }, logger: quietLogVer,
+      });
+      exportedVer2.push(rDep.file);
+      check('有联网上下文时补齐依赖版本 tarball：导出包 tarballs 数等于版本数（依赖版本真正被导出）',
+        rDep.packages === 2 && rDep.versions === 2 && rDep.tarballs === 2
+          && fetchedDep.includes('mirror-selftest-vere@2.5.0')
+          && Array.isArray(rDep.versionFilter['mirror-selftest-vere'])
+          && rDep.versionFilter['mirror-selftest-vere'][0] === '2.5.0',
+        'packages=' + rDep.packages + ' versions=' + rDep.versions + ' tarballs=' + rDep.tarballs
+          + ' fetched=' + JSON.stringify(fetchedDep) + ' filter=' + JSON.stringify(rDep.versionFilter));
+      await stV2.close();
+    } finally {
+      for (const f of exportedVer2) {
+        try { fs.unlinkSync(path.join(util.rootPath('data', 'bundles'), f)); } catch { /* 忽略 */ }
+      }
+      try { fs.rmSync(workVer2, { recursive: true, force: true }); } catch { /* 忽略 */ }
+    }
+
     // D) 接口层参数校验：versions 只能配合 scope=selected；形状/写错直接 400，不启动导出任务
     const verApiRows = [];
     for (const body of [

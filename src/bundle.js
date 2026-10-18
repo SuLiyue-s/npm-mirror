@@ -696,7 +696,6 @@ async function exportBundle({
       err.status = 409;
       throw err;
     }
-    await checkVersionsAvailable({ ctx, store, roots, versionFilter, localScanConc, logger, emit, isCanceled });
   }
   if (withDeps && scope === 'selected' && roots.length) {
     const closureOpts = { concurrency: localScanConc, isCanceled };
@@ -735,6 +734,19 @@ async function exportBundle({
       return m;
     });
     targets = Array.from(new Set([...roots, ...closure.names])).sort();
+  }
+
+  /* 指定版本统一校验/补齐（必须放在依赖闭包之后）：
+   * roots 的版本、以及「按所选版本依赖范围解析出的依赖版本」都要检查本地元数据存在、tarball 已缓存；
+   * 缺 tarball 的先联网补齐（cache/proxy 模式），仍缺就抛 EVERSIONMISSING 列明细。
+   * 之前只在依赖闭包之前校验 roots，依赖版本虽然被算进了 versionFilter，但没有 tarball 时会被
+   * 静默导出成「元数据里有版本、归档里没有 tarball」的假版本，导入端会跳过 ——
+   * 用户看到的症状就是「只导出了选中的包，依赖包的版本没有导出」。
+   */
+  if (versionFilter) {
+    await checkVersionsAvailable({
+      ctx, store, roots: Array.from(versionFilter.keys()), versionFilter, localScanConc, logger, emit, isCanceled,
+    });
   }
 
   if (!targets.length) {

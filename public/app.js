@@ -5017,10 +5017,77 @@
     } catch (e) { return false; }
   }
 
+  /* ============================================================
+   * 与镜像源服务的连接状态
+   * 每 4 秒用 /-/ping 探测一次：断线时顶栏变红并自动重试（带重试次数提示），
+   * 恢复后 toast 提醒并刷新一次界面，让顶栏、列表、统计都回到最新状态。
+   * 服务重启、电脑休眠唤醒、网络恢复都能自动接上。
+   * ============================================================ */
+  var connDown = false;
+  var connFails = 0;
+
+  function setConnState(ok, fails) {
+    var chip = $('#chip-conn');
+    if (!chip) return;
+    chip.classList.toggle('is-cy', !!ok);
+    chip.classList.toggle('is-red', !ok);
+    var lamp = $('#chip-conn-lamp');
+    if (lamp) lamp.className = 'lamp ' + (ok ? 'lamp-cy' : 'lamp-red');
+    var txt = $('#chip-conn-text');
+    if (txt) txt.textContent = ok ? '已连接' : '连接断开';
+    setTip(chip, ok
+      ? '与镜像源服务连接正常（每 4 秒探测一次）'
+      : '与镜像源服务的连接已断开，正在自动重试（已重试 ' + fails + ' 次）；恢复连接后会自动刷新界面');
+  }
+
+  function pingOnce() {
+    var ctrl = (typeof AbortController === 'function') ? new AbortController() : null;
+    var timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, 3000);
+    var opts = { cache: 'no-store' };
+    if (ctrl) opts.signal = ctrl.signal;
+    return fetch('/-/ping', opts).then(function (r) {
+      clearTimeout(timer);
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.text();
+    }, function (e) { clearTimeout(timer); throw e; });
+  }
+
+  function connTick() {
+    if (document.hidden) return;
+    pingOnce().then(function () {
+      var wasDown = connDown;
+      connDown = false;
+      connFails = 0;
+      setConnState(true, 0);
+      /* 断线恢复：刷新一次管理界面，避免页面停留在断线期间的旧数据上 */
+      if (wasDown) {
+        toast('已重新连接到镜像源服务，正在刷新界面…', 'ok', 3000);
+        setTimeout(function () { location.reload(); }, 800);
+      }
+    }, function () {
+      connFails++;
+      var firstDown = !connDown;
+      connDown = true;
+      setConnState(false, connFails);
+      if (firstDown) toast('与镜像源服务的连接已断开，正在自动重试；恢复连接后会自动刷新界面', 'err', 8000);
+    });
+  }
+
+  function startConnWatch() {
+    setConnState(true, 0);
+    connTick();
+    setInterval(connTick, 4000);
+    /* 休眠唤醒 / 网络恢复时不等下一个探测周期 */
+    window.addEventListener('online', function () { if (connDown) connTick(); });
+    document.addEventListener('visibilitychange', function () { if (!document.hidden) connTick(); });
+  }
+
   function init() {
     consumeUrlToken();
     startClock();
     bindGlobal();
+    /* 与镜像源服务的连接状态（顶栏 chip，断线自动重试、恢复后刷新界面） */
+    startConnWatch();
     /* 静态的容器框（面板 / 统计卡）在页面加载后统一铺上背景动效；
      * 弹窗与抽屉在创建时由 modal()/openDetail() 自己插。 */
     $$('.panel,.stat').forEach(decorateFx);
