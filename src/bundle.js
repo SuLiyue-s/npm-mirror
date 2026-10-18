@@ -186,6 +186,11 @@ function normalizeVersionFilter(onlyVersions) {
     out.get(n).add(v);
   };
   const badError = (msg) => { const e = new Error(msg); e.code = 'EBADVERSION'; e.status = 400; return e; };
+  /* 把 map/对象里的「版本值」统一展开成数组：
+   * - 可能是单个版本字符串、版本数组（前端/接口的写法），也可能是 Set（本函数自己返回的 Map 再被规范化一次时的形态）。
+   * 注意：Map<包名, Set<版本>> 必须按 Set 逐项展开；曾经把 Set 当成「一个版本值」包成 [Set]，String 之后变成
+   * "[object Set]"，导致接口层「预规范化过的 Map」再传进 exportBundle 时版本被当成字符串 "[object Set]"。 */
+  const listOf = (list) => (list instanceof Set ? Array.from(list) : (Array.isArray(list) ? list : [list]));
   if (Array.isArray(onlyVersions)) {
     for (const item of onlyVersions) {
       if (typeof item === 'string') {
@@ -200,11 +205,11 @@ function normalizeVersionFilter(onlyVersions) {
     }
   } else if (onlyVersions instanceof Map) {
     for (const [name, list] of onlyVersions) {
-      for (const v of (Array.isArray(list) ? list : [list])) add(name, v);
+      for (const v of listOf(list)) add(name, v);
     }
   } else if (typeof onlyVersions === 'object') {
     for (const [name, list] of Object.entries(onlyVersions)) {
-      for (const v of (Array.isArray(list) ? list : [list])) add(name, v);
+      for (const v of listOf(list)) add(name, v);
     }
   } else {
     throw badError('versions 必须是「{包名: [版本]}」对象或「包名@版本」字符串数组');

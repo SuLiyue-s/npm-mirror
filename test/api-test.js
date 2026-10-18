@@ -2703,6 +2703,40 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
         && verApiRows[1].status === 400 && verApiRows[1].code === 'EBADVERSION'
         && verApiRows[2].status === 400 && verApiRows[2].code === 'EBADVERSION',
       JSON.stringify(verApiRows));
+
+    // E) 回归：api.js 会先把 body.versions 规范化成 Map<包名, Set<版本>> 再交给 exportBundle，
+    //    exportBundle 内部又会规范化一次；第二次必须按 Set 逐项展开，不能把 Set 当成一个版本值
+    //    （曾导致接口层带 versions 的导出必然失败，报「playwright-core@[object Set]」）。
+    const normMap = bundleModVer.normalizeVersionFilter({ 'pkg-aa': ['1.0.0', '2.0.0'] });
+    const normAgain = bundleModVer.normalizeVersionFilter(normMap);
+    check('归一化结果再归一化一次是幂等的（Map<包名, Set<版本>> 逐项展开，不会变成 [object Set]）',
+      !!normAgain && normAgain.get('pkg-aa').size === 2
+        && normAgain.get('pkg-aa').has('1.0.0') && normAgain.get('pkg-aa').has('2.0.0')
+        && !normAgain.get('pkg-aa').has('[object Set]'),
+      JSON.stringify(normAgain && Array.from(normAgain.get('pkg-aa') || [])));
+
+    // 真接口成功路径：选一个本地已缓存的真实包版本，走 POST /bundles/export（api.js 预规范化 → exportBundle）
+    const rms = await api('/__admin/api/packages/ms');
+    const msData = (rms.json && rms.json.data) || {};
+    const msCachedVer = (Array.isArray(msData.versions) ? msData.versions : []).find((v) => v && v.cached && v.version);
+    if (rms.status !== 200 || !msCachedVer) {
+      skip('接口层：POST /bundles/export 带 versions 成功导出指定版本', '本机没有 ms 的已缓存版本');
+    } else {
+      const rExpVer = await api('/__admin/api/bundles/export', {
+        method: 'POST',
+        body: { scope: 'selected', names: ['ms'], versions: { ms: [msCachedVer.version] }, withDeps: false },
+        timeoutMs: 180000,
+      });
+      const dExpVer = (rExpVer.json && rExpVer.json.data) || {};
+      check(`接口层：POST /bundles/export 带 versions 成功导出指定版本（ms@${msCachedVer.version}），返回 versionFiltered`,
+        rExpVer.status === 200 && dExpVer.versionFiltered === true
+          && !!dExpVer.versionFilter && Array.isArray(dExpVer.versionFilter.ms)
+          && dExpVer.versionFilter.ms.length === 1 && dExpVer.versionFilter.ms[0] === msCachedVer.version,
+        `status=${rExpVer.status} data=${JSON.stringify(dExpVer).slice(0, 300)}`);
+      if (dExpVer.file) {
+        await api('/__admin/api/bundles?file=' + encodeURIComponent(dExpVer.file), { method: 'DELETE' });
+      }
+    }
   }
 
   section('六之五、导出/导入并行与「根目录名不是 package」的 tarball');
