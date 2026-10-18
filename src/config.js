@@ -29,7 +29,7 @@ function defaults() {
       token: randomToken(24),
       requirePublish: true,        // 发布/删除包需要令牌
       requireRead: false,          // 读取（安装）是否需要令牌
-      trustLocalhost: true,        // 本机回环地址免令牌，方便自己用
+      trustLocalhost: true,        // 本机回环地址（整个 127.0.0.0/8 网段与 ::1）免令牌，方便自己用
       username: 'admin',
     },
     storage: {

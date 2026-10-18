@@ -126,7 +126,11 @@ function integrityToCachePath(cacheDir, integrity) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-/** 判断是否为回环地址。只接受 IP 字面量（主机名 localhost 不等于回环，避免 127.0.0.1.evil.com 之类绕过） */
+/**
+ * 判断是否为回环地址：整个 IPv4 127.0.0.0/8 网段（不只 127.0.0.1）、IPv6 ::1、
+ * 以及 IPv4-mapped 形式（::ffff:127.x.x.x）都算本机回环。
+ * 只接受 IP 字面量（主机名 localhost 不等于回环，避免 127.0.0.1.evil.com 之类绕过）。
+ */
 function isLoopback(addr) {
   if (!addr) return false;
   const a = String(addr).replace(/^::ffff:/, '');

@@ -32,7 +32,7 @@ node cli.js init
 node cli.js start
 ```
 
-也可以在 Windows 上直接双击 **`启动镜像源.cmd`**。
+也可以在 Windows 上直接双击 **`启动镜像源.cmd`**。服务已经在运行时再双击（或开机自启重复触发）**不会重复启动**：脚本会先执行 `node cli.js prestart` 检查——同一端口已在运行就提示「已在运行」（并自动打开管理界面）后直接结束，检测到运行在其它端口则提示先停止，不会再抢端口、也不会重复注册托盘图标。
 
 > 首次启动后，管理界面的「配置」页与 `data/config.json` 里都能看到访问令牌（`security.token`）。
 
@@ -69,7 +69,7 @@ registry=http://127.0.0.1:4873/
 //127.0.0.1:4873/:_authToken=<你的访问令牌>
 ```
 
-> 本机回环访问默认免令牌（`security.trustLocalhost: true`）；局域网共享或需要严格鉴权时，在配置里开启 `requireRead` / `requirePublish` 并分发令牌。
+> 本机回环访问默认免令牌（`security.trustLocalhost: true`，覆盖整个 `127.0.0.0/8` 网段与 `::1`）；局域网共享或需要严格鉴权时，在配置里开启 `requireRead` / `requirePublish` 并分发令牌。
 
 ## 常用命令
 
@@ -132,7 +132,7 @@ node cli.js import npm-mirror-all.tgz
 | `upstream.concurrency` / `maxTarballMB` | `6` / `512` | 并发下载数 / 单个 tarball 上限（MB） |
 | `security.token` | 随机生成 | 访问令牌（**不要提交到仓库**） |
 | `security.requirePublish` / `requireRead` | `true` / `false` | 发布 / 读取是否需要令牌 |
-| `security.trustLocalhost` | `true` | 本机回环地址免令牌 |
+| `security.trustLocalhost` | `true` | 本机回环地址（整个 `127.0.0.0/8` 网段与 `::1`）免令牌 |
 | `storage.dir` / `storage.maxUploadMB` | `data/storage` / `500` | 包存储目录 / 单包上传上限（MB，1-4096） |
 | `storage.maxBundleUploadMB` | `4096` | 网页上传整机备份（离线包）的上限（MB，1-65536）。上传走流式落盘，不占内存；更大的包可放进 `data/bundles` 后用界面「导入」 |
 | `storage.bundleExportConcurrency` | `4` | 导出整机备份时的并行压缩线程数（1-64）。整数备份大、机器核数多时可调大（高核机器可调到接近逻辑处理器数），设 1 回到单线程 |
@@ -190,9 +190,9 @@ pwsh -File test/acceptance-npm.ps1   # 真实 npm 客户端验收（Windows / Po
 
 | 脚本 | 内容 | 最近结果（2026-10-18，本机） |
 | --- | --- | --- |
-| `test/api-test.js` | npm 协议、管理接口、发布/删除、离线导入导出、进度任务（含逐版本 `downloads[]` 实时进度）、并行导出导入与根目录/版本写法兼容、导出时自动补齐缺失依赖、全部包补全部版本规划、安全回归、包管理页「缺 tarball / 不缺 tarball」快捷筛选等 266 项（上游可达时会额外执行 3 项自动补依赖用例，共 269 项） | **260 通过 + 6 跳过，0 失败**（上游可达时 264 通过 + 5 跳过） |
+| `test/api-test.js` | npm 协议、管理接口、发布/删除、离线导入导出、进度任务（含逐版本 `downloads[]` 实时进度）、并行导出导入与根目录/版本写法兼容、导出时自动补齐缺失依赖、全部包补全部版本规划、安全回归、包管理页「缺 tarball / 不缺 tarball」快捷筛选、**补全部包全量规划不阻塞服务（1520 包规划期间 `/-/ping` 最大延迟 < 5s、`planTargets` 异步每 8 包让出事件循环）、`cli.js prestart` 同端口不重复启动（退出码 10/11）、回环免鉴权覆盖 127.0.0.0/8（`util.isLoopback` 与 Host: 127.0.0.5）**等 274 项（上游可达时会额外执行 3 项自动补依赖用例，共 277 项） | **268 通过 + 6 跳过，0 失败**（上游可达时 272 通过 + 5 跳过） |
 | `test/ui-check.js` | 前端与后端接口/页面元素契约（含导入结果的失败/跳过详情面板、导出自动补依赖勾选项、全部包补全部版本入口、补 tarball 弹窗「版本进度」栏、「缺 tarball / 不缺 tarball」快捷筛选、悬停提示自绘浮层（首页无原生 title、el() 把 title 映射成 data-tip、uiTip 控制器、`.ui-tip` 样式与项目配色变量）、补 tarball 左栏行数上限回收（`reclaimRow` 只收已完成行、失败行保留、提示条）、导出/导入进度弹窗右栏多行进度（`inFlight`：导出按「并行文件」一行一个正在压缩的条目、导入一个包一行）、导出收尾写盘阶段（`concat` 字节进度 → 任务快照 `concatDone/concatTotal` → 右栏「正在写入 · 拼接分片」，压缩阶段最多 95%）、**弹窗/抽屉/面板/统计卡内部背景复用整页动态背景（`.fx-box` 动效层 + `isolation:isolate`，与整页 32px 网格/扫过亮带一致、不挡点击）**、**导出「按添加时间」范围（segbar 与自绘日期时间选择器 `#exp-added-row`、payload `addedFrom/addedTo`、后端 `addedTimeRange` 清单、非法/空范围 400 与提示）与进度弹窗「取消」等待期禁用（`requestTaskCancel` 置灰/「正在取消…」、成功保持禁用、失败恢复可点）**、**原生下拉改项目风格自绘下拉（`csel*` 实现：7 个静态 `<select>` + 动态创建/重建选项的接管、`.csel-btn/.csel-menu` 样式、键盘与点外关闭、保留原生 `change` 语义）**、**搜索框清除叉 / 数字框上下箭头收掉、`:focus-visible` 统一青色描边、原生 `window.confirm` 换 `confirmBox`**、**下拉按钮箭头三态（悬停/键盘聚焦/展开）变青、复选框对勾加粗与全选「半选」横杠、勾选单行时表头全选框同步半选**、**概览页「上游与来源分布」条形图能真正渲染彩色填充（`fill` 用 `display:block`、非零来源最小 2% 宽）**、favicon 声明、**导入备份分片并发上传（`uploadBundleChunked` 与 `/bundles/upload/init|chunk|complete|abort` 四接口）**、**多并发解包（`extractTarGz` 并发写盘）**、**版本级并行调度器（`laneCount/stealTask/runVersionTask/laneLoop`）与右栏「· N 路」显示**） | **153/153 通过** |
-| `test/tray-check.js` | 托盘脚本/项目图标/启动脚本/favicon 路由契约（含右键菜单「打开管理界面」）、**开机自启（`.vbs` 隐藏启动项 / UTF-16LE BOM / 旧 `.cmd` 清理 / `off` 幂等，临时目录真跑）**，并真跑一次托盘自检（Windows） | **48/48 通过** |
+| `test/tray-check.js` | 托盘脚本/项目图标/启动脚本/favicon 路由契约（含右键菜单「打开管理界面」）、**开机自启（`.vbs` 隐藏启动项 / UTF-16LE BOM / 旧 `.cmd` 清理 / `off` 幂等，临时目录真跑）**，并真跑一次托盘自检（Windows）、**托盘健康检查的进程存活保护（服务忙但进程还活着只提示「忙碌」、不关窗口）、启动脚本 prestart 同端口不重复启动（退出码 10/11）** | **54/54 通过** |
 | `test/tray-e2e.ps1` | 托盘端到端：隔离副本启动 → 窗口隐藏 → 可重新显示 → 停服务后托盘退出并关窗 | **8/8 通过（手工）** |
 | `test/acceptance-npm.ps1` | 真实 `npm install / publish / dist-tag / deprecate / unpublish` | **16/16 通过** |
 | `test/ui-e2e-*.js` | 浏览器端端到端（需要 Chrome 调试端口，可选） | 需本机 Chrome CDP 环境 |

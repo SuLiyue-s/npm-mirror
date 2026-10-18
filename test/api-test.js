@@ -1020,9 +1020,10 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
     check(`store.names() 一次拿到全部 ${totalPkgs} 个包名（list() 的 size 上限是 200，不能拿来取全量名单）`,
       names.length === totalPkgs, `names=${names.length} total=${totalPkgs}`);
 
-    const planLatest = pullMod.planTargets(roStore, names, 'latest');
-    const planTags = pullMod.planTargets(roStore, names, 'tags');
-    const planAll = pullMod.planTargets(roStore, names, 'all');
+    // planTargets 自本轮起是 async（每 8 个包让出一次事件循环，避免全量规划把服务卡住几秒），调用处要 await
+    const planLatest = await pullMod.planTargets(roStore, names, 'latest');
+    const planTags = await pullMod.planTargets(roStore, names, 'tags');
+    const planAll = await pullMod.planTargets(roStore, names, 'all');
     const sum = (plan) => plan.reduce((a, p) => a + p.target.length, 0);
     check('planTargets(全部包, latest / tags) 每个包一行，latest 的目标数不超过 tags',
       planLatest.length === totalPkgs && planTags.length === totalPkgs && sum(planLatest) <= sum(planTags),
@@ -1043,8 +1044,12 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
       const tarFile = pathM.join(osM.tmpdir(), `pull-progress-${process.pid}-${Date.now()}.tgz`);
       fsM.writeFileSync(tarFile, Buffer.alloc(1024));
       const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+      // 规划改成 async 后走 store.getAsync + store.tarballDir/tarballFileName（同一份 packument 只读一次）
       const fakeStore = {
         get() { return { packument: { 'dist-tags': { latest: '1.0.1' }, versions: { '1.0.0': {}, '1.0.1': {} } } }; },
+        async getAsync() { return this.get(); },
+        tarballDir() { return osM.tmpdir(); },
+        tarballFileName(name, version) { return `${name}-${version}.tgz`; },
         missingTarballs() { return ['1.0.0', '1.0.1']; },
       };
       const seen = [];
@@ -1167,6 +1172,128 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
       `scope=${res.scope} packages=${res.packages && res.packages.length} skipped=${res.skippedLocal}`);
 
     await roStore.close();
+  }
+
+  // ---------------------------------------------------------------- 本轮修复回归：全量规划不阻塞 / 启动脚本预检查 / 回环地址免鉴权
+  section('五之八之二、全量规划不阻塞服务 / 启动脚本预检查 / 回环地址免鉴权（新）');
+  {
+    const { spawnSync } = require('node:child_process');
+    const ROOT = path.join(__dirname, '..');
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+    // 1) 全量规划期间服务必须还能响应：修复前规划在请求处理里同步跑完要 9~15 秒，
+    //    /session 等健康检查会超时，托盘因此误判「服务已停止」并把控制台窗口一起关掉（连带杀掉 node）。
+    const lat = [];
+    let stopProbe = false;
+    const probe = (async () => {
+      while (!stopProbe) {
+        const st = Date.now();
+        try { await api('/-/ping', { timeoutMs: 20000 }); } catch { /* 超时也记一笔延迟 */ }
+        lat.push(Date.now() - st);
+        await sleep(120);
+      }
+    })();
+    const pullAll = await api('/__admin/api/packages/pull', { method: 'POST', body: { all: true, mode: 'tags' }, timeoutMs: 180000 });
+    stopProbe = true;
+    await probe;
+    const maxLat = lat.length ? Math.max(...lat) : 0;
+    check(`全量规划期间 /-/ping 仍能及时响应（${lat.length} 次采样，最大 ${maxLat}ms；修复前整段会超时）`,
+      pullAll.status === 200 && lat.length >= 2 && maxLat < 5000,
+      `status=${pullAll.status} samples=${lat.length} max=${maxLat}ms`);
+    const pjAll = (pullAll.json && pullAll.json.data) || {};
+    if (pjAll.taskId) {
+      await api('/__admin/api/tasks/' + pjAll.taskId + '/cancel', { method: 'POST' });
+      for (let i = 0; i < 120; i++) {
+        await sleep(250);
+        const g = await api('/__admin/api/tasks/' + pjAll.taskId);
+        if (((g.json && g.json.data) || {}).status !== 'running') break;
+      }
+    }
+
+    // 2) planTargets 内部每 8 个包让出一次事件循环：同步实现期间定时器几乎跑不动，可直接对比出差异
+    {
+      const { Store } = require('../src/store');
+      const pullMod = require('../src/pull');
+      const cfgMod = require('../src/config');
+      const quiet = { info() {}, warn() {}, error() {}, debug() {} };
+      const roStore2 = new Store({ dir: cfgMod.storageDir(), logger: quiet });
+      await roStore2.init();
+      const allNames = roStore2.names();
+      let ticks = 0;
+      const ticker = setInterval(() => { ticks++; }, 5);
+      const ts = Date.now();
+      let planOk = false;
+      let planCount = 0;
+      try {
+        const p = await pullMod.planTargets(roStore2, allNames, 'tags');
+        planOk = Array.isArray(p) && p.length === allNames.length;
+        planCount = p.length;
+      } catch { planOk = false; }
+      clearInterval(ticker);
+      const cost = Date.now() - ts;
+      check(`planTargets 是异步规划：${planCount} 个包耗时 ${cost}ms，期间事件循环执行了 ${ticks} 次定时器（同步实现会接近 0）`,
+        planOk && ticks >= 3, `plan=${planCount} cost=${cost}ms ticks=${ticks}`);
+      await roStore2.close();
+    }
+
+    // 3) cli.js prestart：给「启动镜像源.cmd」/开机自启用，服务已在同端口运行时不再重复启动
+    //    子进程输出用文件接（沙箱里不能开命名管道），避免 spawnSync 的 pipe EPERM
+    const runCli = (args) => {
+      const out = path.join(os.tmpdir(), `npm-mirror-cli-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.txt`);
+      const fd = fs.openSync(out, 'w');
+      let r = null;
+      try {
+        r = spawnSync(process.execPath, [path.join(ROOT, 'cli.js'), ...args], {
+          cwd: ROOT, stdio: ['ignore', fd, fd], timeout: 60000, windowsHide: true,
+        });
+      } finally { try { fs.closeSync(fd); } catch { /* 忽略 */ } }
+      let text = '';
+      try { text = fs.readFileSync(out, 'utf8'); } catch { /* 忽略 */ }
+      try { fs.unlinkSync(out); } catch { /* 忽略 */ }
+      return { status: r && r.status, error: r && r.error, text };
+    };
+    // 期望值要跟随 pid 文件：正常单实例时 pid.port === 本次端口（退出码 10）；
+    // 若测试机同时跑着另一端口的实例（pid 文件记的是它），prestart 应报 11。
+    let pidRec = null;
+    try { pidRec = JSON.parse(fs.readFileSync(path.join(ROOT, 'data', 'mirror.pid'), 'utf8')); } catch { pidRec = null; }
+    const pidPort = pidRec ? Number(pidRec.port) || 0 : 0;
+    const expectSame = pidPort && pidPort !== BASE_PORT ? 11 : 10;
+    const same = runCli(['prestart', '--port', String(BASE_PORT), '--json', '--no-open']);
+    check(`cli.js prestart：服务已在本次要用的端口运行 → 退出码 10（启动脚本据此跳过重复启动；实际 pid 端口 ${pidPort || '无'} → 期望 ${expectSame}）`,
+      same.status === expectSame, `exit=${same.status} out=${String(same.text || '').trim().slice(0, 160)}`);
+    let sj = null;
+    try {
+      const jt = String(same.text || '');
+      const a = jt.indexOf('{');
+      const b = jt.lastIndexOf('}');
+      sj = a >= 0 && b > a ? JSON.parse(jt.slice(a, b + 1)) : null;
+    } catch { sj = null; }
+    check('prestart --json 输出 running/samePort/wantPort 字段（供启动脚本判断）',
+      !!sj && sj.running === true && sj.samePort === (expectSame === 10) && Number(sj.wantPort) === BASE_PORT,
+      JSON.stringify(sj || {}).slice(0, 160));
+    const other = runCli(['prestart', '--port', String(BASE_PORT + 7), '--json', '--no-open']);
+    check('cli.js prestart：已有实例运行在其它端口 → 退出码 11（不硬抢端口，提示先停止）',
+      other.status === 11, `exit=${other.status} out=${String(other.text || '').trim().slice(0, 160)}`);
+    const human = runCli(['prestart', '--port', String(BASE_PORT), '--no-open']);
+    const humanTxt = String(human.text || '');
+    check('prestart 人类可读模式说清「服务已经在运行 / 不再重复启动」或「在其它端口运行，请先停止」',
+      human.status === expectSame
+        && (expectSame === 10 ? /已经在运行/.test(humanTxt) : /其它端口运行/.test(humanTxt)),
+      humanTxt.trim().split(/\r?\n/).slice(0, 3).join(' / ').slice(0, 160));
+
+    // 4) 本地回环免鉴权覆盖整个 127.0.0.0/8（不只是 127.0.0.1）
+    const lp = util.isLoopback;
+    check('util.isLoopback：整个 127/8 网段、::1、IPv4-mapped 都算回环，局域网 IP/主机名不算',
+      lp('127.0.0.1') && lp('127.0.0.2') && lp('127.255.255.254') && lp('::1') && lp('::ffff:127.0.0.1')
+        && !lp('192.168.1.2') && !lp('10.0.0.1') && !lp('localhost') && !lp('127.0.0.1.attacker.com'),
+      `127.0.0.2=${lp('127.0.0.2')} 10.0.0.1=${lp('10.0.0.1')} localhost=${lp('localhost')}`);
+    const hostProbe = await rawReq('/__admin/api/session', { headers: { Host: `127.0.0.5:${BASE_PORT}` } });
+    let hostJson = null;
+    try { hostJson = JSON.parse(hostProbe.text); } catch { hostJson = null; }
+    check('Host 头写成其它 127 地址（127.0.0.5）也照常放行，且按本机回环免鉴权处理',
+      hostProbe.status === 200 && !!hostJson && hostJson.ok === true && hostJson.data
+        && hostJson.data.viaLocalhost === true && hostJson.data.authenticated === true,
+      `status=${hostProbe.status} body=${String(hostProbe.text).slice(0, 140)}`);
   }
 
   // ---------------------------------------------------------------- 包管理页快捷筛选

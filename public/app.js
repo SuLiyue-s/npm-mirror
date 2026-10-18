@@ -4018,7 +4018,7 @@
         { k: 'security.token', label: '访问令牌', type: 'token', hint: '留空表示不修改已保存的令牌。' },
         { k: 'security.requirePublish', label: '发布需要令牌', type: 'bool' },
         { k: 'security.requireRead', label: '读取需要令牌', type: 'bool' },
-        { k: 'security.trustLocalhost', label: '回环地址免鉴权', type: 'bool', hint: '开启后本机 127.0.0.1 访问不需要令牌。' },
+        { k: 'security.trustLocalhost', label: '回环地址免鉴权', type: 'bool', hint: '开启后本机回环地址（127.0.0.0/8 网段与 ::1）访问不需要令牌。' },
         { k: 'security.username', label: '发布用户名', type: 'text' }
       ]
     },

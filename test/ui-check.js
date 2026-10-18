@@ -621,6 +621,49 @@ async function get(p, { json = false } = {}) {
       /phase: 'assemble'/.test(apiSrc) && /正在合并上传分片/.test(js.text) && /正在把分片合并成完整备份文件/.test(js.text));
   }
 
+  console.log('\x1b[1m九之三、大任务不阻塞服务 / 启动脚本预检查 / 回环地址免鉴权\x1b[0m');
+  {
+    const pullSrc2 = fs.readFileSync(path.join(__dirname, '..', 'src', 'pull.js'), 'utf8');
+    const storeSrc2 = fs.readFileSync(path.join(__dirname, '..', 'src', 'store.js'), 'utf8');
+    const apiSrc2 = fs.readFileSync(path.join(__dirname, '..', 'src', 'api.js'), 'utf8');
+    const cliSrc2 = fs.readFileSync(path.join(__dirname, '..', 'cli.js'), 'utf8');
+    const utilSrc2 = fs.readFileSync(path.join(__dirname, '..', 'src', 'util.js'), 'utf8');
+    const traySrc2 = fs.readFileSync(path.join(__dirname, '..', 'tools', 'tray.ps1'), 'utf8');
+    const cmdSrc2 = fs.readFileSync(path.join(__dirname, '..', '启动镜像源.cmd'), 'utf8');
+
+    // ① 「补充全部包」不再把服务卡死：规划改异步、每 8 个包让出事件循环、packument 只读一次
+    check('补 tarball 规划改为异步：每 8 个包让出事件循环，且用同一次 packument 计算缺失（不再重复读盘）',
+      /async function planTargets\s*\(/.test(pullSrc2) && /PLAN_YIELD_EVERY = 8/.test(pullSrc2)
+        && /await yieldLoop\(\)/.test(pullSrc2) && /function missingTarballsFrom\s*\(/.test(pullSrc2)
+        && /await store\.getAsync\(name\)/.test(pullSrc2) && /async getAsync\(name\)/.test(storeSrc2));
+    check('HTTP 请求处理里 await 规划，任务直接复用已算好的 plan（同一批包不再规划两遍）',
+      /await pull\.planTargets\(/.test(apiSrc2) && /Array\.isArray\(opts\.plan\)/.test(pullSrc2)
+        && /concurrency, task, plan,/.test(apiSrc2));
+
+    // ② 托盘健康检查加固：进程还活着就只记「忙碌」，绝不关控制台（关窗 = 直接杀 node）
+    check('托盘健康检查带进程存活保护：服务忙时只记日志继续等待，进程真的退出才关控制台',
+      /function Get-MirrorPid/.test(traySrc2) && /function Test-MirrorProcessAlive/.test(traySrc2)
+        && /继续等待，不关闭窗口/.test(traySrc2) && /HealthFail -ge 5/.test(traySrc2)
+        && /检测到服务已停止（进程已退出）/.test(traySrc2));
+
+    // ③ 启动脚本 / 开机自启：服务已在运行且端口一致时不再抢端口
+    check('启动镜像源.cmd 启动前先跑 cli.js prestart：同端口已在运行（退出码 10）直接结束，不重复托盘',
+      /cli\.js" prestart/.test(cmdSrc2) && /PRESTART_CODE/.test(cmdSrc2)
+        && /"%PRESTART_CODE%"=="10"/.test(cmdSrc2) && /本次没有重复启动/.test(cmdSrc2) && /exit \/b 0/.test(cmdSrc2));
+    check('启动镜像源.cmd：已在其它端口运行（退出码 11）提示先停止，不强行启动第二份',
+      /"%PRESTART_CODE%"=="11"/.test(cmdSrc2) && /已经在其它端口运行/.test(cmdSrc2) && /exit \/b 1/.test(cmdSrc2));
+    check('cli.js 提供 prestart 命令（退出码 0/10/11 + --json），并在同端口时打开管理界面后退出',
+      /commands\.prestart = async function/.test(cliSrc2) && /process\.exitCode = samePort \? 10 : 11/.test(cliSrc2)
+        && /flags\.json/.test(cliSrc2) && /samePort && !flags\['no-open'\]/.test(cliSrc2));
+
+    // ④ 本地回环免鉴权覆盖整个 127/8（不只 127.0.0.1）
+    check('util.isLoopback 覆盖整个 127.0.0.0/8 + ::1 + IPv4-mapped（注释与实现都写明，主机名不算回环）',
+      /a\.startsWith\('127\.'\)/.test(utilSrc2) && /127\.0\.0\.0\/8/.test(utilSrc2)
+        && /::ffff:/.test(utilSrc2) && /主机名 localhost 不等于回环/.test(utilSrc2));
+    check('配置页提示与 cli.js 的 npmrc 识别同步写成「127.0.0.0/8 网段与 ::1」/ isLoopback 判断',
+      js.text.includes('127.0.0.0/8 网段与 ::1') && /util\.isLoopback\(host\)/.test(cliSrc2));
+  }
+
   console.log('\x1b[1m十、导入备份结束后的「失败 / 跳过详情」（整理在弹窗最下方，可一键复制）\x1b[0m');
   {
     const cssSrc = fs.readFileSync(path.join(__dirname, '..', 'public', 'style.css'), 'utf8');

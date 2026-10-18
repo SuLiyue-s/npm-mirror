@@ -631,7 +631,7 @@ async function handleAdmin(ctx) {
     if (unknown.length === names.length) return fail(res, 404, `本地没有这些包：${unknown.join('、')}`, 'ENOTFOUND');
 
     const concurrency = clamp(Number(body.concurrency) || Number(cfg.upstream.concurrency) || 6, 1, 32);
-    const plan = pull.planTargets(store, names, mode, targets);
+    const plan = await pull.planTargets(store, names, mode, targets);
     const total = plan.reduce((a, p) => a + p.target.length, 0);
     const modeLabel = mode === 'all' ? '全部版本'
       : (mode === 'latest' ? '最新版本' : (mode === 'selected' ? '选中版本' : 'dist-tag 版本'));
@@ -656,7 +656,7 @@ async function handleAdmin(ctx) {
     setImmediate(() => {
       Promise.resolve()
         .then(() => pull.pullTarballs(ctx, {
-          names, mode, selected: targets, concurrency, task,
+          names, mode, selected: targets, concurrency, task, plan,
           onProgress: (info) => tasks.update(task.id, {
             done: info.done, ok: info.ok, failed: info.failed, bytes: info.bytes, packages: info.packages,
             errors: (info.errors || []).slice(0, 50),
@@ -763,7 +763,7 @@ async function handleAdmin(ctx) {
           let dl = null;
 
           if (prefetch && targets.length && !task.cancelRequested) {
-            const plan = pull.planTargets(store, names, 'selected', targets);
+            const plan = await pull.planTargets(store, names, 'selected', targets);
             const planTotal = plan.reduce((a, p) => a + p.target.length, 0);
             tasks.update(task.id, {
               phase: 'download',
@@ -776,7 +776,7 @@ async function handleAdmin(ctx) {
               message: `依赖已解析，开始下载 tarball（${planTotal} 个）`,
             });
             dl = await pull.pullTarballs(ctx, {
-              names, mode: 'selected', selected: targets, concurrency, task,
+              names, mode: 'selected', selected: targets, concurrency, task, plan,
               onProgress: (info) => tasks.update(task.id, {
                 done: info.done, ok: info.ok, failed: info.failed, bytes: info.bytes,
                 packages: info.packages, errors: (info.errors || []).slice(0, 50),

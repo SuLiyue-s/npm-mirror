@@ -126,9 +126,30 @@ function Get-ServiceUrl([string]$Path) {
 
 function Test-Service {
   try {
-    $r = Invoke-WebRequest -UseBasicParsing -Uri (Get-ServiceUrl '/__admin/api/session') -TimeoutSec 2
+    # 超时放宽到 5 秒：服务正在跑「补全部包」这类大任务时，偶发一两次响应慢属于正常忙碌，
+    # 不能因此判定服务已经停止（见下面健康检查里的进程存活二次确认）。
+    $r = Invoke-WebRequest -UseBasicParsing -Uri (Get-ServiceUrl '/__admin/api/session') -TimeoutSec 5
     return [bool]($r.StatusCode -eq 200)
   } catch { return $false }
+}
+
+# 读 data/mirror.pid 里的服务进程 PID（0 表示没有记录）
+function Get-MirrorPid {
+  try {
+    $pidFile = Join-Path $Root 'data\mirror.pid'
+    if (-not (Test-Path $pidFile)) { return 0 }
+    $p = Get-Content $pidFile -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($p -and $p.pid) { return [int]$p.pid }
+  } catch { /* 忽略 */ }
+  return 0
+}
+
+# 服务进程是否真的还活着：健康检查失败时用它做二次确认，
+# 只要进程还活着就绝不能关控制台窗口（关窗口 = 直接杀进程，就是「点关闭后服务被结束」的根因）。
+function Test-MirrorProcessAlive {
+  $p = Get-MirrorPid
+  if (-not $p) { return $false }
+  try { return [bool](Get-Process -Id $p -ErrorAction Stop) } catch { return $false }
 }
 
 # ---------- 命令行窗口 ----------
@@ -377,6 +398,9 @@ $notify.add_MouseClick({
 })
 
 # ---------- 服务健康检查：被外部停止（比如双击「停止镜像源.cmd」）时自动退出 ----------
+# 注意：服务「忙」和「已停止」必须区分开。大任务（如补全部包）期间接口可能连续几秒没响应，
+# 以前 3 次探测失败就直接关控制台窗口，等于把还活着的 node 进程一起杀掉。
+# 现在失败 5 次后先看 data/mirror.pid 里的进程是否真的还在：还活着就只记日志、继续等。
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 4000
 $timer.add_Tick({
@@ -387,8 +411,14 @@ $timer.add_Tick({
     return
   }
   $script:HealthFail++
-  if ($script:HealthFail -ge 3) {
-    Write-TrayLog '检测到服务已停止，托盘自动退出'
+  if ($script:HealthFail -ge 5) {
+    if (Test-MirrorProcessAlive) {
+      Write-TrayLog ('服务响应超时，但进程仍在运行（PID {0}），继续等待，不关闭窗口' -f (Get-MirrorPid))
+      $script:HealthFail = 0
+      if (-not $script:Closing -and $script:Notify) { $script:Notify.Text = ('私人 npm 镜像源 · 运行中（忙碌）') }
+      return
+    }
+    Write-TrayLog '检测到服务已停止（进程已退出），托盘自动退出'
     Stop-Tray -CloseConsole $true
   }
 })

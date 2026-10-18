@@ -132,6 +132,8 @@ commands.help = function () {
     '  node cli.js restart           重启镜像源',
     '  node cli.js status            查看运行状态',
     '  node cli.js open              在浏览器中打开管理界面',
+    '  node cli.js prestart [--port N] [--json] [--no-open]',
+    '                                启动前检查：服务已在本端口运行时不重复启动（启动脚本/开机自启内部使用）',
     '',
     `${C.cyan}配置${C.reset}`,
     '  node cli.js init              初始化配置文件（打印访问令牌）',
@@ -336,6 +338,64 @@ commands.status = async function () {
   }
 };
 
+/* 启动前预检查：给「启动镜像源.cmd」和开机自启用，避免服务已经在跑时还去抢同一个端口。
+ * 退出码约定（脚本据此决定是否继续启动）：
+ *   0  = 没有在运行，可以正常启动；
+ *   10 = 已经在本次要用的端口上运行，不要再启动第二份（也不会再注册第二个托盘）；
+ *   11 = 已经在其它端口上运行——两个实例共用同一个 data 目录不安全，提示用户先停止。 */
+commands.prestart = async function () {
+  const cfg = config.get();
+  const pid = readPid();
+  const wantPort = Number(flags.port) || Number(cfg.server.port) || 4873;
+  const probeHost = (ip) => (!ip || ip === '0.0.0.0' || ip === '::') ? '127.0.0.1' : ip;
+  /** 探测某个端口上是不是本镜像源在跑（能识别本服务即可，不依赖 pid 文件） */
+  const probe = async (port, ip) => {
+    try {
+      const res = await fetch(`http://${probeHost(ip)}:${port}/__admin/api/session`, {
+        headers: { 'X-Mirror-Token': cfg.security.token },
+        signal: AbortSignal.timeout(2000),
+      });
+      const j = await res.json();
+      const d = j && j.ok === true ? j.data : null;
+      return (d && d.version) ? d : null;      // 只认带 version 字段的本镜像响应
+    } catch { return null; }
+  };
+  let live = null;                             // { port, pid, data }
+  if (pid && pidAlive(pid.pid)) {
+    // pid 文件里的进程还活着：端口以它记录的为准（可能启动时用 --port 覆盖过配置）
+    const pidPort = Number(pid.port) || wantPort;
+    live = { port: pidPort, pid: pid.pid, data: await probe(pidPort, pid.ip) };
+  } else {
+    const data = await probe(wantPort, cfg.server.ip);
+    if (data) live = { port: wantPort, pid: Number(data.pid) || 0, data };
+  }
+  const samePort = !!(live && live.port === wantPort);
+  const out = {
+    running: !!live,
+    samePort,
+    wantPort,
+    port: live ? live.port : 0,
+    pid: live ? live.pid : 0,
+    url: live ? `http://${probeHost(cfg.server.ip)}:${live.port}/` : '',
+    configPort: Number(cfg.server.port) || 0,
+  };
+  if (flags.json) {
+    log(JSON.stringify(out));
+  } else if (!live) {
+    log(`${C.dim}服务未在运行：可以正常启动。${C.reset}`);
+  } else if (samePort) {
+    log(`${C.green}● 服务已经在运行${C.reset}：${out.url}（本次启动端口 ${wantPort} 与已运行端口一致，不再重复启动）`);
+  } else {
+    log(`${C.yellow}● 服务已经在其它端口运行${C.reset}：端口 ${live.port}（本次要启动的是 ${wantPort}）。`);
+    log(`  同一个 data 目录不支持同时运行两个实例，请先停止现有服务：node cli.js stop`);
+  }
+  // 已在运行且允许打开界面时，直接打开管理界面（双击启动脚本的用户不用再手动找地址）
+  if (samePort && !flags['no-open'] && !process.env.MIRROR_AUTOSTART) {
+    await commands.open();
+  }
+  if (live) process.exitCode = samePort ? 10 : 11;
+};
+
 commands.stop = async function () {
   const pid = readPid();
   let stopped = false;
@@ -409,7 +469,8 @@ function isMirrorRegistry(value, cfg) {
   const port = String(u.port || (u.protocol === 'https:' ? 443 : 80));
   if (port !== String(cfg.server.port)) return false;
   const host = u.hostname.replace(/^\[|\]$/g, '').toLowerCase();
-  if (['127.0.0.1', 'localhost', '::1', '0.0.0.0'].includes(host)) return true;
+  // 本机回环「整个 127 网段」+ localhost + 监听全部网卡时写的 0.0.0.0 都算本镜像
+  if (host === 'localhost' || host === '0.0.0.0' || util.isLoopback(host)) return true;
   return host === String(cfg.server.ip || '').toLowerCase();
 }
 

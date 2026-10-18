@@ -5,6 +5,28 @@
  * 关键点：跨包并发下载是安全的 —— registry.ensureTarball 内部用 store.withLock(name) 串行化同一包的 packument 写入。
  */
 const fs = require('node:fs');
+const path = require('node:path');
+
+/** 规划时每处理多少个包让出一次事件循环（大规划不能把服务同步卡住十几秒） */
+const PLAN_YIELD_EVERY = 8;
+
+/** 让出一次事件循环：让正在等待的 HTTP 请求（健康检查 / 页面轮询）能插进来 */
+function yieldLoop() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+/**
+ * 用「这一次读到的 packument」计算缺失 tarball 的版本。
+ * 不再调用 store.missingTarballs(name)——那会为了同一份数据再读一次 packument.json。
+ */
+function missingTarballsFrom(store, name, rec) {
+  const versions = Object.keys((rec.packument && rec.packument.versions) || {});
+  const dir = store.tarballDir(name);
+  return versions.filter((v) => {
+    const file = store.tarballFileName(name, v);
+    return !file || !fs.existsSync(path.join(dir, file));
+  });
+}
 
 /**
  * 规划：返回每个包要补哪些版本。
@@ -12,8 +34,12 @@ const fs = require('node:fs');
  * - mode='latest'：只补 dist-tags.latest 指向且本地缺失的那一个版本
  * - mode='all'：补全部本地缺失的版本
  * - mode='selected'：只补 selected（[{name,version}]）里点名且本地缺失的版本
+ *
+ * 异步实现：读 packument 改用 store.getAsync（await IO），并且每处理 PLAN_YIELD_EVERY 个包
+ * 主动让出一次事件循环。此前是同步循环读 1500+ 个包，会让服务整整卡住 9~15 秒，
+ * 连 /-/ping、/session 都来不及响应，托盘健康检查因此误判「服务已停止」并连控制台一起关掉。
  */
-function planTargets(store, names, mode, selected) {
+async function planTargets(store, names, mode, selected) {
   const pick = mode === 'selected';
   const byName = new Map();
   if (pick) {
@@ -27,10 +53,12 @@ function planTargets(store, names, mode, selected) {
   }
   const list = pick ? Array.from(byName.keys()) : names;
   const plan = [];
-  for (const name of list) {
-    const rec = store.get(name);
+  for (let i = 0; i < list.length; i++) {
+    if (i > 0 && i % PLAN_YIELD_EVERY === 0) await yieldLoop();
+    const name = list[i];
+    const rec = await store.getAsync(name);
     if (!rec) { plan.push({ name, target: [], missingCount: 0, missingVersions: 0, error: '本地没有这个包' }); continue; }
-    const missing = store.missingTarballs(name);          // 已缓存元数据但没有 tarball 的版本
+    const missing = missingTarballsFrom(store, name, rec);   // 已缓存元数据但没有 tarball 的版本
     const missingSet = new Set(missing);
     let target;
     if (pick) {
@@ -62,7 +90,7 @@ function planTargets(store, names, mode, selected) {
 /**
  * 并发下载计划内的所有 tarball。
  * @param {object} ctx 伪上下文，需要 { cfg(), store, registry, log }
- * @param {object} opts { names, mode, concurrency, onProgress(info), shouldStop(), task }
+ * @param {object} opts { names, mode, concurrency, onProgress(info), shouldStop(), task, plan? }
  * @returns {Promise<object>} 汇总结果
  */
 async function pullTarballs(ctx, opts) {
@@ -78,7 +106,8 @@ async function pullTarballs(ctx, opts) {
   const cfgConc = Number((cfg.upstream && cfg.upstream.concurrency) || 6);
   const limit = Math.max(1, Math.min(32, Number(opts.concurrency) || cfgConc || 6));
 
-  const plan = planTargets(ctx.store, names, mode, selected);
+  // api.js 已经算好的规划直接复用：避免同一批包在请求处理与任务启动里各规划一次（大镜像会白卡两遍）
+  const plan = Array.isArray(opts.plan) ? opts.plan : await planTargets(ctx.store, names, mode, selected);
   const pkgs = plan.map((p) => ({
     name: p.name, target: p.target.length, done: 0, ok: 0, failed: 0, bytes: 0,
     missing: p.missingCount, totalVersions: p.totalVersions || 0,

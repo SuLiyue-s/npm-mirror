@@ -100,6 +100,10 @@ function readIco(buf) {
       /__admin\/api\/service\/shutdown/.test(tray) && /X-Mirror-Token/.test(tray) && /WM_CLOSE/.test(tray));
     check('服务被外部停止（如双击「停止镜像源.cmd」）时托盘自动退出',
       /HealthFail/.test(tray) && /检测到服务已停止/.test(tray));
+    check('健康检查带「进程存活」保护：服务忙/大任务时只记日志继续等待，绝不关控制台（避免误判把 node 一起杀掉）',
+      /function Get-MirrorPid/.test(tray) && /function Test-MirrorProcessAlive/.test(tray) &&
+      /继续等待，不关闭窗口/.test(tray) && /HealthFail -ge 5/.test(tray) &&
+      /检测到服务已停止（进程已退出）/.test(tray));
     check('等镜像源就绪后才隐藏窗口（启动失败时保留命令行报错）',
       /WaitSeconds/.test(tray) && /Test-Service/.test(tray) && /命令行窗口已隐藏/.test(tray));
     check('顺便把命令行窗口本身的图标也换成项目图标（WM_SETICON）',
@@ -159,6 +163,14 @@ function readIco(buf) {
       /node "%~dp0cli\.js" start %\*/.test(cmdSrc) &&
       /if defined MIRROR_AUTOSTART/.test(cmdSrc) &&
       /data\\logs\\autostart\.log/.test(cmdSrc));
+    check('启动脚本先跑 cli.js prestart 做启动前检查（服务已在运行就不再抢同一个端口）',
+      /cli\.js" prestart/.test(cmdSrc) && /PRESTART_CODE/.test(cmdSrc));
+    check('启动脚本：已在同端口运行（退出码 10）直接结束——不启动第二份、不注册第二个托盘',
+      /"%PRESTART_CODE%"=="10"/.test(cmdSrc) && /本次没有重复启动/.test(cmdSrc) && /exit \/b 0/.test(cmdSrc));
+    check('启动脚本：已在其它端口运行（退出码 11）提示先停止，不强行启动第二份',
+      /"%PRESTART_CODE%"=="11"/.test(cmdSrc) && /已经在其它端口运行/.test(cmdSrc) && /exit \/b 1/.test(cmdSrc));
+    check('开机自启模式下检测到已在运行只写 data\\logs\\autostart.log（隐藏窗口不弹窗、不 pause）',
+      /开机自启检测到镜像源已在运行，跳过本次启动/.test(cmdSrc));
   }
 
   // ---------- 三之二、开机自启 ----------
@@ -172,6 +184,9 @@ function readIco(buf) {
     /启动镜像源\.cmd/.test(cliSrc) && /, 0, False/.test(cliSrc));
   check('开启时清理旧版 .cmd 启动项（升级用户不会登录时同时起来两份）',
     /legacyStartupFile/.test(cliSrc) && /已移除旧版/.test(cliSrc));
+  check('cli.js 提供 prestart 启动前预检查（退出码 0/10/11 + --json，供启动脚本与开机自启判断）',
+    /commands\.prestart = async function/.test(cliSrc) && /process\.exitCode = samePort \? 10 : 11/.test(cliSrc) &&
+    /flags\.json/.test(cliSrc) && /samePort/.test(cliSrc));
   // 真跑一遍：隔离到临时 Startup 目录，不碰用户真正的「启动」文件夹
   const startupDir = fs.mkdtempSync(path.join(os.tmpdir(), 'npm-mirror-startup-'));
   const legacyFile = path.join(startupDir, '私人npm镜像源.cmd');

@@ -2,6 +2,7 @@
 /* 包存储：data/storage/<包名>/{packument.json, meta.json, tarballs/*.tgz}
    全部落在项目目录内，删除/迁移只需拷走 data 目录 */
 const fs = require('node:fs');
+const fsp = require('node:fs/promises');
 const path = require('node:path');
 const {
   ensureDir, readJson, writeJsonAtomic, writeFileAtomic,
@@ -102,6 +103,21 @@ class Store {
     const packument = readJson(this.packumentPath(name), null);
     if (!packument) return null;
     const meta = this.index.get(name) || readJson(this.metaPath(name), null);
+    return { packument, meta: meta || this.buildMeta(name, packument) };
+  }
+
+  /**
+   * get() 的异步版：磁盘读改为 await，避免「一次要读上千个包」的批量规划
+   * 在事件循环里连续做几十秒同步 IO（那会把整个服务卡死，托盘也会误判服务已停止）。
+   * 注意：JSON.parse 仍是同步的（单个包几 MB 时约几十毫秒），调用方需要分批让出事件循环。
+   */
+  async getAsync(name) {
+    if (!isSafePkgName(name)) return null;
+    let text;
+    try { text = await fsp.readFile(this.packumentPath(name), 'utf8'); } catch { return null; }
+    let packument;
+    try { packument = JSON.parse(text); } catch { return null; }
+    const meta = this.index.get(name) || null;
     return { packument, meta: meta || this.buildMeta(name, packument) };
   }
 
