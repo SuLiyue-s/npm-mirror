@@ -171,11 +171,18 @@ async function pullTarballs(ctx, opts) {
   const activeKey = (n, v) => `${n}@${v}`;
   let reportTimer = null;
   let lastReportAt = 0;
+  /* 是否已收尾（resolve 之后不再推任何进度回调）：
+   * 并发数为 1 时，每个任务结束的 done() 都会把 guard 减到 0，
+   * 若此时还没派发完所有任务就 resolve，调用方会把任务标成「已完成」，
+   * 而后台仍在派发后续下载并继续推任务快照，导致任务结束后残留「正在下载」行。
+   * 所以只有「所有任务都派发完」或「已取消」才允许 resolve，并在 resolve 前置位。 */
+  let finished = false;
   const downloadsSnapshot = () => Array.from(active.values()).map(d => ({
     name: d.name, version: d.version, received: d.received, total: d.total, startedAt: d.startedAt,
   }));
 
   const emit = () => {
+    if (finished) return;                // 收尾之后绝不再推进度
     result.downloads = downloadsSnapshot();
     if (typeof opts.onProgress === 'function') {
       try { opts.onProgress(result); } catch (e) { /* 进度回调异常不影响下载 */ }
@@ -184,6 +191,7 @@ async function pullTarballs(ctx, opts) {
   /* 每个数据块都推一次进度会让任务快照更新过于频繁（包清单本身很大），
    * 所以按 400ms 节流；结束 / 开始新下载时用 report(true) 立即推。 */
   function report(immediate) {
+    if (finished) return;
     const now = Date.now();
     if (!immediate && now - lastReportAt < 400) {
       if (!reportTimer) {
@@ -213,9 +221,14 @@ async function pullTarballs(ctx, opts) {
         // 收尾这一刻也要再看一眼取消标志：全部任务已派发、最后一个下载期间按下取消也必须生效
         if (!canceled && typeof opts.shouldStop === 'function' && opts.shouldStop()) canceled = true;
         if (canceled) result.canceled = true;
-        report(true);                    // 结束前把最终字节数推出去
-        if (reportTimer) { clearTimeout(reportTimer); reportTimer = null; }
-        resolve(result);
+        /* 只有「所有任务都派发完」或「已取消」才算真正收尾；否则这里只是当前并发槽空出来，
+         * 外层还会继续 pump() 派发下一个下载，不能提前 resolve（否则任务快照会残留进行中行）。 */
+        if (cursor >= jobs.length || canceled) {
+          report(true);                  // 结束前把最终字节数推出去
+          finished = true;               // 之后再来的进度回调一律丢弃
+          if (reportTimer) { clearTimeout(reportTimer); reportTimer = null; }
+          resolve(result);
+        }
       }
     }
 
@@ -262,8 +275,8 @@ async function pullTarballs(ctx, opts) {
             active.delete(ak);           // 从「正在下载」清单里移除
             report(true);
             done();
-            // 已取消 / 已停止就绝不再取新任务（避免"取消后仍在后台悄悄下载"）
-            if (!canceled && guard < limit && cursor < jobs.length && !(typeof opts.shouldStop === 'function' && opts.shouldStop())) pump();
+            // 已取消 / 已停止 / 已收尾就绝不再取新任务（避免「取消后仍在后台悄悄下载」与结束后残留进度行）
+            if (!finished && !canceled && guard < limit && cursor < jobs.length && !(typeof opts.shouldStop === 'function' && opts.shouldStop())) pump();
           });
       }
       if (guard === 0 && (cursor >= jobs.length || canceled)) {
@@ -272,6 +285,7 @@ async function pullTarballs(ctx, opts) {
           result.canceled = true;
         }
         report(true);
+        finished = true;
         if (reportTimer) { clearTimeout(reportTimer); reportTimer = null; }
         resolve(result);
       }

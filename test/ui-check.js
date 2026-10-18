@@ -1167,8 +1167,13 @@ async function get(p, { json = false } = {}) {
     check('「测试连通性」按钮：把每行地址提交到 POST /upstream/accelerators/test 并逐源展示可用/不可用',
       /text: '测试连通性'/.test(jsAcc2)
         && /api\('\/upstream\/accelerators\/test', \{ method: 'POST', body: \{ urls: lines \}/.test(jsAcc2)
-        && /class: 'acc-row ' \+ \(r\.ok \? 'is-ok' : 'is-bad'\)/.test(jsAcc2),
-      '结果要逐源展示，可用/不可用分别用 is-ok / is-bad 样式');
+        && /class: 'acc-row ' \+ \(r\.ok \? 'is-ok' : 'is-bad'\)/.test(jsAcc2)
+        // 状态行是「未测试 → 正在探测 → N / M 个源可用」的 DOM 节点，必须直接改 textContent；
+        // setText(id, t) 只接受元素 id（内部 getElementById），传节点会静默无效（会一直显示「未测试」）。
+        && /sum\.textContent = '正在并行探测 '/.test(jsAcc2)
+        && /sum\.textContent = results\.length \?/.test(jsAcc2)
+        && !/setText\(sum,/.test(jsAcc2),
+      '结果要逐源展示，可用/不可用分别用 is-ok / is-bad 样式；状态行要用 textContent 更新（不能用只接受 id 的 setText）');
 
     check('后端连通性测试接口：只读探测元数据 + 测试包 tarball（HEAD 失败用 Range 兜底），返回中文原因',
       /rel === '\/upstream\/accelerators\/test' && method === 'POST'/.test(apiAcc2)

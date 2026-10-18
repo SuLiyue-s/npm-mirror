@@ -4315,13 +4315,13 @@
       if (ta.value !== norm) ta.value = norm;   /* 顺手把空行与首尾空白清理掉 */
       if (!lines.length) { toast('请先填写至少一个加速镜像源地址', 'warn'); return; }
       btnBusy(btn, true, '测试中');
-      setText(sum, '正在并行探测 ' + lines.length + ' 个源…');
+      sum.textContent = '正在并行探测 ' + lines.length + ' 个源…';
       clear(list); list.hidden = true;
       api('/upstream/accelerators/test', { method: 'POST', body: { urls: lines }, timeout: 30000 }).then(function (d) {
         btnBusy(btn, false);
         var results = (d && d.results) || [];
         var okCount = results.filter(function (r) { return r.ok; }).length;
-        setText(sum, results.length ? okCount + ' / ' + results.length + ' 个源可用' : '没有可测试的地址');
+        sum.textContent = results.length ? okCount + ' / ' + results.length + ' 个源可用' : '没有可测试的地址';
         if (!results.length) { toast('没有可测试的地址', 'warn'); return; }
         list.hidden = false;
         results.forEach(function (r) {
@@ -4338,7 +4338,7 @@
         toast(okCount === results.length ? '全部 ' + okCount + ' 个加速镜像源可用' : (results.length - okCount) + ' 个加速镜像源不可用', okCount === results.length ? 'ok' : 'warn', 6000);
       }, function (e) {
         btnBusy(btn, false);
-        setText(sum, '测试失败');
+        sum.textContent = '测试失败';
         handleErr(e);
       });
     });
