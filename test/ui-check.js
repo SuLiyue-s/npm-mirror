@@ -1184,6 +1184,46 @@ async function get(p, { json = false } = {}) {
       '接口只做只读探测，不改配置；地址规则与保存配置一致');
   }
 
+  console.log('\x1b[1m九之十一、导出「指定版本」（依赖按所选版本解析）\x1b[0m');
+  {
+    const htmlExp = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
+    const jsExp = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
+    const bundleExp = fs.readFileSync(path.join(__dirname, '..', 'src', 'bundle.js'), 'utf8');
+    const apiExp = fs.readFileSync(path.join(__dirname, '..', 'src', 'api.js'), 'utf8');
+    const cliExp = fs.readFileSync(path.join(__dirname, '..', 'cli.js'), 'utf8');
+    check('迁移页导出表单有「指定版本」多行输入 + 生成模板/清空按钮，且默认随范围隐藏',
+      /id="exp-version-row"/.test(htmlExp) && /id="exp-versions"/.test(htmlExp)
+        && /id="exp-ver-template"/.test(htmlExp) && /id="exp-ver-clear"/.test(htmlExp)
+        && /id="exp-version-row" hidden/.test(htmlExp),
+      '选中包范围才显示「指定版本」输入区');
+    check('前端解析「包名@版本」并随 payload.versions 提交；切到选中包范围时显隐该行',
+      /function parseExportVersionLines\(/.test(jsExp) && /payload\.versions = parsed\.map/.test(jsExp)
+        && /function fillExportVersionTemplate\(/.test(jsExp)
+        && /var vrow = \$\('#exp-version-row'\)/.test(jsExp)
+        && /if \(vrow\) vrow\.hidden = state\.mig\.scope !== 'selected';/.test(jsExp)
+        && /r\.versionFiltered/.test(jsExp),
+      '格式不对的版本行要拦在前端（不白跑任务）');
+    check('bundle 只导出指定版本：白名单 + 依赖按所选版本解析 + packument/meta 裁剪成内存 data 条目',
+      /onlyVersions = null/.test(bundleExp) && /function normalizeVersionFilter\(/.test(bundleExp)
+        && /function collectDepClosureForVersions\(/.test(bundleExp)
+        && /function trimPackumentForVersions\(/.test(bundleExp) && /function trimMetaForVersions\(/.test(bundleExp)
+        && /collectDepClosureForVersions\(store, roots/.test(bundleExp)
+        && /versionFilter: versionFilterSummary/.test(bundleExp)
+        && /EVERSIONMISSING/.test(bundleExp),
+      '点名但本地缺的版本必须报错，不能静默漏导');
+    check('接口层校验 versions：只有 scope=selected 能用；形状不对 400；导出时传 onlyVersions',
+      /只有导出「选中包」时才能指定版本/.test(apiExp)
+        && /normalizeVersionFilter\(body\.versions\)/.test(apiExp)
+        && /onlyVersions: versionPins/.test(apiExp)
+        && /EBADVERSION/.test(apiExp) && /EBADSCOPE/.test(apiExp)
+        && /EVERSIONMISSING/.test(apiExp),
+      '参数校验在启动任务之前完成');
+    check('CLI export 支持 --version/--versions 与位置参数 包名@版本，并打印 versionFilter',
+      /body === 'version' \|\| body === 'versions'/.test(cliExp)
+        && /onlyVersions/.test(cliExp) && /r\.versionFilter/.test(cliExp),
+      '离线机器上也能直接导出精确版本');
+  }
+
   console.log('\x1b[1m十之五、概览页「上游与来源分布」条形图渲染\x1b[0m');
   {
     const jsBars = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');

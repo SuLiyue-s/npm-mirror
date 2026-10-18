@@ -1306,6 +1306,18 @@ async function handleAdmin(ctx) {
     // 镜像里没有的依赖：默认在 cache/proxy 模式下自动下载并入库（离线模式只会提示）；显式 autoFetchDeps:false 可关闭
     const autoFetchDeps = body.autoFetchDeps === undefined ? true : !!body.autoFetchDeps;
     const names = Array.isArray(body.names) ? body.names.filter(n => typeof n === 'string') : [];
+    /* 「只导出指定版本」：只有导出选中包时才能带。支持 {包名:[版本]}、['包名@版本']、
+     * 或前端按行拆出来的「包名@版本」数组；校验规则与 bundle.normalizeVersionFilter 共用一套（超 500 包 / 5000 版本 400）。 */
+    let versionPins = null;
+    if (body.versions !== undefined && body.versions !== null) {
+      if (scope !== 'selected') return fail(res, 400, '只有导出「选中包」时才能指定版本（versions）', 'EBADSCOPE');
+      try {
+        versionPins = ctx.bundle.normalizeVersionFilter(body.versions);
+      } catch (e) {
+        return fail(res, 400, e.message, e.code || 'EBADVERSION');
+      }
+      if (!versionPins) return fail(res, 400, 'versions 里没有有效的「包名@版本」项', 'EBADVERSION');
+    }
     /* progress:true —— 长任务模式：立即返回 taskId，界面用 /tasks/<id> 轮询
      * 「统计 → 打包」两阶段进度、逐包打包详情与「并行打包的每个包」进度条；可取消。 */
     if (body.progress === true) {
@@ -1328,6 +1340,7 @@ async function handleAdmin(ctx) {
               fileName: body.name || body.fileName,
               withDeps,
               autoFetchDeps,
+              onlyVersions: versionPins,
               logger: log,
               isCanceled,
               concurrency: conc,
@@ -1430,6 +1443,7 @@ async function handleAdmin(ctx) {
         fileName: body.name || body.fileName,
         withDeps,
         autoFetchDeps,
+        onlyVersions: versionPins,
         logger: log,
         concurrency: Math.max(1, Number(cfg.storage.bundleExportConcurrency) || 4),
         localScanConcurrency: localScanConcurrency(cfg),
@@ -1437,7 +1451,10 @@ async function handleAdmin(ctx) {
       });
       return ok(res, r);
     } catch (e) {
-      return fail(res, e.code === 'EMPTY' ? 409 : 500, e.message, e.code || 'EEXPORT');
+      // 400：范围/版本参数用法错误；409：没有可导出内容、或点名的版本本地没有且补不到
+      const status = (e.code === 'EBADSCOPE' || e.code === 'EBADVERSION') ? 400
+        : (e.code === 'EMPTY' || e.code === 'EVERSIONMISSING') ? 409 : 500;
+      return fail(res, status, e.message, e.code || 'EEXPORT');
     }
   }
 

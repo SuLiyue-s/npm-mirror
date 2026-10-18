@@ -2526,6 +2526,185 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
     }
   }
 
+  section('六之四之五、只导出指定版本（含依赖按所选版本解析）');
+  {
+    const bundleModVer = require('../src/bundle');
+    const { Store: StoreVer } = require('../src/store');
+    const quietLogVer = { info() {}, warn() {}, error() {}, debug() {} };
+
+    // A) 版本清单解析：对象 / 数组（包名@版本）/ Map 三种写法；非法写法报 EBADVERSION（接口层 400）
+    check('normalizeVersionFilter 支持 {包名: [版本]}、["包名@版本"]、Map<包名, 版本[]> 三种写法',
+      (() => {
+        const a = bundleModVer.normalizeVersionFilter({ 'pkg-aa': ['1.0.0', '2.0.0'] });
+        const b = bundleModVer.normalizeVersionFilter(['pkg-aa@1.0.0', '@scope/pkg-bb@3.1.4']);
+        const c = bundleModVer.normalizeVersionFilter(new Map([['pkg-aa', ['1.0.0']]]));
+        const d = bundleModVer.normalizeVersionFilter(null);
+        return !!a && a.get('pkg-aa').size === 2
+          && !!b && b.get('@scope/pkg-bb').has('3.1.4')
+          && !!c && c.get('pkg-aa').has('1.0.0')
+          && d === null;
+      })(), '三种写法都要能识别，null 表示不指定版本');
+    check('parseVersionSpecLine 用最后一个 @ 切分包名/版本（@scope 包名不误判），缺版本的项返回 null',
+      (() => {
+        const ok = bundleModVer.parseVersionSpecLine('@scope/pkg-bb@1.2.3');
+        const ok2 = bundleModVer.parseVersionSpecLine('pkg-aa@2.0.0');
+        return !!ok && ok.name === '@scope/pkg-bb' && ok.version === '1.2.3'
+          && !!ok2 && ok2.name === 'pkg-aa'
+          && bundleModVer.parseVersionSpecLine('pkg-aa') === null
+          && bundleModVer.parseVersionSpecLine('pkg-aa@') === null;
+      })());
+    const verCodes = [];
+    for (const bad of ['不是对象也不是数组', 42, ['pkg-aa'], [{ name: 'pkg-aa' }]]) {
+      try { bundleModVer.normalizeVersionFilter(bad); verCodes.push('NO_THROW'); } catch (e) { verCodes.push(e.code); }
+    }
+    check('versions 形状不对（字符串/数字/无版本项）统一报 EBADVERSION', verCodes.every((c) => c === 'EBADVERSION'), JSON.stringify(verCodes));
+
+    // B) 临时 Store 端到端：A@1.0.0 依赖 depB ^1.0.0；A@2.0.0 依赖 depB ^2.0.0；depB 有 4 个版本
+    const workVer = fs.mkdtempSync(path.join(os.tmpdir(), 'mirror-version-export-'));
+    const exportedVer = [];
+    try {
+      const stVer = new StoreVer({ dir: path.join(workVer, 'storage'), logger: quietLogVer });
+      await stVer.init();
+      const mkVerPkg = async (name, version, depsMap) => {
+        const srcDir = path.join(workVer, 'src', name, version, 'package');
+        util.ensureDir(srcDir);
+        fs.writeFileSync(path.join(srcDir, 'package.json'), JSON.stringify({ name, version, dependencies: depsMap || {} }));
+        const tgz = path.join(workVer, `${name}-${version}.tgz`);
+        await tar.packTarGz(tgz, [{ name: 'package/package.json', source: path.join(srcDir, 'package.json') }], { gzip: true });
+        return stVer.putTarball(name, version, fs.readFileSync(tgz));
+      };
+      const saveVer = (name, items, latest) => {
+        const versions = {}, files = {}, sizes = {};
+        for (const it of items) {
+          versions[it.version] = {
+            name, version: it.version,
+            dist: { tarball: `${BASE}/${name}/-/${it.put.file}`, integrity: it.put.integrity, shasum: it.put.shasum },
+            ...(it.deps ? { dependencies: it.deps } : {}),
+          };
+          files[it.version] = it.put.file;
+          sizes[it.version] = it.put.sizeBytes;
+        }
+        stVer.save(name, { name, 'dist-tags': { latest: latest || items[items.length - 1].version }, versions },
+          { source: 'private', files, sizes });
+      };
+      const vA = [], vB = [];
+      for (const v of ['1.0.0', '1.5.0', '2.0.0', '2.5.0']) vB.push({ version: v, put: await mkVerPkg('mirror-selftest-verd', v) });
+      saveVer('mirror-selftest-verd', vB);
+      vA.push({ version: '1.0.0', put: await mkVerPkg('mirror-selftest-verc', '1.0.0', { 'mirror-selftest-verd': '^1.0.0' }), deps: { 'mirror-selftest-verd': '^1.0.0' } });
+      vA.push({ version: '2.0.0', put: await mkVerPkg('mirror-selftest-verc', '2.0.0', { 'mirror-selftest-verd': '^2.0.0' }), deps: { 'mirror-selftest-verd': '^2.0.0' } });
+      saveVer('mirror-selftest-verc', vA);
+
+      const rEx1 = await bundleModVer.exportBundle({
+        store: stVer, scope: 'selected', names: ['mirror-selftest-verc'], withDeps: true,
+        autoFetchDeps: false, onlyVersions: { 'mirror-selftest-verc': ['1.0.0'] }, logger: quietLogVer,
+      });
+      exportedVer.push(rEx1.file);
+      check('只导出 A@1.0.0 时，依赖按该版本 dependencies(^1.0.0) 解析：只带 depB 的 1.5.0（不是全部 4 个版本）',
+        rEx1.packages === 2 && rEx1.versions === 2 && rEx1.versionFiltered === true
+          && Array.isArray(rEx1.versionFilter['mirror-selftest-verd'])
+          && rEx1.versionFilter['mirror-selftest-verd'].length === 1
+          && rEx1.versionFilter['mirror-selftest-verd'][0] === '1.5.0',
+        `packages=${rEx1.packages} versions=${rEx1.versions} filter=${JSON.stringify(rEx1.versionFilter)}`);
+
+      const manEx1 = await bundleModVer.readBundleManifest(rEx1.path);
+      const manPkgA = (manEx1.packages || []).find((p) => p.name === 'mirror-selftest-verc');
+      const manPkgB = (manEx1.packages || []).find((p) => p.name === 'mirror-selftest-verd');
+      check('裁剪导出的 manifest：versionFilter 记录精确版本，packages 里的版本列表也只含被导出的版本',
+        !!manEx1.versionFilter && Array.isArray(manEx1.versionFilter['mirror-selftest-verc'])
+          && manEx1.versionFilter['mirror-selftest-verc'][0] === '1.0.0'
+          && !!manPkgA && manPkgA.versions.length === 1
+          && manPkgA.versions[0] && manPkgA.versions[0].version === '1.0.0' && manPkgA.latest === '1.0.0'
+          && !!manPkgB && manPkgB.versions.length === 1
+          && manPkgB.versions[0] && manPkgB.versions[0].version === '1.5.0',
+        JSON.stringify({ filter: manEx1.versionFilter, a: manPkgA && manPkgA.versions, b: manPkgB && manPkgB.versions }));
+
+      const dirVerA = util.safePkgDir('mirror-selftest-verc');
+      const packVerA = JSON.parse((await tar.readTarEntry(rEx1.path, `storage/${dirVerA}/packument.json`)).toString('utf8'));
+      const metaVerA = JSON.parse((await tar.readTarEntry(rEx1.path, `storage/${dirVerA}/meta.json`)).toString('utf8'));
+      check('bundle 里的 packument.json / meta.json 被裁剪成只含 A@1.0.0（dist-tags.latest 同步收敛，不留「指向不存在版本」的悬空 latest）',
+        Object.keys(packVerA.versions).length === 1 && packVerA.versions['1.0.0']
+          && packVerA['dist-tags'].latest === '1.0.0'
+          && Object.keys(metaVerA.files).length === 1 && metaVerA.files['1.0.0']
+          && metaVerA.versionCount === 1,
+        JSON.stringify({ versions: Object.keys(packVerA.versions), tags: packVerA['dist-tags'], files: Object.keys(metaVerA.files), versionCount: metaVerA.versionCount }));
+
+      const rEx2 = await bundleModVer.exportBundle({
+        store: stVer, scope: 'selected', names: ['mirror-selftest-verc'], withDeps: true,
+        autoFetchDeps: false, onlyVersions: { 'mirror-selftest-verc': ['2.0.0'] }, logger: quietLogVer,
+      });
+      exportedVer.push(rEx2.file);
+      check('换一个根版本 A@2.0.0：依赖按 ^2.0.0 解析出 depB 2.5.0（不同版本带不同依赖版本）',
+        Array.isArray(rEx2.versionFilter['mirror-selftest-verd'])
+          && rEx2.versionFilter['mirror-selftest-verd'].length === 1
+          && rEx2.versionFilter['mirror-selftest-verd'][0] === '2.5.0',
+        JSON.stringify(rEx2.versionFilter));
+
+      const rFull = await bundleModVer.exportBundle({
+        store: stVer, scope: 'selected', names: ['mirror-selftest-verc'], withDeps: true,
+        autoFetchDeps: false, logger: quietLogVer,
+      });
+      exportedVer.push(rFull.file);
+      check('不指定版本时保持原行为（A 的 2 个版本 + depB 的 4 个版本全带，共 6 个版本），versionFiltered=false',
+        rFull.packages === 2 && rFull.versions === 6 && rFull.versionFiltered === false, `packages=${rFull.packages} versions=${rFull.versions}`);
+
+      let verErr = null;
+      try {
+        await bundleModVer.exportBundle({
+          store: stVer, scope: 'selected', names: ['mirror-selftest-verc'], withDeps: true,
+          autoFetchDeps: false, onlyVersions: { 'mirror-selftest-verc': ['9.9.9'] }, logger: quietLogVer,
+        });
+      } catch (e) { verErr = e; }
+      check('点名了本地不存在的版本 → EVERSIONMISSING（不静默漏导），错误信息里带包名@版本',
+        !!verErr && verErr.code === 'EVERSIONMISSING' && /mirror-selftest-verc@9\.9\.9/.test(verErr.message || ''),
+        verErr ? `${verErr.code} ${verErr.message}` : '没有抛错');
+
+      let scopeErr = null;
+      try {
+        await bundleModVer.exportBundle({
+          store: stVer, scope: 'all', names: [], withDeps: false, autoFetchDeps: false,
+          onlyVersions: { 'mirror-selftest-verc': ['1.0.0'] }, logger: quietLogVer,
+        });
+      } catch (e) { scopeErr = e; }
+      check('只有导出「选中包」才能指定版本，其它范围 → EBADSCOPE',
+        !!scopeErr && scopeErr.code === 'EBADSCOPE', scopeErr ? scopeErr.code : '没有抛错');
+
+      // C) 裁剪导出的 bundle 仍可正常导入，且导入后本地只有被点名的版本（元数据与 tarball 一致）
+      const stImp = new StoreVer({ dir: path.join(workVer, 'import-storage'), logger: quietLogVer });
+      await stImp.init();
+      await bundleModVer.importBundle({ store: stImp, file: rEx1.path, overwrite: true, logger: quietLogVer, concurrency: 1 });
+      const recImpA = stImp.get('mirror-selftest-verc');
+      const recImpB = stImp.get('mirror-selftest-verd');
+      check('裁剪导出包导入后本地只有被点名的版本，且 tarball 齐全（不会出现「元数据有版本、盘中没 tarball」）',
+        !!recImpA && Object.keys(recImpA.packument.versions).length === 1
+          && !!stImp.tarballPath('mirror-selftest-verc', '1.0.0')
+          && !!recImpB && Object.keys(recImpB.packument.versions).length === 1
+          && !!stImp.tarballPath('mirror-selftest-verd', '1.5.0'),
+        JSON.stringify({ a: recImpA && Object.keys(recImpA.packument.versions), b: recImpB && Object.keys(recImpB.packument.versions) }));
+      await stImp.close();
+    } finally {
+      for (const f of exportedVer) {
+        try { fs.unlinkSync(path.join(util.rootPath('data', 'bundles'), f)); } catch { /* 忽略 */ }
+      }
+      try { fs.rmSync(workVer, { recursive: true, force: true }); } catch { /* 忽略 */ }
+    }
+
+    // D) 接口层参数校验：versions 只能配合 scope=selected；形状/写错直接 400，不启动导出任务
+    const verApiRows = [];
+    for (const body of [
+      { scope: 'all', versions: { 'mirror-selftest-x': ['1.0.0'] } },
+      { scope: 'selected', names: ['mirror-selftest-x'], versions: '不是对象' },
+      { scope: 'selected', names: ['mirror-selftest-x'], versions: ['没有版本号的字符串'] },
+    ]) {
+      const r = await api('/__admin/api/bundles/export', { method: 'POST', body, timeoutMs: 15000 });
+      verApiRows.push({ status: r.status, code: r.json && r.json.code });
+    }
+    check('接口层：versions 配 scope=all 报 400 EBADSCOPE；versions 形状非法报 400 EBADVERSION',
+      verApiRows[0].status === 400 && verApiRows[0].code === 'EBADSCOPE'
+        && verApiRows[1].status === 400 && verApiRows[1].code === 'EBADVERSION'
+        && verApiRows[2].status === 400 && verApiRows[2].code === 'EBADVERSION',
+      JSON.stringify(verApiRows));
+  }
+
   section('六之五、导出/导入并行与「根目录名不是 package」的 tarball');
   {
     const crypto = require('node:crypto');

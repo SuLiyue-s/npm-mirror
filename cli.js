@@ -42,8 +42,15 @@ for (let i = 0; i < raw.length; i++) {
     const body = a.replace(/^-+/, '');
     const eq = body.indexOf('=');
     if (eq >= 0) { flags[body.slice(0, eq)] = body.slice(eq + 1); continue; }
-    if (VALUE_FLAGS.has(body) && raw[i + 1] && !raw[i + 1].startsWith('-')) flags[body] = raw[++i];
-    else flags[body] = true;
+    if (VALUE_FLAGS.has(body) && raw[i + 1] && !raw[i + 1].startsWith('-')) {
+      const v = raw[++i];
+      // --version / --versions 允许重复出现（导出时按版本精确选择）：累积成数组，原本的字符串形态保持不变
+      if (body === 'version' || body === 'versions') {
+        if (flags[body] === undefined) flags[body] = v;
+        else if (Array.isArray(flags[body])) flags[body].push(v);
+        else flags[body] = [flags[body], v];
+      } else flags[body] = v;
+    } else flags[body] = true;
   } else {
     positional.push(a);
   }
@@ -150,8 +157,9 @@ commands.help = function () {
     '                                递归添加：连它的依赖、依赖的依赖一起加进来（npm: 别名会解析到真实包）',
     '  node cli.js remove <包名> [--version 1.2.3] [--yes]   删除包或单个版本',
     '  node cli.js stats             统计包/版本/占用空间',
-    '  node cli.js export [--scope all|private|upstream|selected|added] [--from 时间] [--to 时间] [--out 文件名] [--no-deps] [--no-fetch-deps] [包名...]',
+    '  node cli.js export [--scope all|private|upstream|selected|added] [--from 时间] [--to 时间] [--out 文件名] [--no-deps] [--no-fetch-deps] [包名[@版本]...]',
     '                                导出选中包时默认连带递归依赖；镜像里没有的依赖在 cache/proxy 模式下自动下载入库再打包',
+    '    --versions "vue@3.4.1,react@18.2.0"（或重复写 --version 包名@版本）只导出点名的版本；连带依赖时按这些版本的 dependencies 声明解析出确定版本，导出体积更小',
     '  node cli.js import <文件.tgz|文件.json> [--overwrite]',
     '  node cli.js scan-cache [--cache 目录] [--any-registry] [--refresh]',
     '                                默认只扫描当前上游源的缓存条目；--any-registry 扫描所有源；--refresh 先清空上次结果再全量重扫',
@@ -593,6 +601,52 @@ commands.export = async function () {
   const autoFetchDeps = !flags['no-fetch-deps'];
   const addedFrom = scope === 'added' ? flags.from : undefined;
   const addedTo = scope === 'added' ? flags.to : undefined;
+  /* 「只导出指定版本」：支持 --version 包名@版本（可重复）、--versions "a@1,b@2" 与位置参数 包名@精确版本。
+   * 范围为 ^ / ~ 之类的范围写法会先按本地元数据挑一个满足范围的版本，再作为确定版本导出。 */
+  const pinnedList = [];
+  const pushPin = (spec) => {
+    const s = String(spec == null ? '' : spec).trim();
+    if (!s) return;
+    const at = s.lastIndexOf('@');
+    const name = at > 0 ? s.slice(0, at) : s;
+    const version = at > 0 ? s.slice(at + 1) : null;
+    if (!name || !version) return;
+    pinnedList.push({ name, version });
+  };
+  const flagVersions = [];
+  for (const k of ['version', 'versions']) {
+    if (flags[k] === undefined) continue;
+    const list = Array.isArray(flags[k]) ? flags[k] : [flags[k]];
+    for (const one of list) for (const part of String(one).split(',')) pushPin(part);
+  }
+  for (const spec of positional.slice()) {
+    const at = spec.lastIndexOf('@');
+    if (at > 0) { pushPin(spec); positional[positional.indexOf(spec)] = spec.slice(0, at); }
+  }
+  let onlyVersions = null;
+  if (pinnedList.length) {
+    if (scope !== 'selected') {
+      log(`${C.red}指定 --version 时请配合 --scope selected 使用${C.reset}`);
+      store.close();
+      process.exitCode = 1;
+      return;
+    }
+    onlyVersions = {};
+    for (const pin of pinnedList) {
+      const rec = store.get(pin.name);
+      if (!rec) { log(`${C.yellow}提示：本镜像没有 ${pin.name}，指定版本会被忽略${C.reset}`); continue; }
+      let v = pin.version;
+      if (!rec.packument.versions[v]) {
+        // 范围写法（^1.2.3 / ~1.2 / latest 等）：按本地元数据挑一个满足范围的确定版本
+        const picked = require('./src/deps').pickVersion(rec.packument, v);
+        if (!picked) { log(`${C.red}No version of ${pin.name} satisfies ${v}${C.reset}`); store.close(); process.exitCode = 1; return; }
+        v = picked;
+      }
+      if (!onlyVersions[pin.name]) onlyVersions[pin.name] = [];
+      if (!onlyVersions[pin.name].includes(v)) onlyVersions[pin.name].push(v);
+    }
+    if (!Object.keys(onlyVersions).length) onlyVersions = null;
+  }
   const { Upstream } = require('./src/upstream');
   const registry = require('./src/registry');
   const upstream = new Upstream(() => config.get(), lg);
@@ -609,6 +663,7 @@ commands.export = async function () {
       fileName: flags.out,
       withDeps,
       autoFetchDeps,
+      onlyVersions,
       logger: lg,
       addedFrom,
       addedTo,
@@ -624,6 +679,12 @@ commands.export = async function () {
     });
     log(`${C.green}导出完成${C.reset} ${r.path}`);
     log(`  包含 ${r.packages} 个包 / ${r.versions} 个版本 / ${r.tarballs} 个 tarball，共 ${human(r.sizeBytes)}，耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+    if (r.versionFiltered && r.versionFilter) {
+      const names = Object.keys(r.versionFilter);
+      log(`  只导出指定版本：${names.length} 个包`);
+      for (const n of names.slice(0, 10)) log(`${C.dim}    ${n}@${r.versionFilter[n].join(',')}${C.reset}`);
+      if (names.length > 10) log(`${C.dim}    …其余 ${names.length - 10} 个见返回的 versionFilter${C.reset}`);
+    }
     if (r.withDeps) {
       log(`  连带依赖 ${r.depsAdded} 个${r.depsFetched ? `，其中自动从上游下载 ${r.depsFetched} 个` : ''}`);
       if (r.autoFetch && r.autoFetch.skippedReason) log(`${C.yellow}  提示：${r.autoFetch.skippedReason}${C.reset}`);

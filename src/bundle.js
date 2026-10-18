@@ -158,6 +158,271 @@ function depTargetName(alias, range) {
   return deps.isRegistryRange(r) ? alias : null;
 }
 
+/** 解析「包名@版本」一行文本（scoped 包名 @scope/name 也能识别）；解析失败返回 null */
+function parseVersionSpecLine(line) {
+  const s = String(line == null ? '' : line).trim();
+  if (!s) return null;
+  const at = s.lastIndexOf('@');
+  if (at <= 0) return null;
+  const name = s.slice(0, at).trim();
+  const version = s.slice(at + 1).trim();
+  if (!name || !version || name.endsWith('/') || version.includes('/')) return null;
+  return { name, version };
+}
+
+/**
+ * 把外部传入的「只导出指定版本」规范化为 Map<包名, Set<版本>>。
+ * 接受三种写法：{包名:[版本, ...]} 对象、['包名@版本', ...] 数组、Map<包名, 版本[]>。
+ * 没有有效项返回 null；格式不对抛 EBADVERSION（接口层 400）。
+ */
+function normalizeVersionFilter(onlyVersions) {
+  if (onlyVersions === undefined || onlyVersions === null) return null;
+  const out = new Map();
+  const add = (name, version) => {
+    const n = String(name == null ? '' : name).trim();
+    const v = String(version == null ? '' : version).trim();
+    if (!n || !v) return;
+    if (!out.has(n)) out.set(n, new Set());
+    out.get(n).add(v);
+  };
+  const badError = (msg) => { const e = new Error(msg); e.code = 'EBADVERSION'; e.status = 400; return e; };
+  if (Array.isArray(onlyVersions)) {
+    for (const item of onlyVersions) {
+      if (typeof item === 'string') {
+        const p = parseVersionSpecLine(item);
+        if (!p) throw badError(`无法识别的版本项：${item}（应写成「包名@版本」）`);
+        add(p.name, p.version);
+      } else if (item && typeof item === 'object' && item.name && item.version) {
+        add(item.name, item.version);
+      } else {
+        throw badError(`无法识别的版本项：${JSON.stringify(item)}（应写成「包名@版本」）`);
+      }
+    }
+  } else if (onlyVersions instanceof Map) {
+    for (const [name, list] of onlyVersions) {
+      for (const v of (Array.isArray(list) ? list : [list])) add(name, v);
+    }
+  } else if (typeof onlyVersions === 'object') {
+    for (const [name, list] of Object.entries(onlyVersions)) {
+      for (const v of (Array.isArray(list) ? list : [list])) add(name, v);
+    }
+  } else {
+    throw badError('versions 必须是「{包名: [版本]}」对象或「包名@版本」字符串数组');
+  }
+  if (!out.size) return null;
+  if (out.size > 500) throw badError('一次最多指定 500 个包的版本');
+  let total = 0;
+  for (const set of out.values()) total += set.size;
+  if (total > 5000) throw badError('一次最多指定 5000 个版本');
+  return out;
+}
+
+/** 把 dist-tags 裁剪到只指向 kept 里的版本；latest 缺失时回退到 kept 里的最高版本 */
+function keepDistTags(tags, kept) {
+  const keep = new Set(kept);
+  const out = {};
+  for (const [tag, v] of Object.entries(tags || {})) if (keep.has(v)) out[tag] = v;
+  if (!out.latest) {
+    const sorted = kept.slice().sort(compareVersions);
+    if (sorted.length) out.latest = sorted[sorted.length - 1];
+  }
+  return out;
+}
+
+/** 只导出指定版本时裁剪 packument：versions 只留 kept，dist-tags 去掉悬空项 */
+function trimPackumentForVersions(packument, kept, name) {
+  const versions = {};
+  for (const v of kept) if (packument.versions[v]) versions[v] = packument.versions[v];
+  return {
+    ...packument,
+    name: packument.name || name,
+    versions,
+    'dist-tags': keepDistTags(packument['dist-tags'], kept),
+  };
+}
+
+/** 只导出指定版本时裁剪 meta：latest/files/sizes/origins/deprecated 只留 kept，并标记导出过滤 */
+function trimMetaForVersions(meta, kept, name) {
+  const keep = new Set(kept);
+  const out = { ...(meta || {}) };
+  const filterMap = (m) => {
+    if (!m || typeof m !== 'object' || Array.isArray(m)) return m;
+    const res = {};
+    for (const [k, v] of Object.entries(m)) if (keep.has(k)) res[k] = v;
+    return res;
+  };
+  if (out.files) out.files = filterMap(out.files);
+  if (out.sizes) out.sizes = filterMap(out.sizes);
+  if (out.origins) out.origins = filterMap(out.origins);
+  if (out.deprecated) out.deprecated = filterMap(out.deprecated);
+  out.latest = keepDistTags({ latest: out.latest }, kept).latest;
+  out.versionCount = kept.length;
+  out.exportedVersions = kept.slice().sort(compareVersions);   // 供导入端/排错时识别这是「裁剪过的」包
+  out.name = out.name || name;
+  return out;
+}
+
+/**
+ * 校验「只导出指定版本」里每个版本都真实存在且 tarball 已缓存。
+ * 缺 tarball 时（cache/proxy 模式且有联网上下文）先尝试从上游补齐；仍缺/元数据里没有 → 抛 EVERSIONMISSING（409）。
+ * 原则：用户既然点名要这些版本，就不能默默漏掉——离线包缺版本等于白导出，所以这里宁可失败也不静默跳过。
+ */
+async function checkVersionsAvailable({ ctx, store, roots, versionFilter, localScanConc, logger, emit, isCanceled }) {
+  const names = roots.filter((n) => versionFilter.has(n));
+  const rows = await mapLimit(names, localScanConc, async (name) => {
+    const rec = await store.getAsync(name);
+    if (!rec) {
+      return { name, invalid: Array.from(versionFilter.get(name)).map((v) => ({ name, version: v, reason: '本地没有这个包的元数据' })), missing: [] };
+    }
+    const all = (rec.packument && rec.packument.versions) || {};
+    const invalid = [];
+    const missing = [];
+    for (const v of versionFilter.get(name)) {
+      if (!all[v]) { invalid.push({ name, version: v, reason: '本地元数据里没有这个版本' }); continue; }
+      const abs = store.tarballPath(name, v);
+      if (!abs || !fs.existsSync(abs)) missing.push({ name, version: v, reason: '本地没有这个版本的 tarball' });
+    }
+    return { name, invalid, missing };
+  });
+  const invalidAll = [];
+  const missingJobs = [];
+  for (const row of rows) {
+    if (!row || row.__error) continue;
+    for (const x of (row.invalid || [])) invalidAll.push(x);
+    for (const x of (row.missing || [])) missingJobs.push(x);
+  }
+  const mode = (ctx && typeof ctx.cfg === 'function' && (ctx.cfg() || {}).mode) || 'cache';
+  if (missingJobs.length && ctx && ctx.registry && ctx.upstream && mode !== 'offline') {
+    emit({ phase: 'deps-fetch', status: 'resolve', total: missingJobs.length, done: 0, downloaded: 0, failed: 0, message: `指定版本里有 ${missingJobs.length} 个 tarball 本地没有，正在从上游补齐…` });
+    let doneN = 0;
+    await mapLimit(missingJobs, Math.max(1, Math.min(8, localScanConc)), async (job) => {
+      try {
+        await ctx.registry.ensureTarballEx(ctx, job.name, job.version, { logger });
+      } catch (e) {
+        if (logger && logger.warn) logger.warn(`导出时补齐 tarball 失败 ${job.name}@${job.version}：${(e && e.message) || e}`);
+      }
+      doneN++;
+      emit({ phase: 'deps-fetch', status: 'download', total: missingJobs.length, done: doneN, downloaded: doneN, failed: 0, message: `正在补齐指定版本的 tarball ${doneN} / ${missingJobs.length} 个…` });
+    });
+  }
+  if (isCanceled && isCanceled()) { const e = new Error('导出已取消'); e.code = 'ECANCELED'; throw e; }
+  const stillMissing = [];
+  for (const job of missingJobs) {
+    const abs = store.tarballPath(job.name, job.version);
+    if (!abs || !fs.existsSync(abs)) {
+      stillMissing.push({
+        ...job,
+        reason: mode === 'offline' ? '纯离线模式不会补下载，本地也没有这个版本的 tarball' : '本地没有这个版本的 tarball，且没能从上游下载到',
+      });
+    }
+  }
+  const bad = invalidAll.concat(stillMissing);
+  if (bad.length) {
+    const shown = bad.slice(0, 6).map((x) => `${x.name}@${x.version}（${x.reason}）`).join('、');
+    const err = new Error(`指定的版本无法导出：${shown}${bad.length > 6 ? ` 等 ${bad.length} 个` : ''}`);
+    err.code = 'EVERSIONMISSING';
+    err.status = 409;
+    err.details = bad.slice(0, 200);
+    throw err;
+  }
+}
+
+/**
+ * 按「指定版本」求依赖闭包（导出精确化用）：
+ *  - roots 的版本由 versions 白名单给定；依赖不再取「包里所有版本 dependencies 的并集」，
+ *    而是只按「已经选中/解析出的版本」的 dependencies 逐条解析出确定版本（deps.pickVersion），
+ *    这样连带依赖只带真正需要的版本，导出体积明显变小；
+ *  - 同一个依赖被多个父级用不同范围要求时，取满足各范围的版本并集（最小必要集合）；
+ *  - 只纳入镜像里真实存在的包；缺失的放进 missing（结构同 collectDepClosure）。
+ * 返回 { names, added, missing, versions: Map<包名, Set<版本>> }，versions 含 roots 与依赖各自选中的版本。
+ */
+async function collectDepClosureForVersions(store, roots, { versions = null, max = DEPS_MAX_PACKAGES, concurrency = 8, isCanceled } = {}) {
+  const conc = Math.max(1, Math.min(64, Math.floor(Number(concurrency)) || 8));
+  const cancelErr = () => { const e = new Error('已取消'); e.code = 'ECANCELED'; return e; };
+  const wantVersions = new Map();    // roots 指定的版本（没指定就整个包全部版本）
+  const pickedVersions = new Map();  // 已选版本（含 roots 与依赖解析结果）
+  const rangesOf = new Map();        // 依赖名 -> Set(范围)：所有父级要求的范围
+  const missing = new Map();
+  const visited = new Set();
+  const queue = [];
+  const addPicked = (name, set) => {
+    if (!set || !set.size) return;
+    if (!pickedVersions.has(name)) pickedVersions.set(name, new Set());
+    for (const v of set) pickedVersions.get(name).add(v);
+  };
+  for (const name of roots) {
+    if (visited.has(name)) continue;
+    visited.add(name);
+    const set = versions && versions.get(name) ? new Set(versions.get(name)) : null;
+    if (set) wantVersions.set(name, set);
+    queue.push({ name, root: true });
+  }
+  let added = 0;
+  while (queue.length) {
+    if (isCanceled && isCanceled()) throw cancelErr();
+    const level = queue.splice(0, queue.length);
+    const rows = await mapLimit(level, conc, async (node) => {
+      const rec = await store.getAsync(node.name);
+      if (!rec) return { node, picked: Array.from(wantVersions.get(node.name) || []), deps: [], error: '读取包元数据失败' };
+      const allVersions = rec.packument && rec.packument.versions ? rec.packument.versions : {};
+      const allKeys = Object.keys(allVersions);
+      const picked = new Set();
+      if (node.root) {
+        const want = wantVersions.get(node.name);
+        for (const v of (want ? Array.from(want) : allKeys)) if (allVersions[v]) picked.add(v);
+      } else {
+        for (const range of Array.from(rangesOf.get(node.name) || [])) {
+          const v = deps.pickVersion(rec.packument, range);
+          if (v) picked.add(v);
+          else if (!missing.has(node.name)) missing.set(node.name, { name: node.name, range, parent: node.parent || '' });
+        }
+      }
+      const depsOut = [];
+      for (const v of picked) {
+        const manifest = allVersions[v] || {};
+        const map = manifest.dependencies;
+        if (!map || typeof map !== 'object') continue;
+        for (const alias of Object.keys(map)) {
+          const range = String(map[alias]);
+          const real = depTargetName(alias, range);
+          if (real) depsOut.push({ name: real, range, parent: `${node.name}@${v}` });
+        }
+      }
+      return { node, picked: Array.from(picked), deps: depsOut, error: '' };
+    });
+    for (const row of rows) {
+      if (!row || row.__error) continue;
+      addPicked(row.node.name, new Set(row.picked || []));
+      if (row.error) continue;
+      for (const d of row.deps || []) {
+        if (!store.index.has(d.name)) {
+          if (!missing.has(d.name)) missing.set(d.name, { name: d.name, range: d.range, parent: d.parent });
+          continue;
+        }
+        if (!rangesOf.has(d.name)) rangesOf.set(d.name, new Set());
+        const ranges = rangesOf.get(d.name);
+        const isNewRange = !ranges.has(d.range);
+        ranges.add(d.range);
+        if (!visited.has(d.name)) {
+          if (visited.size >= max) {
+            if (!missing.has(d.name)) missing.set(d.name, { name: d.name, range: d.range, parent: d.parent, reason: `超过连带导出上限（${max} 个包），未纳入` });
+            continue;
+          }
+          visited.add(d.name);
+          added++;
+          queue.push({ name: d.name, root: false, parent: d.parent });
+        } else if (isNewRange) {
+          // 已访问过的包出现了新的范围：可能需要另一个版本，再排一次队补上（collectDepClosureForVersions 的队列合并）
+          queue.push({ name: d.name, root: false, parent: d.parent });
+        }
+      }
+    }
+  }
+  if (isCanceled && isCanceled()) throw cancelErr();
+  const names = Array.from(visited).filter((n) => !roots.includes(n));
+  return { names, added, missing: Array.from(missing.values()), versions: pickedVersions };
+}
+
 /**
  * 求「这批包 + 它们（递归）依赖的包」的闭包。
  * 只纳入镜像里真实存在的包；镜像里没有的放进 missing，回报给前端提示用户先补。
@@ -365,11 +630,14 @@ async function autoFillDeps({ ctx, store, roots, logger, emit = () => {}, isCanc
  *   { phase:'package', name, status:'packed', tarballs, versions, sizeBytes }  某个包的全部条目已写入
  * @param {function} [o.isCanceled] 返回 true 时尽快中止（抛 code=ECANCELED）
  * @param {number} [o.concurrency=1] 打包并发：>1 时起多段 gzip 流共享条目游标并行压缩（产物仍是标准 tar.gz）
+ * @param {object|Array|Map} [o.onlyVersions] 只导出这些版本（仅 scope='selected' 生效）：
+ *   支持 {包名:[版本]}、['包名@版本'] 或 Map<包名, 版本[]>；withDeps 时依赖按这些版本的 dependencies 解析出确定版本，
+ *   只带真正需要的版本（导出体积明显变小）；指定的版本必须存在且 tarball 已缓存，缺的会先尝试从上游补齐，仍缺则报 EVERSIONMISSING
  */
 async function exportBundle({
   store, ctx = null, scope = 'all', names = [], fileName, withDeps = false,
   autoFetchDeps = true, autoDeps = null, logger, onProgress, isCanceled, concurrency = 1,
-  localScanConcurrency = 8,
+  localScanConcurrency = 8, onlyVersions = null,
   addedFrom = null, addedTo = null,
 }) {
   const emit = (ev) => {
@@ -403,17 +671,52 @@ async function exportBundle({
   let depsAdded = 0;
   let missingDeps = [];
   let autoFetch = null;
+  /* 「只导出指定版本」：只对 scope=selected 生效。先把版本白名单收敛到「确实在镜像里」的包，
+   * 再校验这些版本在本地元数据里存在、tarball 已缓存（缺的会先尝试联网补齐），
+   * 否则导入端会以为版本齐全但离线装不上 —— 宁可导出前明确报错，也不静默漏掉用户点名的版本。 */
+  let versionFilter = normalizeVersionFilter(onlyVersions);
+  if (versionFilter && scope !== 'selected') {
+    const err = new Error('只有导出「选中包」时才能指定版本');
+    err.code = 'EBADSCOPE';
+    err.status = 400;
+    throw err;
+  }
+  if (versionFilter) {
+    const kept = new Map();
+    for (const [name, set] of versionFilter) if (targets.includes(name)) kept.set(name, set);
+    versionFilter = kept.size ? kept : null;
+    if (!versionFilter) {
+      const err = new Error('指定的版本没有任何可导出的包（请检查包名是否已经在本镜像里）');
+      err.code = 'EVERSIONMISSING';
+      err.status = 409;
+      throw err;
+    }
+    await checkVersionsAvailable({ ctx, store, roots, versionFilter, localScanConc, logger, emit, isCanceled });
+  }
   if (withDeps && scope === 'selected' && roots.length) {
-    let closure = await collectDepClosure(store, roots, { concurrency: localScanConc, isCanceled });
+    const closureOpts = { concurrency: localScanConc, isCanceled };
+    if (versionFilter) closureOpts.versions = versionFilter;
+    // 指定版本时走「按已选版本解析依赖」的精确闭包；否则保持原来的整包依赖闭包
+    const runClosure = () => (versionFilter
+      ? collectDepClosureForVersions(store, roots, closureOpts)
+      : collectDepClosure(store, roots, closureOpts));
+    let closure = await runClosure();
     // 镜像里没有的依赖：cache/proxy 模式自动从上游下载并入库；离线模式只提示、不下载
     if (autoFetchDeps && closure.missing.length) {
       autoFetch = await autoFillDeps({
         ctx, store, roots, logger, emit, isCanceled,
         opts: { ...(autoDeps || {}), localScanConcurrency: localScanConc },
       });
-      if (!autoFetch.skippedReason) closure = await collectDepClosure(store, roots, { concurrency: localScanConc, isCanceled });
+      if (!autoFetch.skippedReason) closure = await runClosure();
     }
     depsAdded = closure.added;
+    // 依赖闭包按版本解析出的精确版本并入白名单（roots 的指定版本本来就在里面）
+    if (versionFilter && closure.versions) {
+      for (const [name, set] of closure.versions) {
+        if (!versionFilter.has(name)) versionFilter.set(name, new Set(set));
+        else for (const v of set) versionFilter.get(name).add(v);
+      }
+    }
     // 给仍然缺的依赖补一句人话原因，前端/CLI/告警文案直接展示
     missingDeps = closure.missing.map((m) => {
       if (m.reason) return m;
@@ -467,7 +770,13 @@ async function exportBundle({
     const list = [];
     const pkgVersions = [];
     let pkgBytes = 0, pkgTarballs = 0, pkgVersionsN = 0;
-    for (const v of Object.keys(rec.packument.versions || {})) {
+    /* 只导出指定版本时：这个包只遍历/打包被点名的版本；没被点名的包（例如闭包里没有版本信息的旧数据）保持全部版本 */
+    const wantedVersions = versionFilter && versionFilter.get(name) ? versionFilter.get(name) : null;
+    const allVersionKeys = Object.keys(rec.packument.versions || {});
+    const versionList = wantedVersions
+      ? allVersionKeys.filter((v) => wantedVersions.has(v))
+      : allVersionKeys;
+    for (const v of versionList) {
       const file = store.tarballFileName(name, v);
       const abs = store.tarballPath(name, v);
       const entryName = `storage/${dir}/tarballs/${file}`;
@@ -487,8 +796,17 @@ async function exportBundle({
       }
       pkgVersionsN++;
     }
-    list.push({ name: `storage/${dir}/packument.json`, source: store.packumentPath(name) });
-    if (fs.existsSync(store.metaPath(name))) list.push({ name: `storage/${dir}/meta.json`, source: store.metaPath(name) });
+    /* 只导出指定版本时，packument.json / meta.json 也要裁剪成同样只含这些版本：
+     * 否则导入端会以为这个包所有版本都在本地、npm 离线安装时去找不存在的 tarball。
+     * 用内存 Buffer 作为条目数据（tar.writeEntry 支持 data 条目），不用落临时文件。 */
+    if (wantedVersions && versionList.length && versionList.length < allVersionKeys.length) {
+      const kept = versionList.slice().sort(compareVersions);
+      list.push({ name: `storage/${dir}/packument.json`, data: Buffer.from(JSON.stringify(trimPackumentForVersions(rec.packument, kept, name))) });
+      list.push({ name: `storage/${dir}/meta.json`, data: Buffer.from(JSON.stringify(trimMetaForVersions(meta, kept, name))) });
+    } else {
+      list.push({ name: `storage/${dir}/packument.json`, source: store.packumentPath(name) });
+      if (fs.existsSync(store.metaPath(name))) list.push({ name: `storage/${dir}/meta.json`, source: store.metaPath(name) });
+    }
     collectedN++;
     // 统计阶段对大镜像也要有反馈（每个包都要 stat 一遍 tarball）
     if (collectedN % 100 === 0) emit({ phase: 'collect', packages: collectedN, total: targets.length });
@@ -504,7 +822,7 @@ async function exportBundle({
       manifestPkg: {
         name,
         source: meta.source || 'upstream',
-        latest: meta.latest || null,
+        latest: wantedVersions && versionList.length ? versionList.slice().sort(compareVersions).pop() : (meta.latest || null),
         versionCount: pkgVersionsN,
         private: !!meta.private,
         versions: pkgVersions,
@@ -544,6 +862,10 @@ async function exportBundle({
     if (!any) break;
   }
 
+  /* 「只导出指定版本」的最终版本清单（含依赖闭包解析出的精确版本）：写进 manifest，导入端与排错时能看清裁剪了哪些版本 */
+  const versionFilterSummary = versionFilter
+    ? Object.fromEntries(Array.from(versionFilter.entries()).map(([n, set]) => [n, Array.from(set).sort(compareVersions)]))
+    : null;
   const manifest = {
     format: FORMAT,
     formatVersion: FORMAT_VERSION,
@@ -553,6 +875,7 @@ async function exportBundle({
     withDeps: !!withDeps,
     roots,
     addedTimeRange: addedRange ? { from: addedRange.fromIso, to: addedRange.toIso } : null,
+    versionFilter: versionFilterSummary,
     stats: { packages: manifestPackages.length, versions, tarballs, tarballBytes: bytes, depsAdded, depsFetched: autoFetch ? autoFetch.downloaded.length : 0, depsMissing: missingDeps.length },
     // 自动补依赖的结果摘要（失败明细放顶层，限制条数，避免 manifest 过大）
     autoFetch: autoFetch ? {
@@ -675,6 +998,8 @@ async function exportBundle({
     depsFetched: fetchedN,
     missingDeps,
     autoFetch,
+    versionFiltered: !!versionFilter,
+    versionFilter: versionFilterSummary,
   };
 }
 
@@ -1271,6 +1596,7 @@ function listBundles() {
 module.exports = {
   FORMAT, FORMAT_VERSION, bundleDir, exportBundle, importBundle, importTarballFile,
   importPackumentJson, readBundleManifest, listBundles, safeFileName,
-  depTargetName, collectDepClosure, autoFillDeps, AUTO_DEPS, DEPS_MAX_PACKAGES,
+  depTargetName, collectDepClosure, collectDepClosureForVersions, autoFillDeps, AUTO_DEPS, DEPS_MAX_PACKAGES,
+  parseVersionSpecLine, normalizeVersionFilter,
   parseTimeBound, normalizeAddedRange, pkgAddedInRange,
 };

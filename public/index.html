@@ -261,6 +261,15 @@
             <label>选中包</label>
             <div class="muted" id="exp-selected-info">尚未在「包管理」页勾选任何包</div>
           </div>
+          <div class="form-row" id="exp-version-row" hidden>
+            <label for="exp-versions">指定版本</label>
+            <textarea id="exp-versions" class="mono" rows="3" spellcheck="false" placeholder="留空 = 导出选中包的全部本地版本；每行一个 包名@版本，例如：&#10;vue@3.4.1&#10;react@18.2.0"></textarea>
+            <div class="muted">可选：只导出点名的版本（包名可带 @scope）。配合上面的「同时导出依赖」，依赖会按这些版本的 dependencies 声明解析出确定版本，只带真正用到的版本，导出体积明显更小。</div>
+            <div class="row-inline">
+              <button class="btn btn-sm" id="exp-ver-template" type="button">生成模板</button>
+              <button class="btn btn-sm btn-ghost" id="exp-ver-clear" type="button">清空</button>
+            </div>
+          </div>
           <div class="form-row" id="exp-deps-row" hidden>
             <label>依赖</label>
             <label class="checkline"><input type="checkbox" id="exp-with-deps" checked /> 同时导出选中包的依赖（递归）</label>

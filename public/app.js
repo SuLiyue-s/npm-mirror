@@ -3907,6 +3907,45 @@
     return m;
   }
 
+  /* 「只导出指定版本」：把 textarea 每行的「包名@版本」解析成 {包名:[版本]}。
+   * @scope 包名本身带 @，所以用最后一个 @ 切分包名与版本；空行/脏行跳过并在界面上提示。 */
+  function parseExportVersionLines(text) {
+    var map = {};
+    var bad = [];
+    String(text == null ? '' : text).split(/\r?\n/).forEach(function (line) {
+      var s = String(line || '').trim();
+      if (!s) return;
+      var at = s.lastIndexOf('@');
+      var name = at > 0 ? s.slice(0, at).trim() : '';
+      var ver = at > 0 ? s.slice(at + 1).trim() : '';
+      if (!name || !ver || /[\s,]/.test(ver)) { bad.push(s); return; }
+      if (!map[name]) map[name] = [];
+      if (map[name].indexOf(ver) < 0) map[name].push(ver);
+    });
+    return { map: map, bad: bad, count: Object.keys(map).length };
+  }
+
+  /* 「生成模板」：把包管理里勾选的每个包的最新版本各填一行，用户再按需增删版本 */
+  function fillExportVersionTemplate(btn) {
+    var names = selectedNames();
+    if (!names.length) { toast('请先在「包管理」页勾选要导出的包', 'warn'); return; }
+    btnBusy(btn, true, '生成中…');
+    Promise.all(names.slice(0, 100).map(function (name) {
+      return api('/packages/' + encodeURIComponent(name), { timeout: 20000 }).then(function (d) {
+        var latest = d && (d.latest || (d['dist-tags'] && d['dist-tags'].latest));
+        var versions = (d && d.versions) || [];
+        if (!latest && versions.length) latest = versions.map(function (x) { return x && x.version; }).filter(Boolean).sort().pop();
+        return latest ? name + '@' + latest : '';
+      }).catch(function () { return ''; });
+    })).then(function (lines) {
+      var ta = $('#exp-versions');
+      var good = lines.filter(Boolean);
+      if (ta) ta.value = good.join('\n') + (good.length ? '\n' : '');
+      if (good.length) toast('已填入 ' + good.length + ' 个包的最新版本，可自行增删版本行', 'ok', 4000);
+      else toast('没能取到这些包的版本信息', 'warn');
+    }).catch(function (e) { handleErr(e); }).then(function () { btnBusy(btn, false); });
+  }
+
   /* 导出备份：详细进度（统计 → 打包，逐包明细 + 当前包，可取消） */
   function runBundleExport(payload, btn) {
     function statText(d, pct) {
@@ -3991,6 +4030,7 @@
         }
         var msg = '已导出 ' + r.file + '：' + fmtNum(r.packages) + ' 包 / ' + fmtNum(r.versions) + ' 版本 / ' + fmtNum(r.tarballs) + ' tarball / ' + fmtBytes(r.sizeBytes);
         if (payload.scope === 'added') msg = '已按添加时间导出（' + (payload.addedFrom ? '从 ' + dtShort(payload.addedFrom) : '起始不限') + ' 到 ' + (payload.addedTo ? dtShort(payload.addedTo) : '现在') + '）：' + fmtNum(r.packages) + ' 包 / ' + fmtNum(r.versions) + ' 版本 / ' + fmtNum(r.tarballs) + ' tarball / ' + fmtBytes(r.sizeBytes);
+        if (r.versionFiltered && r.versionFilter) msg += '（只导出指定版本：' + fmtNum(Object.keys(r.versionFilter).length) + ' 个包）';
         if (r.depsAdded) msg += '（其中连带依赖 ' + fmtNum(r.depsAdded) + ' 个' + (r.depsFetched ? '，自动下载 ' + fmtNum(r.depsFetched) + ' 个' : '') + '）';
         setText('exp-status', msg);
         toast(msg, 'ok', 9000);
@@ -4786,12 +4826,16 @@
       state.mig.scope = b.getAttribute('data-scope');
       var row = $('#exp-selected-row');
       if (row) row.hidden = state.mig.scope !== 'selected';
+      var vrow = $('#exp-version-row');
+      if (vrow) vrow.hidden = state.mig.scope !== 'selected';
       var drow = $('#exp-deps-row');
       if (drow) drow.hidden = state.mig.scope !== 'selected';
       var arow = $('#exp-added-row');
       if (arow) arow.hidden = state.mig.scope !== 'added';
       paintSelbar();
     });
+    on('exp-ver-template', 'click', function () { fillExportVersionTemplate(this); });
+    on('exp-ver-clear', 'click', function () { var ta = $('#exp-versions'); if (ta) ta.value = ''; });
     /* 「按添加时间」的两个时间框：换成项目风格的自绘日期时间弹层
      * （原生 datetime-local 点开的小日历弹窗是浏览器内部绘制的，改不了样式） */
     ['exp-added-from', 'exp-added-to'].forEach(function (id) {
@@ -4812,6 +4856,13 @@
         payload.withDeps = !(wd && wd.checked === false);
         var af = $('#exp-auto-fetch');
         payload.autoFetchDeps = !(af && af.checked === false);
+        var ta = $('#exp-versions');
+        var parsed = parseExportVersionLines(ta ? ta.value : '');
+        if (parsed.bad.length) {
+          toast('「指定版本」有 ' + parsed.bad.length + ' 行格式不对（应写成 包名@版本）：' + parsed.bad.slice(0, 3).join('、') + (parsed.bad.length > 3 ? ' 等' : ''), 'warn', 9000);
+          return;
+        }
+        if (parsed.count) payload.versions = parsed.map;
       } else if (scope === 'added') {
         /* 「按添加时间」导出：自绘日期时间选择器把本地时间存成 ISO（input.__dtIso）；
          * 两端都空没有意义（等于全部），直接提示；起晚于止也拦在前端，省得白跑一趟任务。 */
@@ -4830,7 +4881,9 @@
         addedLabel = (fShow || '不限') + ' ~ ' + (tShow || '不限');
       }
       var btn = $('#exp-run');
+      var vn = payload.versions ? Object.keys(payload.versions).length : 0;
       if (addedLabel) setText('exp-status', '正在挑选添加时间在 ' + addedLabel + ' 之间的包并打包，包较多时可能耗时较久…');
+      else if (vn) setText('exp-status', '正在按指定版本打包（' + vn + ' 个包' + (payload.withDeps ? ' + 按这些版本解析出的依赖' : '') + '），包较多时可能耗时较久…');
       else setText('exp-status', payload.withDeps ? '正在打包（含递归依赖），包较多时可能耗时较久…' : '正在打包，包较多时可能耗时较久…');
       runBundleExport(payload, btn);
     });
