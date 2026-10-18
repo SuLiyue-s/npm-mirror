@@ -23,6 +23,9 @@ function defaults() {
       acceptAbbreviated: true,     // 使用精简元数据，速度快、体积小
       concurrency: 6,              // 补 tarball 时同时下载的个数（1~32）
       fetchPublishTime: true,      // 是否额外拉完整元数据补齐每个版本的真实发布时间
+      // 加速镜像源列表（可填多个）：包版本元数据仍来自上面的上游源，但下载 tarball 时
+      // 会先并行探测这些镜像，优先从「有这个版本且响应最快」的镜像下载，都没有才回上游源。
+      accelerators: [],
       maxTarballMB: 512,           // 单个 tarball 下载上限（MB）
     },
     security: {
@@ -68,6 +71,28 @@ function safeStorageDir(dir) {
   if (abs === path.parse(abs).root) return 'data/storage';   // 拒绝 C:\ / D:\ 这类根目录
   if (abs.length < 4) return 'data/storage';
   return raw;
+}
+
+/**
+ * 加速镜像源列表规整：只接受 http(s) 地址；统一去掉结尾斜杠、去重（大小写不敏感）、
+ * 排除与主上游相同的地址，最多保留 8 个。非法项直接丢弃，不因为界面填错导致配置写入失败。
+ */
+function safeAccelerators(value, mainRegistry) {
+  const list = Array.isArray(value) ? value : [];
+  const main = String(mainRegistry || '').trim().replace(/\/+$/, '').toLowerCase();
+  const out = [];
+  const seen = new Set();
+  for (const raw of list) {
+    const s = String(raw == null ? '' : raw).trim().replace(/\/+$/, '');
+    if (!/^https?:\/\/[^\s/]+/i.test(s)) continue;
+    if (s.length > 300) continue;
+    const k = s.toLowerCase();
+    if (k === main || seen.has(k)) continue;
+    seen.add(k);
+    out.push(s);
+    if (out.length >= 8) break;
+  }
+  return out;
 }
 
 function deepMerge(base, patch) {
@@ -116,6 +141,8 @@ function sanitize(input) {
     mode: MODES.includes(String(src.mode)) ? String(src.mode) : 'cache',
     upstream: {
       registry: /^https?:\/\//i.test(registry) ? registry : d.upstream.registry,
+      // 加速镜像源列表：类型非法/地址非法会被过滤，排除与主上游重复的地址，最多 8 个
+      accelerators: safeAccelerators(up.accelerators, /^https?:\/\//i.test(registry) ? registry : d.upstream.registry),
       timeoutMs: clampInt(up.timeoutMs, 1000, 600000, d.upstream.timeoutMs),
       retries: clampInt(up.retries, 0, 5, d.upstream.retries),
       prefetchTarball: up.prefetchTarball === true,

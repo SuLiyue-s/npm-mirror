@@ -1613,6 +1613,15 @@ async function handleAdmin(ctx) {
     if (patch.upstream) {
       const u = patch.upstream;
       if (u.registry !== undefined && !/^https?:\/\//i.test(String(u.registry))) return bad('upstream.registry 必须是 http(s) 地址');
+      if (u.accelerators !== undefined) {
+        if (!Array.isArray(u.accelerators)) return bad('upstream.accelerators 必须是地址数组（每行一个）');
+        if (u.accelerators.length > 8) return bad('upstream.accelerators 最多填 8 个加速镜像源');
+        for (const a of u.accelerators) {
+          if (typeof a !== 'string' || !/^https?:\/\/[^\s/]+/i.test(a.trim()) || a.trim().length > 300) {
+            return bad(`加速镜像源地址不合法：${String(a)}（必须是 http(s) 地址）`);
+          }
+        }
+      }
       for (const k of ['timeoutMs', 'retries', 'metadataTtlSec', 'concurrency']) {
         if (u[k] !== undefined && !Number.isFinite(Number(u[k]))) return bad(`upstream.${k} 必须是数字`);
       }

@@ -7,6 +7,7 @@ const {
 } = require('./http-util');
 const { nowIso, compareVersions, maxSatisfying, pkgBaseName, rootPath, isSafeVersion } = require('./util');
 const packumentView = require('./packument');
+const upstreamUtil = require('./upstream');
 
 const NAME_RE = /^(?:@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/i;
 
@@ -260,12 +261,19 @@ async function ensureTarballEx(ctx, name, version, opts) {
       const manifest = rec.packument.versions[version];
       const url = manifest.dist && manifest.dist.tarball;
       if (!url || !/^https?:\/\//i.test(url)) return { path: null, reason: 'no-url' };
+      // 加速镜像源：用上游元数据里的 dist.tarball 路径，换上每个加速镜像的地址。
+      // 下载时并行探测各镜像速度，优先走「有该版本且响应最快」的镜像；全部不可用再回配置的上游源。
+      const mirrors = upstreamUtil.buildMirrorCandidates(cfg.upstream && cfg.upstream.accelerators, url);
       // 校验上游元数据里声明的 integrity/shasum，拒绝内容与元数据不符的 tarball
-      const buf = await ctx.upstream.downloadTarball(url, {
+      const got = await ctx.upstream.downloadTarballPreferred(url, mirrors, {
         expectedIntegrity: manifest.dist.integrity,
         expectedShasum: manifest.dist.shasum,
         onProgress,
       });
+      const buf = got.buf;
+      if (got.source === 'mirror' && ctx.log && typeof ctx.log.debug === 'function') {
+        ctx.log.debug(`tarball ${name}@${version} 来自加速镜像 ${got.mirror}（探测 ${got.probeMs}ms，下载 ${got.ms}ms）`);
+      }
       const info = ctx.store.putTarball(name, version, buf);
       await ctx.store.withLock(name, async () => {
         const r2 = ctx.store.get(name);

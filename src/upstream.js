@@ -97,6 +97,14 @@ function assertSameHost(registry, url, { denyPrivate = false } = {}) {
   if (isPrivateHost(host)) return deny('指向本机或内网地址');
 }
 
+/**
+ * 上游源本身是公网地址时才禁止访问私网（防 SSRF）；
+ * 用户故意把 registry 配成本机/内网地址（局域网私有源）时不能反过来把自己拦死。
+ */
+function registryIsPublic(registryUrl) {
+  try { return !isPrivateHost(new URL(registryUrl).hostname); } catch { return true; }
+}
+
 function cancelBody(res) {
   if (!res) return;
   try {
@@ -282,6 +290,47 @@ function retryAfterMs(value) {
   return 1000;
 }
 
+/** 取 URL 的 pathname（tarball 相对路径），非法 URL 返回空串 */
+function tarballPathOf(tarballUrl) {
+  try {
+    const p = new URL(String(tarballUrl)).pathname;
+    return p && p !== '/' ? p : '';
+  } catch {
+    return '';
+  }
+}
+
+/** URL 的主机名（带端口），用于日志/镜像标签 */
+function hostOfUrl(url) {
+  try { return new URL(String(url)).host; } catch { return ''; }
+}
+
+/**
+ * 根据上游元数据里的 dist.tarball 地址，算出每个加速镜像源上同一 tarball 的下载地址。
+ * 直接复用原始 pathname（保留 @scope/name 与百分号编码），避免自己拼接包名时把 scoped 包拼错。
+ * 配置的加速镜像源会先经过 config.sanitize 规整，这里再做一次兜底过滤。
+ */
+function buildMirrorCandidates(accelerators, tarballUrl) {
+  const pathname = tarballPathOf(tarballUrl);
+  if (!pathname) return [];
+  const list = Array.isArray(accelerators) ? accelerators : [];
+  const out = [];
+  const seen = new Set();
+  for (const raw of list) {
+    const base = String(raw == null ? '' : raw).trim().replace(/\/+$/, '');
+    if (!/^https?:\/\/[^\s/]+/i.test(base)) continue;
+    if (seen.has(base)) continue;
+    seen.add(base);
+    out.push({ url: base + pathname, registry: base, label: hostOfUrl(base) || base });
+  }
+  return out;
+}
+
+function isHeadUnsupported(err) {
+  const status = Number(err && err.status);
+  return status === 403 || status === 405 || status === 501;
+}
+
 class Upstream {
   constructor(cfgProvider, logger) {
     this.cfgProvider = cfgProvider;
@@ -297,7 +346,12 @@ class Upstream {
     return `${this.registry}/${encodeURIComponent(name).replace(/%40/g, '@')}`;
   }
 
-  async request(url, { accept, timeoutMs, retries, method = 'GET', body, headers = {} } = {}) {
+  /**
+   * 发起一次上游请求。
+   * allowedRegistry：允许的重定向目标所属 registry（默认配置里的上游源；加速镜像源时传它自己的地址）。
+   * allowPrivateRedirect：允许重定向到本机/内网（用户自己配置的加速镜像源可能是内网地址，默认只对加速镜像放开）。
+   */
+  async request(url, { accept, timeoutMs, retries, method = 'GET', body, headers = {}, allowedRegistry, allowPrivateRedirect = false } = {}) {
     if (this.offline) {
       const err = new Error('当前为纯离线模式，已禁止访问上游源');
       err.code = 'OFFLINE_MODE';
@@ -355,7 +409,10 @@ class Upstream {
               err.code = 'EREDIRECT';
               throw err;
             }
-            assertSameHost(this.registry, next.href, { denyPrivate: true });
+            const redirectBase = allowedRegistry || this.registry;
+            assertSameHost(redirectBase, next.href, {
+              denyPrivate: !allowPrivateRedirect && registryIsPublic(redirectBase),
+            });
             current = next.href;
             hops++;
             continue;
@@ -458,14 +515,18 @@ class Upstream {
   }
 
   /** 下载并返回 Buffer（小文件用）；带超时、大小上限与完整性校验；onProgress(received, total) 用于实时字节进度 */
-  async downloadTarball(url, { expectedIntegrity, expectedShasum, maxBytes, onProgress } = {}) {
-    assertSameHost(this.registry, url);
+  async downloadTarball(url, { expectedIntegrity, expectedShasum, maxBytes, onProgress, allowedRegistry, allowPrivateRedirect = false } = {}) {
+    const registryBase = allowedRegistry || this.registry;
+    const denyPrivateRedirect = !allowPrivateRedirect && registryIsPublic(registryBase);
+    assertSameHost(registryBase, url);
     const timeout = downloadTimeoutMs(this.cfg);
     const limit = tarballMaxBytes(this.cfg, maxBytes);
-    const { notFound, res } = await this.request(url, { accept: '*/*', retries: 1, timeoutMs: timeout });
+    const { notFound, res } = await this.request(url, {
+      accept: '*/*', retries: 1, timeoutMs: timeout, allowedRegistry, allowPrivateRedirect,
+    });
     if (notFound) throw new Error(`上游 tarball 不存在(404): ${url}`);
     // 手动重定向后 res.url 是最终地址，再校验一次（双保险）
-    try { assertSameHost(this.registry, res.url || url); } catch (e) {
+    try { assertSameHost(registryBase, res.url || url, { denyPrivate: denyPrivateRedirect }); } catch (e) {
       cancelBody(res);
       disposeResponse(res);
       throw e;
@@ -483,6 +544,85 @@ class Upstream {
     }
     verifyDownload(buf, expectedIntegrity, expectedShasum, url, this.log);
     return buf;
+  }
+
+  /**
+   * 探测一个 tarball 地址是否可用、以及响应快慢（用于在多个加速镜像源里挑最快的）。
+   * 优先 HEAD（只拿响应头、不下载 body）；若对方不支持 HEAD（403/405/501），退回 Range GET。
+   * 返回 { ok, status, ms, error? }，永不抛异常。
+   */
+  async probeTarball(url, { allowedRegistry, allowPrivateRedirect = true, timeoutMs } = {}) {
+    const started = Date.now();
+    const probeTimeout = Math.max(1000, Number(timeoutMs) || 4000);
+    try {
+      const { notFound, res } = await this.request(url, {
+        method: 'HEAD', accept: '*/*', retries: 0, timeoutMs: probeTimeout, allowedRegistry, allowPrivateRedirect,
+      });
+      if (notFound) return { ok: false, status: 404, ms: Date.now() - started };
+      cancelBody(res);
+      disposeResponse(res);
+      return { ok: true, status: res.status, ms: Date.now() - started };
+    } catch (e) {
+      if (!isHeadUnsupported(e)) {
+        return { ok: false, status: (e && e.status) || 0, ms: Date.now() - started, error: (e && e.message) || String(e) };
+      }
+      // HEAD 不被支持：用 GET + Range 只要响应头，不读 body
+      try {
+        const { notFound, res } = await this.request(url, {
+          method: 'GET', headers: { range: 'bytes=0-0' }, accept: '*/*', retries: 0, timeoutMs: probeTimeout, allowedRegistry, allowPrivateRedirect,
+        });
+        if (notFound) return { ok: false, status: 404, ms: Date.now() - started };
+        cancelBody(res);
+        disposeResponse(res);
+        return { ok: true, status: res.status, ms: Date.now() - started };
+      } catch (e2) {
+        return { ok: false, status: (e2 && e2.status) || 0, ms: Date.now() - started, error: (e2 && e2.message) || String(e2) };
+      }
+    }
+  }
+
+  /**
+   * 下载 tarball：优先走加速镜像源，最后一个都不可用再回配置的上游源。
+   * mirrors：buildMirrorCandidates() 生成（每项 { url, registry, label }）。
+   * 策略：并行探测所有镜像 → 按耗时升序 → 依次尝试下载（失败自动换下一个）→ 全失败回上游。
+   * 完整性校验始终执行（用上游元数据里的 integrity/shasum），不会因为换源而降低安全性。
+   * 返回 { buf, source: 'mirror'|'upstream', mirror?, url, probeMs?, ms? }。
+   */
+  async downloadTarballPreferred(primaryUrl, mirrors = [], opts = {}) {
+    const list = (Array.isArray(mirrors) ? mirrors : []).filter(m => m && m.url);
+    if (!this.offline && list.length) {
+      const probes = await Promise.all(list.map(m => this.probeTarball(m.url, {
+        allowedRegistry: m.registry, allowPrivateRedirect: true,
+      }).then(p => Object.assign({}, p, m))));
+      const usable = probes.filter(p => p.ok).sort((a, b) => a.ms - b.ms);
+      if (this.log && this.log.debug) {
+        this.log.debug(`加速镜像探测：${probes.map(p => `${p.label}=${p.ok ? p.ms + 'ms' : '不可用'}`).join('，') || '无候选'}`);
+      }
+      for (const m of usable) {
+        try {
+          const started = Date.now();
+          const buf = await this.downloadTarball(m.url, {
+            expectedIntegrity: opts.expectedIntegrity,
+            expectedShasum: opts.expectedShasum,
+            maxBytes: opts.maxBytes,
+            onProgress: opts.onProgress,
+            allowedRegistry: m.registry,
+            allowPrivateRedirect: true,
+          });
+          return { buf, source: 'mirror', mirror: m.label, url: m.url, probeMs: m.ms, ms: Date.now() - started };
+        } catch (e) {
+          if (this.log && this.log.debug) this.log.debug(`加速镜像下载失败（${m.url}）：${e.message}`);
+        }
+      }
+    }
+    const started = Date.now();
+    const buf = await this.downloadTarball(primaryUrl, {
+      expectedIntegrity: opts.expectedIntegrity,
+      expectedShasum: opts.expectedShasum,
+      maxBytes: opts.maxBytes,
+      onProgress: opts.onProgress,
+    });
+    return { buf, source: 'upstream', url: primaryUrl, ms: Date.now() - started };
   }
 
   async search(text, size = 20) {
@@ -513,4 +653,4 @@ class Upstream {
   }
 }
 
-module.exports = { Upstream, integrityOf };
+module.exports = { Upstream, integrityOf, buildMirrorCandidates, tarballPathOf, hostOfUrl };

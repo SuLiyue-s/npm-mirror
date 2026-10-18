@@ -4189,6 +4189,7 @@
     {
       title: '上游', en: 'UPSTREAM', fields: [
         { k: 'upstream.registry', label: '上游 registry', type: 'text' },
+        { k: 'upstream.accelerators', label: '加速镜像源', type: 'lines', hint: '每行一个加速镜像源地址（最多 8 个，填 http(s) 地址，例如 npmmirror 的公共源）。包版本元数据仍从上游源获取；下载 tarball 时先并行探测这些镜像，优先走「有该版本且响应最快」的镜像，所有镜像都没有这个版本再回上游源。' },
         { k: 'upstream.timeoutMs', label: '超时（毫秒）', type: 'number' },
         { k: 'upstream.retries', label: '重试次数', type: 'number' },
         { k: 'upstream.concurrency', label: '「补 tarball」并发下载数', type: 'number', hint: '同时下载几个 tarball，1~32，默认 6；太大可能被上游限速或占用较多内存。也可在「包管理」页选择条里直接改。' },
@@ -4337,6 +4338,17 @@
           item.appendChild(el('label', { text: f.label }));
           item.appendChild(el('div', { class: 'row-inline' }, [input, eye, cp, reset]));
           item.appendChild(el('p', { class: 'hint', text: '令牌只能通过「重置令牌」修改；未显示时无法复制（先点「显示」加载当前令牌）。' }));
+        } else if (f.type === 'lines') {
+          /* 多行文本（每行一个地址）：保存时拆成数组上报，对应后端 config.sanitize 的数组字段 */
+          var lines = Array.isArray(val) ? val : [];
+          input = el('textarea', {
+            class: 'mono', 'data-cfg': f.k, rows: '3',
+            placeholder: '每行一个加速镜像源地址（http(s)）',
+            style: 'width:100%;min-height:64px;resize:vertical'
+          });
+          input.value = lines.join('\n');
+          item.appendChild(el('label', { text: f.label }));
+          item.appendChild(input);
         } else if (f.type === 'number') {
           input = el('input', { type: 'number', class: 'mono', 'data-cfg': f.k, value: val === undefined || val === null ? '' : String(val) });
           item.appendChild(el('label', { text: f.label }));
@@ -4369,9 +4381,15 @@
       var val;
       if (input.type === 'checkbox') val = !!input.checked;
       else if (input.type === 'number') val = input.value === '' ? null : Number(input.value);
-      else val = input.value;
+      else if (input.tagName === 'TEXTAREA') {
+        /* 加速镜像源这类「每行一个」的字段：拆成数组，与后端/默认值（数组）做比较 */
+        val = String(input.value || '').split('\n').map(function (s) { return s.trim(); }).filter(Boolean);
+      } else val = input.value;
       if (input.type === 'number' && val !== null && isNaN(val)) { toast('「' + key + '」需要是数字', 'warn'); return; }
-      if (val !== orig) setPath(payload, key, val);
+      var changed;
+      if (Array.isArray(val) || Array.isArray(orig)) changed = JSON.stringify(val || []) !== JSON.stringify(orig || []);
+      else changed = val !== orig;
+      if (changed) setPath(payload, key, val);
     });
     return payload;
   }

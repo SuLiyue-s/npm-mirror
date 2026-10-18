@@ -1475,6 +1475,148 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
     await roStore.close();
   }
 
+  // ---------------------------------------------------------------- 加速镜像源
+  section('五之十、加速镜像源：配置校验 / 地址推导 / 多源探测与回退（新）');
+  {
+    const http = require('node:http');
+    const { Upstream, buildMirrorCandidates } = require('../src/upstream');
+
+    const before = await api('/__admin/api/config');
+    const beforeAccel = (before.json && before.json.data && before.json.data.config
+      && before.json.data.config.upstream && before.json.data.config.upstream.accelerators) || [];
+    check('配置接口暴露 upstream.accelerators（数组，默认空数组）',
+      before.status === 200 && Array.isArray(beforeAccel),
+      `status=${before.status} accelerators=${JSON.stringify(beforeAccel)}`);
+
+    const putBad1 = await api('/__admin/api/config', { method: 'PUT', body: { upstream: { accelerators: 'https://registry.npmmirror.com' } } });
+    check('加速镜像源必须是数组（传字符串时 400，避免界面传错静默丢配置）',
+      putBad1.status === 400, `status=${putBad1.status} body=${String(putBad1.text).slice(0, 120)}`);
+    const putBad2 = await api('/__admin/api/config', { method: 'PUT', body: { upstream: { accelerators: ['ftp://mirror.example.com'] } } });
+    check('加速镜像源地址必须是 http(s)（拒绝 ftp:// 等）',
+      putBad2.status === 400, `status=${putBad2.status}`);
+    const manyAccel = [];
+    for (let i = 0; i < 9; i++) manyAccel.push(`https://m${i}.example.com`);
+    const putBad3 = await api('/__admin/api/config', { method: 'PUT', body: { upstream: { accelerators: manyAccel } } });
+    check('加速镜像源最多 8 个（超出 400）',
+      putBad3.status === 400, `status=${putBad3.status}`);
+
+    const mainRegistry = (before.json && before.json.data && before.json.data.config
+      && before.json.data.config.upstream && before.json.data.config.upstream.registry)
+      || 'https://registry.npmmirror.com';
+    const putOk = await api('/__admin/api/config', {
+      method: 'PUT',
+      body: { upstream: { accelerators: ['https://mirror.example.com/', 'https://mirror.example.com', mainRegistry] } },
+    });
+    const savedAccel = putOk.json && putOk.json.data && putOk.json.data.config
+      && putOk.json.data.config.upstream && putOk.json.data.config.upstream.accelerators;
+    check('保存加速镜像源会规整：去掉结尾斜杠、去重，并排除与主上游相同的地址',
+      putOk.status === 200 && Array.isArray(savedAccel) && savedAccel.length === 1
+        && savedAccel[0] === 'https://mirror.example.com',
+      `status=${putOk.status} saved=${JSON.stringify(savedAccel)}`);
+
+    const cand = buildMirrorCandidates(
+      ['https://mirror-a.example.com/', 'https://mirror-b.example.com'],
+      'https://registry.npmmirror.com/@scope/pkg/-/pkg-1.0.0.tgz',
+    );
+    check('加速镜像地址 = 镜像源 + 上游 tarball 的 pathname（scoped 包路径完整保留）',
+      cand.length === 2
+        && cand[0].url === 'https://mirror-a.example.com/@scope/pkg/-/pkg-1.0.0.tgz'
+        && cand[0].registry === 'https://mirror-a.example.com'
+        && cand[0].label === 'mirror-a.example.com',
+      JSON.stringify(cand));
+    const cand2 = buildMirrorCandidates(
+      ['', 'ftp://x', 'https://mirror-a.example.com/', 'https://mirror-a.example.com'],
+      'https://r.example.com/a/-/a-1.0.0.tgz',
+    );
+    check('加速镜像地址非法/重复项会被过滤（空串、非 http(s)、同一地址重复）',
+      cand2.length === 1 && cand2[0].url === 'https://mirror-a.example.com/a/-/a-1.0.0.tgz',
+      JSON.stringify(cand2));
+
+    // 本地起 HTTP 服务模拟「加速镜像」与「上游源」，验证优先镜像 + 校验失败/404 回退
+    const quiet = { info() {}, warn() {}, error() {}, debug() {} };
+    const tarballBytes = Buffer.from('fake-tarball-content-for-mirror-test-0123456789', 'utf8');
+    const tarballIntegrity = util.integrityOf(tarballBytes);
+    const tarballShasum = util.sha1hex(tarballBytes);
+    const primaryBytes = Buffer.from('primary-upstream-tarball-bytes-should-be-fallback', 'utf8');
+    let mirrorHits = 0;
+    let primaryHits = 0;
+    let badMirrorHits = 0;
+    const mkServer = (handler) => {
+      const srv = http.createServer(handler);
+      return new Promise((resolve) => srv.listen(0, '127.0.0.1', () => resolve({
+        srv, port: srv.address().port, base: `http://127.0.0.1:${srv.address().port}`,
+      })));
+    };
+    const mirrorSrv = await mkServer((req, res) => {
+      mirrorHits++;
+      if (req.method === 'HEAD') { res.writeHead(200); res.end(); return; }
+      res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': tarballBytes.length });
+      res.end(tarballBytes);
+    });
+    const badMirrorSrv = await mkServer((req, res) => {
+      badMirrorHits++;
+      if (req.method === 'HEAD') { res.writeHead(200); res.end(); return; }
+      const bad = Buffer.from('corrupted-bytes-from-bad-mirror');
+      res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': bad.length });
+      res.end(bad);
+    });
+    const missSrv = await mkServer((req, res) => {
+      res.writeHead(404, { 'content-type': 'text/plain' });
+      res.end('not found');
+    });
+    const primarySrv = await mkServer((req, res) => {
+      primaryHits++;
+      if (req.method === 'HEAD') { res.writeHead(200); res.end(); return; }
+      res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': primaryBytes.length });
+      res.end(primaryBytes);
+    });
+    const primaryUrl = `${primarySrv.base}/pkg/-/pkg-1.0.0.tgz`;
+    const mkUpstream = (accels) => new Upstream(() => ({
+      mode: 'cache',
+      upstream: { registry: primarySrv.base, timeoutMs: 5000, retries: 0, accelerators: accels },
+    }), quiet);
+    try {
+      const gotMirror = await mkUpstream([mirrorSrv.base]).downloadTarballPreferred(
+        primaryUrl, buildMirrorCandidates([mirrorSrv.base], primaryUrl),
+        { expectedIntegrity: tarballIntegrity, expectedShasum: tarballShasum },
+      );
+      check('加速镜像有该版本时优先从镜像下载（source=mirror、内容与校验正确、完全没碰上游源）',
+        gotMirror.source === 'mirror' && gotMirror.buf.equals(tarballBytes) && mirrorHits > 0 && primaryHits === 0,
+        `source=${gotMirror.source} mirrorHits=${mirrorHits} primaryHits=${primaryHits}`);
+
+      const gotBad = await mkUpstream([badMirrorSrv.base]).downloadTarballPreferred(
+        primaryUrl, buildMirrorCandidates([badMirrorSrv.base], primaryUrl),
+        { expectedIntegrity: util.integrityOf(primaryBytes), expectedShasum: util.sha1hex(primaryBytes) },
+      );
+      check('加速镜像返回的内容校验不通过时自动回退上游源（不把坏包写进镜像）',
+        gotBad.source === 'upstream' && gotBad.buf.equals(primaryBytes) && badMirrorHits > 0,
+        `source=${gotBad.source} badMirrorHits=${badMirrorHits}`);
+
+      const gotMiss = await mkUpstream([missSrv.base]).downloadTarballPreferred(
+        primaryUrl, buildMirrorCandidates([missSrv.base], primaryUrl),
+        { expectedIntegrity: util.integrityOf(primaryBytes), expectedShasum: util.sha1hex(primaryBytes) },
+      );
+      check('加速镜像没有该版本（404）时自动回退上游源下载',
+        gotMiss.source === 'upstream' && gotMiss.buf.equals(primaryBytes),
+        `source=${gotMiss.source}`);
+
+      // 没配置加速镜像源时保持原有行为：直接走上游源
+      const primaryHitsBefore = primaryHits;
+      const gotPlain = await mkUpstream([]).downloadTarballPreferred(primaryUrl, [], {
+        expectedIntegrity: util.integrityOf(primaryBytes), expectedShasum: util.sha1hex(primaryBytes),
+      });
+      check('未配置加速镜像源时直接走上游源（保持原有行为）',
+        gotPlain.source === 'upstream' && gotPlain.buf.equals(primaryBytes) && primaryHits > primaryHitsBefore,
+        `source=${gotPlain.source} primaryHits=${primaryHits}`);
+    } finally {
+      for (const s of [mirrorSrv, badMirrorSrv, missSrv, primarySrv]) s.srv.close();
+    }
+
+    const restore = await api('/__admin/api/config', { method: 'PUT', body: { upstream: { accelerators: beforeAccel } } });
+    check('用例结束后恢复原有加速镜像源配置（不给用户留下测试地址）',
+      restore.status === 200, `status=${restore.status}`);
+  }
+
   // ---------------------------------------------------------------- 离线包
   section('六、离线包导出 / 导入（迁移用）');
   let bundleFile = null;

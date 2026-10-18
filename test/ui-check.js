@@ -1092,6 +1092,52 @@ async function get(p, { json = false } = {}) {
       /if \(p\.metadataVersions\) bits\.push\(fmtNum\(p\.metadataVersions\) \+ ' 个仅补元数据'\);/.test(appMic));
   }
 
+  console.log('\x1b[1m九之九、加速镜像源下载 tarball（多源探测优先 + 回退上游）\x1b[0m');
+  {
+    const upstreamSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'upstream.js'), 'utf8');
+    const registrySrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'registry.js'), 'utf8');
+    const configSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'config.js'), 'utf8');
+    const apiSrcAcc = fs.readFileSync(path.join(__dirname, '..', 'src', 'api.js'), 'utf8');
+    const appAcc = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
+
+    check('上游模块支持加速镜像源：地址推导 + HEAD 探测 + 多镜像优先下载，全部不可用再回退上游',
+      /function buildMirrorCandidates\(accelerators, tarballUrl\)/.test(upstreamSrc)
+        && /async probeTarball\(url, \{ allowedRegistry, allowPrivateRedirect = true, timeoutMs \} = \{\}\)/.test(upstreamSrc)
+        && /async downloadTarballPreferred\(primaryUrl, mirrors = \[\], opts = \{\}\)/.test(upstreamSrc)
+        && /\.sort\(\(a, b\) => a\.ms - b\.ms\)/.test(upstreamSrc)
+        && /return \{ buf, source: 'upstream', url: primaryUrl, ms: Date\.now\(\) - started \};/.test(upstreamSrc),
+      '先并行探测所有镜像、按响应耗时排序后逐个尝试下载；镜像都没这个版本/内容校验不过才回上游');
+
+    check('补 tarball 时从配置读取加速镜像源（包版本元数据仍来自上游源）',
+      /buildMirrorCandidates\(cfg\.upstream && cfg\.upstream\.accelerators, url\)/.test(registrySrc)
+        && /downloadTarballPreferred\(url, mirrors, \{/.test(registrySrc)
+        && /来自加速镜像/.test(registrySrc));
+
+    check('配置支持多个加速镜像源（默认空数组；规整为 http(s)、去重、最多 8 个、排除主上游地址）',
+      /accelerators: \[\],/.test(configSrc)
+        && /function safeAccelerators\(value, mainRegistry\)/.test(configSrc)
+        && /if \(k === main \|\| seen\.has\(k\)\) continue;/.test(configSrc)
+        && /if \(out\.length >= 8\) break;/.test(configSrc)
+        && /accelerators: safeAccelerators\(up\.accelerators/.test(configSrc));
+
+    check('配置接口校验加速镜像源（必须是数组、每项 http(s) 地址、最多 8 个）',
+      /if \(u\.accelerators !== undefined\) \{/.test(apiSrcAcc)
+        && /必须是地址数组（每行一个）/.test(apiSrcAcc)
+        && /最多填 8 个加速镜像源/.test(apiSrcAcc)
+        && /加速镜像源地址不合法/.test(apiSrcAcc));
+
+    check('配置页「上游」提供加速镜像源多行输入，保存时拆成数组并参与变更判断',
+      /k: 'upstream\.accelerators', label: '加速镜像源', type: 'lines'/.test(appAcc)
+        && /f\.type === 'lines'/.test(appAcc)
+        && /input\.tagName === 'TEXTAREA'/.test(appAcc)
+        && /JSON\.stringify\(val \|\| \[\]\) !== JSON\.stringify\(orig \|\| \[\]\)/.test(appAcc));
+
+    check('下载加速镜像时按其自身地址做归属校验并允许其重定向（不削弱上游源的 SSRF 防护）',
+      /allowedRegistry, allowPrivateRedirect = false/.test(upstreamSrc)
+        && /function registryIsPublic\(registryUrl\)/.test(upstreamSrc)
+        && /assertSameHost\(registryBase, res\.url \|\| url, \{ denyPrivate: denyPrivateRedirect \}\)/.test(upstreamSrc));
+  }
+
   console.log('\x1b[1m十之五、概览页「上游与来源分布」条形图渲染\x1b[0m');
   {
     const jsBars = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');

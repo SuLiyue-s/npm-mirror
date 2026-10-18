@@ -82,18 +82,29 @@ function readIco(buf) {
       /public\\favicon\.ico/.test(tray) && /\.Icon\s*=/.test(tray));
     check('图标带提示文字（镜像源名 + 运行中的地址）',
       /\.Text\s*=\s*\(\s*'私人 npm 镜像源 · 运行中/.test(tray));
-    check('左键单击 = 打开命令行窗口（MouseClick + Left + 显示窗口）',
-      /add_MouseClick/.test(tray) && /MouseButtons\]::Left/.test(tray) && /Set-ConsoleVisible \$true/.test(tray));
+    check('左键单击 = 打开管理界面（MouseClick + Left + Open-ManagementUi）',
+      /add_MouseClick/.test(tray) && /MouseButtons\]::Left/.test(tray) &&
+      /MouseButtons\]::Left\) \{ \[void\]\(Open-ManagementUi\) \}/.test(tray));
     check('右键菜单每次弹出都按窗口当前状态重建（ContextMenuStrip + Opening + Rebuild-Menu）',
       /ContextMenuStrip/.test(tray) && /add_Opening\(\{\s*Rebuild-Menu\s*\}\)/.test(tray));
-    check('菜单文案：窗口显示中给「隐藏控制台」，隐藏中给「打开控制台」；「打开管理界面」「退出镜像源」始终在',
+    check('菜单文案：窗口显示中给「隐藏控制台」，隐藏中给「打开控制台」；「打开管理界面」「重启镜像源」「退出镜像源」始终在',
       /function Get-MenuLabels/.test(tray) &&
       /\$toggle = if \(\$ConsoleVisible\) \{ '隐藏控制台' \} else \{ '打开控制台' \}/.test(tray) &&
-      /return @\(\$toggle, '打开管理界面', '退出镜像源'\)/.test(tray));
+      /return @\(\$toggle, '打开管理界面', '重启镜像源', '退出镜像源'\)/.test(tray));
     check('右键菜单有「打开管理界面」，点击时用默认浏览器打开网页端管理页面（Start-Process + 服务地址）',
       /function Open-ManagementUi/.test(tray) && /'打开管理界面'/.test(tray) &&
       /Start-Process -FilePath \$url/.test(tray) && /Get-ServiceUrl '\/'/.test(tray) &&
       /openUi\.add_Click\(\{\s*\[void\]\(Open-ManagementUi\)\s*\}\)/.test(tray));
+    check('右键菜单有「重启镜像源」（Restart-MirrorService + 调 /service/restart 接口 + token）',
+      /function Restart-MirrorService/.test(tray) && /'重启镜像源'/.test(tray) &&
+      /add_Click\(\{\s*Restart-MirrorService\s*\}\)/.test(tray) &&
+      /__admin\/api\/service\/restart/.test(tray) && /X-Mirror-Token/.test(tray));
+    check('重启期间健康检查跳过、不会被误判成「服务已停止」而退出托盘（$script:Restarting）',
+      /\$script:Restarting = \$false/.test(tray) && /if \(\$script:Restarting\) \{ return \}/.test(tray) &&
+      /if \(\$script:Restarting\) \{ Write-TrayLog '正在重启中/.test(tray));
+    check('重启完成/失败都有托盘气泡提示与结果日志',
+      /ShowBalloonTip\(3000, '镜像源已重启'/.test(tray) && /重启完成，服务已恢复/.test(tray) &&
+      /重启镜像源失败/.test(tray));
     check('显示/隐藏窗口走 Win32（GetConsoleWindow / ShowWindow / IsWindowVisible）',
       /GetConsoleWindow/.test(tray) && /ShowWindow/.test(tray) && /IsWindowVisible/.test(tray));
     check('「退出镜像源」= 调管理接口优雅停服务（/__admin/api/service/shutdown + token）后再关窗口',
@@ -155,8 +166,8 @@ function readIco(buf) {
     check('启动脚本会拉起托盘宿主（start /b powershell + tools\\tray.ps1，且不传 -Root）',
       /start "" \/b powershell\.exe/.test(cmdLines) && /-File "%~dp0tools\\tray\.ps1"/.test(cmdLines) &&
       !/-Root\s+"%~dp0"/.test(cmdLines));
-    check('启动脚本提示托盘操作（左键打开本窗口 / 右键打开隐藏控制台与退出镜像源）',
-      /左键单击托盘图标/.test(cmdSrc) && /右键单击托盘图标/.test(cmdSrc));
+    check('启动脚本提示托盘操作（左键打开管理界面 / 右键菜单含重启镜像源与退出镜像源）',
+      /左键单击托盘图标 = 打开管理界面/.test(cmdSrc) && /右键单击托盘图标 = .*重启镜像源/.test(cmdSrc));
     check('找不到 PowerShell 时回退为普通窗口（托盘不可用但不影响启动）',
       /where powershell\.exe/.test(cmdSrc) && /托盘图标不可用/.test(cmdSrc));
     check('启动脚本支持参数透传 + 开机自启模式（输出写 data\\logs\\autostart.log，失败不停住）',
@@ -287,13 +298,15 @@ function readIco(buf) {
         // 沙箱/无控制台环境里 GetConsoleWindow() 返回 0 属正常；这里只要求字段是数字且非负
         check('自检能拿到命令行窗口句柄（GetConsoleWindow，无控制台环境为 0 也算正常）',
           typeof data.consoleHwnd === 'number' && data.consoleHwnd >= 0, `hwnd=${data.consoleHwnd}`);
-        check('自检菜单文案：显示中=隐藏控制台+打开管理界面+退出镜像源',
-          Array.isArray(data.visibleMenu) && data.visibleMenu.length === 3 &&
-          data.visibleMenu[0] === '隐藏控制台' && data.visibleMenu[1] === '打开管理界面' && data.visibleMenu[2] === '退出镜像源',
+        check('自检菜单文案：显示中=隐藏控制台+打开管理界面+重启镜像源+退出镜像源',
+          Array.isArray(data.visibleMenu) && data.visibleMenu.length === 4 &&
+          data.visibleMenu[0] === '隐藏控制台' && data.visibleMenu[1] === '打开管理界面' &&
+          data.visibleMenu[2] === '重启镜像源' && data.visibleMenu[3] === '退出镜像源',
           JSON.stringify(data.visibleMenu));
-        check('自检菜单文案：隐藏中=打开控制台+打开管理界面+退出镜像源',
-          Array.isArray(data.hiddenMenu) && data.hiddenMenu.length === 3 &&
-          data.hiddenMenu[0] === '打开控制台' && data.hiddenMenu[1] === '打开管理界面' && data.hiddenMenu[2] === '退出镜像源',
+        check('自检菜单文案：隐藏中=打开控制台+打开管理界面+重启镜像源+退出镜像源',
+          Array.isArray(data.hiddenMenu) && data.hiddenMenu.length === 4 &&
+          data.hiddenMenu[0] === '打开控制台' && data.hiddenMenu[1] === '打开管理界面' &&
+          data.hiddenMenu[2] === '重启镜像源' && data.hiddenMenu[3] === '退出镜像源',
           JSON.stringify(data.hiddenMenu));
         check('自检给出管理界面地址（与当前端口一致）',
           typeof data.managementUrl === 'string' && data.managementUrl === `http://127.0.0.1:${data.servicePort}/`,
