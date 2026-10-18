@@ -1552,17 +1552,90 @@
     var pick = {};                                        // 勾选的版本号（Set 语义，跨页跨筛选保留）
     var missing = versions.filter(function (v) { return !v.cached; }).map(function (v) { return v.version; });
 
+    /* 版本排序：默认「版本 ↑」（接口本来就按 semver 升序返回），其余是快捷排序 */
+    var sortKey = 'version';
+    function verParts(v) {
+      var str = String(v).trim();
+      var plus = str.indexOf('+');
+      if (plus >= 0) str = str.slice(0, plus);            // 忽略 build metadata
+      var dash = str.indexOf('-');
+      var core = dash >= 0 ? str.slice(0, dash) : str;
+      var pre = dash >= 0 ? str.slice(dash + 1) : '';
+      var nums = core.split('.').map(function (x) { return parseInt(x, 10) || 0; });
+      while (nums.length < 3) nums.push(0);
+      return { nums: nums, pre: pre };
+    }
+    /* 预发布标识比较：数字段比数值、数字段比非数字段小、正式版大于同版本预发布 */
+    function cmpPrerelease(a, b) {
+      if (!a && !b) return 0;
+      if (!a) return 1;
+      if (!b) return -1;
+      var pa = a.split('.'), pb = b.split('.');
+      var len = Math.max(pa.length, pb.length);
+      for (var i = 0; i < len; i++) {
+        var x = pa[i], y = pb[i];
+        if (x === undefined) return -1;
+        if (y === undefined) return 1;
+        var nx = /^[0-9]+$/.test(x), ny = /^[0-9]+$/.test(y);
+        if (nx && ny) {
+          var d = Number(x) - Number(y);
+          if (d) return d < 0 ? -1 : 1;
+        } else if (nx) {
+          return -1;
+        } else if (ny) {
+          return 1;
+        } else if (x !== y) {
+          return x < y ? -1 : 1;
+        }
+      }
+      return 0;
+    }
+    function cmpVersion(a, b) {
+      var A = verParts(a), B = verParts(b);
+      for (var i = 0; i < 3; i++) {
+        if (A.nums[i] !== B.nums[i]) return A.nums[i] < B.nums[i] ? -1 : 1;
+      }
+      return cmpPrerelease(A.pre, B.pre);
+    }
+    function cmpSort(a, b) {
+      var d;
+      if (sortKey === 'published' || sortKey === '-published') {
+        var ta = a.publishedAt ? Date.parse(a.publishedAt) : NaN;
+        var tb = b.publishedAt ? Date.parse(b.publishedAt) : NaN;
+        var na = isNaN(ta), nb = isNaN(tb);
+        if (na && nb) return cmpVersion(a.version, b.version);
+        if (na) return 1;                                  // 没有发布时间的始终排最后
+        if (nb) return -1;
+        d = ta - tb;
+        if (sortKey === '-published') d = -d;
+        return d || cmpVersion(a.version, b.version);
+      }
+      if (sortKey === 'size' || sortKey === '-size') {
+        d = Number(a.sizeBytes || 0) - Number(b.sizeBytes || 0);
+        if (sortKey === '-size') d = -d;
+      } else if (sortKey === 'downloads' || sortKey === '-downloads') {
+        d = Number(a.downloads || 0) - Number(b.downloads || 0);
+        if (sortKey === '-downloads') d = -d;
+      } else if (sortKey === '-version') {
+        d = cmpVersion(b.version, a.version);
+      } else {
+        d = cmpVersion(a.version, b.version);
+      }
+      return d || cmpVersion(a.version, b.version);        // 同值再按版本号，保证顺序稳定
+    }
+
     function pickKeys() {
       return Object.keys(pick).filter(function (k) { return pick[k]; });
     }
     function available() {
       var kw = keyword.toLowerCase();
-      return versions.filter(function (v) {
+      var list = versions.filter(function (v) {
         if (filter === 'uncached' && v.cached) return false;
         if (filter === 'cached' && !v.cached) return false;
         if (kw && String(v.version).toLowerCase().indexOf(kw) < 0) return false;
         return true;
       });
+      return list.slice().sort(cmpSort);                  // 过滤后再排序，不影响原始 versions 数组
     }
     function pickItems() {
       var by = {};
@@ -1579,6 +1652,24 @@
 
     var search = el('input', {
       class: 'fill-kw', type: 'search', placeholder: '版本号关键字…', autocomplete: 'off', title: '按版本号包含匹配（忽略大小写）'
+    });
+
+    var sortSel = el('select', { class: 'mini-sel', title: '版本排序方式' });
+    [
+      ['version', '版本 ↑（旧→新）'],
+      ['-version', '版本 ↓（新→旧）'],
+      ['-published', '发布时间 ↓（新→旧）'],
+      ['published', '发布时间 ↑（旧→新）'],
+      ['-size', '本地体积 ↓'],
+      ['-downloads', '下载量 ↓']
+    ].forEach(function (it) {
+      sortSel.appendChild(el('option', { value: it[0], text: it[1] }));
+    });
+    sortSel.value = sortKey;
+    sortSel.addEventListener('change', function () {
+      sortKey = sortSel.value || 'version';
+      page = 1;                                          // 换排序回到第一页
+      go();
     });
 
     var segbox = el('div', { class: 'segbar' });
@@ -1634,6 +1725,7 @@
 
     tools.appendChild(segbox);
     tools.appendChild(search);
+    tools.appendChild(sortSel);
     tools.appendChild(el('span', { class: 'fill-sp' }));
     tools.appendChild(btnAll);
     tools.appendChild(btnNone);
@@ -1642,11 +1734,22 @@
     tools.appendChild(btnLatest);
     tools.appendChild(rangeInfo);
 
+    /* 表头复选框：只作用于「本页」（当前页可见的行），半选表示本页部分勾选 */
+    var chkPage = el('input', {
+      type: 'checkbox', title: '全选本页 / 取消本页勾选',
+      onchange: function () {
+        var on = !!chkPage.checked;
+        pageData.forEach(function (v) { if (on) pick[v.version] = true; else delete pick[v.version]; });
+        updateBar();
+        render();
+      }
+    });
+
     /* 表格 */
     var tb = el('tbody');
     var table = el('table', { class: 'tbl' }, [
       el('thead', {}, [el('tr', {}, [
-        el('th', { class: 'col-chk' }),
+        el('th', { class: 'col-chk' }, [chkPage]),
         el('th', { text: '版本' }),
         el('th', { class: 'num' }, ['本地体积', el('small', { text: '已下载' })]),
         el('th', { class: 'num' }, ['源体积', el('small', { text: '源服务器' })]),
@@ -1750,6 +1853,7 @@
           if (chk.checked) pick[v.version] = true; else delete pick[v.version];
           tr.classList.toggle('is-selected', !!chk.checked);
           updateBar();
+          syncPageChk();
         }
       });
       tr.appendChild(el('td', { class: 'col-chk' }, [chk]));
@@ -1786,6 +1890,18 @@
         })
       ])]));
       return tr;
+    }
+
+    /* 表头复选框三态：全选 / 半选（部分选中）/ 未选；无行时禁用 */
+    function syncPageChk() {
+      var total = pageData.length, sel = 0;
+      pageData.forEach(function (v) { if (pick[v.version]) sel++; });
+      chkPage.disabled = total ? null : true;
+      chkPage.checked = total > 0 && sel === total;
+      chkPage.indeterminate = sel > 0 && sel < total;
+      setTip(chkPage, total
+        ? '全选本页 / 取消本页勾选（本页 ' + total + ' 个版本，已勾选 ' + sel + ' 个）'
+        : '本页没有版本');
     }
 
     function render() {
@@ -1825,6 +1941,7 @@
       note2.textContent = '筛选中：未下载 ' + fmtNum(segNums.uncached) + ' 个 / 已下载 ' + fmtNum(segNums.cached) + ' 个'
         + (filter !== 'all' || keyword ? (' · 当前命中 ' + fmtNum(total) + ' 个') : '');
       updateBar();
+      syncPageChk();
     }
 
     search.addEventListener('input', function () { keyword = search.value.trim(); page = 1; render(); });

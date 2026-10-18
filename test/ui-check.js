@@ -1016,6 +1016,46 @@ async function get(p, { json = false } = {}) {
         && /if \(ev\.phase === 'scan-done'\) \{/.test(apiProg));
   }
 
+  console.log('\x1b[1m九之七、单包详情版本表：表头全选（半选）与快捷排序\x1b[0m');
+  {
+    const pathDet = require('node:path');
+    const fsDet = require('node:fs');
+    const appDet = fsDet.readFileSync(pathDet.join(__dirname, '..', 'public/app.js'), 'utf8');
+
+    check('版本表表头有全选复选框（只作用于本页）：全选 / 未选 / 半选三态由 syncPageChk 维护',
+      /var chkPage = el\('input', \{/.test(appDet)
+        && /el\('th', \{ class: 'col-chk' \}, \[chkPage\]\)/.test(appDet)
+        && /chkPage\.indeterminate = sel > 0 && sel < total;/.test(appDet)
+        && /chkPage\.checked = total > 0 && sel === total;/.test(appDet)
+        && /function syncPageChk\(\)/.test(appDet));
+
+    check('表头复选框 change 时对本页 pageData 批量勾选 / 取消，随后重渲染刷新三态',
+      /onchange: function \(\) \{[\s\S]{0,260}pageData\.forEach\(function \(v\) \{ if \(on\) pick\[v\.version\] = true; else delete pick\[v\.version\]; \}\);/.test(appDet)
+        && /updateBar\(\);\s*\n\s*render\(\);/.test(appDet));
+
+    check('行内勾选变化会同步表头三态，render 结束也同步（翻页 / 筛选 / 排序后状态正确）',
+      /updateBar\(\);\s*\n\s*syncPageChk\(\);/.test(appDet)
+        && /updateBar\(\);\s*\n\s*syncPageChk\(\);\s*\n\s*\}/.test(appDet));
+
+    check('版本表有快捷排序下拉（原生 select 由自绘下拉接管），默认「版本 ↑」保持原顺序',
+      /var sortSel = el\('select', \{ class: 'mini-sel', title: '版本排序方式' \}\)/.test(appDet)
+        && /\['version', '版本 ↑（旧→新）'\]/.test(appDet)
+        && /\['-version', '版本 ↓（新→旧）'\]/.test(appDet)
+        && /\['-published', '发布时间 ↓（新→旧）'\]/.test(appDet)
+        && /\['-size', '本地体积 ↓'\]/.test(appDet)
+        && /\['-downloads', '下载量 ↓'\]/.test(appDet)
+        && /sortKey = sortSel\.value \|\| 'version';/.test(appDet));
+
+    check('切排序回到第 1 页，且只在过滤后的副本上排序（不影响原始 versions 数组）',
+      /page = 1;\s*\/\/ 换排序回到第一页\s*\n\s*go\(\);/.test(appDet)
+        && /return list\.slice\(\)\.sort\(cmpSort\);/.test(appDet));
+
+    check('版本比较按 semver：数字段 / 预发布标识正确排序，正式版大于同版本预发布，缺失发布时间排最后',
+      /function cmpVersion\(a, b\) \{/.test(appDet)
+        && /if \(!a\) return 1;\s*\n\s*if \(!b\) return -1;/.test(appDet)
+        && /if \(na\) return 1;/.test(appDet));
+  }
+
   console.log('\x1b[1m十之五、概览页「上游与来源分布」条形图渲染\x1b[0m');
   {
     const jsBars = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
