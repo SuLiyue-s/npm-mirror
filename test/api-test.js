@@ -2,7 +2,9 @@
 'use strict';
 /*
  * 端到端自检：注册表协议 + 可视化管理 API + 私有包发布/删除 + 离线包导出导入
- * 用法：先启动镜像源，再执行  node test/api-test.js [--base http://127.0.0.1:4873]
+ * 用法：先启动镜像源，再执行  node test/api-test.js [--base 管理界面地址] [--registry-base 镜像源地址]
+ * 默认是「快速模式」：跳过会大量导包 / 全部包补 tarball / 本机 npm 缓存导入等耗时用例；
+ * 改动了导包、补 tarball、缓存导入相关代码、需要完整回归时加 --full（另加 --destructive 含重启/清日志）。
  * 仅使用 fetch，不依赖任何第三方库；测试数据写入镜像源自身的存储，可重复执行。
  */
 const fs = require('node:fs');
@@ -41,6 +43,13 @@ const REG_PORT = Number(REG_URL.port || 80);
 // 破坏性用例（重启服务、清空日志）默认不跑：自检不应替用户重启服务或删掉日志。
 // 需要时显式加 --destructive。
 const DESTRUCTIVE = process.argv.includes('--destructive');
+
+// 快速模式（默认）：跳过会真的向上游导包、全部包补 tarball、从本机 npm 缓存导入等耗时用例。
+// 这些用例会大量占用网络/磁盘并改动镜像数据，日常改 UI/后端/文档时不必每次跑；
+// 改动了导包相关代码、需要完整回归时加 --full。
+const FULL = process.argv.includes('--full');
+const QUICK = !FULL;
+const QUICK_REASON = '快速模式默认跳过（会大量导包/全量规划，耗时且会改动镜像数据）：需要完整回归时加 --full';
 
 const results = [];
 let failures = 0;
@@ -133,6 +142,9 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
   const PRIVATE2 = '@mirror-selftest/scoped-pkg';
 
   process.stdout.write(`\x1b[1m私人 npm 镜像源自检\x1b[0m  管理界面：${BASE}  镜像源：${REG_BASE}\n`);
+  if (QUICK) {
+    process.stdout.write('\x1b[2m（快速模式：跳过「递归添加依赖 / 全部包补 tarball / 本机 npm 缓存导入」等耗时导包用例；完整回归加 --full）\x1b[0m\n');
+  }
 
   // 清理上一轮遗留的「自检专用」数据（mirror-selftest-* 只可能由本脚本创建，删掉是安全的）。
   // 注意：不在开头删 ms / lodash 等真实公共包——它们是用户镜像里的真实数据，
@@ -694,7 +706,9 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
 
   // ---------------------------------------------------------------- 递归添加依赖
   section('五之七、递归添加依赖（依赖的依赖一起加）');
-  {
+  if (QUICK) {
+    skip('五之七、递归添加依赖（依赖的依赖一起加）', QUICK_REASON);
+  } else {
     const deps = require('../src/deps');
 
     // ---- 纯离线单元断言（不联网）----
@@ -1128,7 +1142,9 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
 
   // ---------------------------------------------------------------- 全部包补 tarball
   section('五之八、全部包补 tarball（包管理页「全部包补 dist-tag 版本 / 全部包补最新版本 / 全部包补全部版本」，不用勾选）');
-  {
+  if (QUICK) {
+    skip('五之八、全部包补 tarball（整节）', QUICK_REASON);
+  } else {
     const { Store } = require('../src/store');
     const cfgMod = require('../src/config');
     const pullMod = require('../src/pull');
@@ -1342,6 +1358,10 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
     const ROOT = path.join(__dirname, '..');
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+    // 快速模式跳过这两条耗时用例：会拉全量包名单做规划与事件循环统计（约 15 秒，且不属于导包功能本身）
+    if (QUICK) {
+      skip('五之八之二、全量规划不阻塞服务（大名单规划 / planTargets 异步性）', QUICK_REASON);
+    } else {
     // 1) 全量规划期间服务必须还能响应：修复前规划在请求处理里同步跑完要 9~15 秒，
     //    /session 等健康检查会超时，托盘因此误判「服务已停止」并把控制台窗口一起关掉（连带杀掉 node）。
     const lat = [];
@@ -1407,6 +1427,8 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
       check(`planTargets 是异步规划：${planCount} 个包耗时 ${cost}ms，期间事件循环执行了 ${ticks} 次定时器（同步实现会接近 0）`,
         planOk && ticks >= 3, `plan=${planCount} cost=${cost}ms ticks=${ticks}`);
       await roStore2.close();
+    }
+
     }
 
     // 3) cli.js prestart：给「启动镜像源.cmd」/开机自启用，服务已在同端口运行时不再重复启动
@@ -3572,7 +3594,9 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
 
   // ---------------------------------------------------------------- 缓存导入
   section('八、从本机 npm 缓存导入（离线补包）');
-  {
+  if (QUICK) {
+    skip('八、从本机 npm 缓存导入（离线补包）', QUICK_REASON);
+  } else {
     // anyRegistry=1：本机缓存可能是用别的 registry 产生的（本项目默认 npmjs，而缓存常来自 npmmirror），
     // 自检用「任意来源」模式，避免换配置就扫出 0 个包、后续缓存导入用例被静默跳过。
     const scan = await api('/__admin/api/npmcache/scan?anyRegistry=1', { timeoutMs: 300000 });
