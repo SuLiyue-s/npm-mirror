@@ -5100,6 +5100,8 @@
    * 恢复后 toast 提醒并刷新一次界面，让顶栏、列表、统计都回到最新状态。
    * 点「重启服务」后切到 250ms 快探测 30 秒：服务重启只需要一两秒，
    * 之前 4 秒一次的间隔很可能整段跳过「不可用窗口」，页面就永远看不到断开状态。
+   * 另外每 2 秒轮询一次 /session 的会话标记（pid + startedAt）：服务重启后标记必变，
+   * 就算心跳刚好错过了「不可用窗口」，也能发现重启并自动刷新页面。
    * 服务重启、电脑休眠唤醒、网络恢复都能自动接上。
    * ============================================================ */
   var connDown = false;
@@ -5110,6 +5112,11 @@
   var CONN_POLL_MS = 1000;          // 常规探测间隔
   var CONN_FAST_MS = 250;           // 重启/唤醒等关键时刻的快探测间隔
   var CONN_FAST_WINDOW_MS = 20000;  // 快探测持续时间
+  var CONN_SESSION_POLL_MS = 2000;  // 服务实例标记（pid + startedAt）轮询间隔
+  var connSessionTimer = null;
+  var connSessionPending = false;
+  var connMark = null;              // 上次看到的服务实例标记（pid@startedAt）
+  var connReloading = false;        // 已经决定刷新页面（避免重复 toast / reload）
 
   function setConnState(ok, fails) {
     var chip = $('#chip-conn');
@@ -5121,7 +5128,7 @@
     var txt = $('#chip-conn-text');
     if (txt) txt.textContent = ok ? '已连接' : '连接断开';
     setTip(chip, ok
-      ? '与镜像源服务连接正常（每 1 秒探测一次）'
+      ? '与镜像源服务连接正常（每 1 秒探测一次；服务重启后自动刷新界面）'
       : '与镜像源服务的连接已断开，正在自动重试（每 1 秒一次，已重试 ' + fails + ' 次）；恢复连接后会自动刷新界面');
   }
 
@@ -5135,6 +5142,51 @@
       if (!r.ok) throw new Error('HTTP ' + r.status);
       return r.text();
     }, function (e) { clearTimeout(timer); throw e; });
+  }
+
+  /* 服务实例标记：pid + startedAt。服务重启后这两个值必变，
+   * 用它判定「服务重启过」比等心跳捕获「连不上」的窗口可靠得多
+   * （重启往往一两秒完成，1 秒心跳经常整段跳过）。 */
+  function serverMark(d) {
+    if (!d) return '';
+    if (!d.pid && !d.startedAt) return '';
+    return String(d.pid || '') + '@' + String(d.startedAt || '');
+  }
+
+  function connReloadForRestart() {
+    if (connReloading) return;
+    connReloading = true;
+    setConnState(true, 0);
+    toast('检测到镜像源服务已重启，正在刷新界面…', 'ok', 4000);
+    setTimeout(function () { location.reload(); }, 700);
+  }
+
+  /* 只读轮询 /session 的 pid + startedAt：不经过 api()，避免触发忙碌指示与错误弹窗；
+   * 服务暂时不可用（重启过程中）时静默忽略，等下一轮。 */
+  function connSessionProbe() {
+    if (connReloading || connSessionPending || document.hidden) return;
+    connSessionPending = true;
+    var headers = {}, token = getToken();
+    if (token) headers['X-Mirror-Token'] = token;
+    fetch(API + '/session', { cache: 'no-store', headers: headers })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (j) {
+        var d = j && j.ok ? j.data : null;
+        var mark = serverMark(d);
+        if (!mark) return;
+        if (connMark && mark !== connMark) { connReloadForRestart(); return; }
+        connMark = mark;
+      })
+      .catch(function () { /* 服务不可用 / 未授权：忽略，下一轮再试 */ })
+      .then(function () { connSessionPending = false; });
+  }
+
+  function scheduleConnSession() {
+    if (connSessionTimer) clearTimeout(connSessionTimer);
+    connSessionTimer = setTimeout(function () {
+      connSessionProbe();
+      scheduleConnSession();
+    }, CONN_SESSION_POLL_MS);
   }
 
   function connDelay() {
@@ -5187,10 +5239,18 @@
   function startConnWatch() {
     setConnState(true, 0);
     connTick();
+    /* 会话标记轮询：服务重启（pid / startedAt 变了）后自动刷新界面，
+     * 不依赖「必须刚好探测到不可用窗口」 */
+    connSessionProbe();
+    scheduleConnSession();
     /* 休眠唤醒 / 网络恢复 / 窗口重新聚焦时不等下一个探测周期 */
-    window.addEventListener('online', function () { connBoost(5000); });
-    document.addEventListener('visibilitychange', function () { if (!document.hidden) connBoost(3000); });
-    window.addEventListener('focus', function () { if (connDown) connBoost(3000); });
+    window.addEventListener('online', function () { connBoost(5000); connSessionProbe(); });
+    document.addEventListener('visibilitychange', function () {
+      if (document.hidden) return;
+      connBoost(3000);
+      connSessionProbe();
+    });
+    window.addEventListener('focus', function () { if (connDown) connBoost(3000); connSessionProbe(); });
   }
 
   function init() {

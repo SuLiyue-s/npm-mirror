@@ -509,7 +509,8 @@ textarea{resize:vertical;min-height:66px;line-height:1.6}
 
 /* 迁移页「导出备份」表单：两列网格（标签 | 控件），右列统一铺满。
    这样「指定版本」多行框、自定义文件名输入框、添加时间下拉与两个时间框的右边缘互相对齐；
-   添加时间行改三列网格（时间框 | 至 | 时间框），两个时间框等宽。 */
+   添加时间行单独用三列网格（时间框 | 至 | 时间框），两个时间框等宽；
+   「添加时间口径」下拉单独整行铺满（不能也套时间行的三列网格，否则只会占 1/3 宽）。 */
 .exp-panel .form-row{
   display:grid;grid-template-columns:104px minmax(0,1fr);gap:6px 12px;
   align-items:center;margin-bottom:10px;
@@ -521,9 +522,13 @@ textarea{resize:vertical;min-height:66px;line-height:1.6}
 .exp-panel .form-row>.row-inline{width:100%}
 /* 单行文本框在网格里显式铺满（input 的 width:auto 是浏览器默认尺寸，不会被 stretch 拉满） */
 .exp-panel .form-row>input[type=text],.exp-panel .form-row>textarea{width:100%}
-.exp-panel #exp-added-row .row-inline>input{width:100%}
-.exp-panel #exp-added-row .row-inline{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);align-items:center;gap:8px;flex-wrap:nowrap}
-.exp-panel #exp-added-row .row-inline>.csel,.exp-panel #exp-added-row .row-inline>select{width:100%}
+/* 添加时间口径下拉：整行铺满（自绘下拉的容器和按钮都要拉满） */
+.exp-panel #exp-added-row .exp-added-mode{display:flex;width:100%}
+.exp-panel #exp-added-row .exp-added-mode>.csel{display:flex;flex:1 1 auto;width:100%;min-width:0}
+.exp-panel #exp-added-row .exp-added-mode .csel-btn{width:100%}
+/* 添加时间：时间框 | 至 | 时间框 三列等分 */
+.exp-panel #exp-added-row .exp-added-times{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);align-items:center;gap:8px}
+.exp-panel #exp-added-row .exp-added-times>input{width:100%}
 .exp-panel #exp-added-from,.exp-panel #exp-added-to{max-width:none}
 
 /* 加速镜像源「测试连通性」：按钮 + 汇总 + 逐源结果（可用/不可用、耗时、失败原因） */

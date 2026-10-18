@@ -1261,6 +1261,16 @@ async function get(p, { json = false } = {}) {
         && /if \(connProbing\) \{ scheduleConnTick\(\); return; \}/.test(jsConn),
       '之前 4 秒一次，服务几秒就重启完了，页面根本看不到断开状态');
 
+    check('服务重启检测：轮询 /session 的 pid + startedAt，重启后自动刷新（不依赖刚好探到断开窗口）',
+      /var CONN_SESSION_POLL_MS = 2000;/.test(jsConn)
+        && /function serverMark\(d\) \{/.test(jsConn)
+        && /function connSessionProbe\(\)/.test(jsConn)
+        && /fetch\(API \+ '\/session', \{ cache: 'no-store', headers: headers \}\)/.test(jsConn)
+        && /if \(connMark && mark !== connMark\) \{ connReloadForRestart\(\); return; \}/.test(jsConn)
+        && /检测到镜像源服务已重启，正在刷新界面…/.test(jsConn)
+        && /scheduleConnSession\(\);/.test(jsConn),
+      '之前只靠 1 秒心跳捕获「连接断开」，服务 1~2 秒就重启完时经常什么都看不到');
+
     check('断线时顶栏变红 + toast 提示，并持续自动重试、记录重试次数',
       /setConnState\(false, connFails\)/.test(jsConn)
         && /与镜像源服务的连接已断开，正在自动重试/.test(jsConn)
@@ -1367,13 +1377,15 @@ async function get(p, { json = false } = {}) {
         && /id="exp-name"/.test(htmlExp),
       'textarea 默认宽度只有 20 来个字符，表单右列铺满后宽度才正常');
 
-    check('「添加时间」行与上方口径下拉右边缘对齐，两个时间框等宽',
-      /\.exp-panel #exp-added-row \.row-inline\{display:grid;grid-template-columns:minmax\(0,1fr\) auto minmax\(0,1fr\)/.test(cssExp)
+    check('「添加时间口径」下拉整行铺满；时间行三列网格、两个时间框等宽且右边缘对齐',
+      /\.exp-panel #exp-added-row \.exp-added-mode\{display:flex;width:100%\}/.test(cssExp)
+        && /\.exp-panel #exp-added-row \.exp-added-mode \.csel-btn\{width:100%\}/.test(cssExp)
+        && /\.exp-panel #exp-added-row \.exp-added-times\{display:grid;grid-template-columns:minmax\(0,1fr\) auto minmax\(0,1fr\)/.test(cssExp)
         && /\.exp-panel #exp-added-from,\.exp-panel #exp-added-to\{max-width:none\}/.test(cssExp)
-        && /id="exp-added-by"/.test(htmlExp)
-        && /id="exp-added-from"/.test(htmlExp)
-        && /id="exp-added-to"/.test(htmlExp),
-      '原来两个时间框各限宽 250px，右侧边与上方下拉对不齐、两框宽度也可能不同');
+        && /class="row-inline exp-added-mode"/.test(htmlExp)
+        && /class="row-inline exp-added-times"/.test(htmlExp)
+        && /id="exp-added-by"/.test(htmlExp),
+      '上一版把口径下拉也套进了时间行的三列网格，导致下拉只占 1/3 宽（用户实测变窄）');
   }
 
   console.log('\x1b[1m十之五、概览页「上游与来源分布」条形图渲染\x1b[0m');
