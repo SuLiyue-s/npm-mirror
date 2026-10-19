@@ -27,21 +27,121 @@ pub fn exe_dir() -> PathBuf {
     .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// 桌面配置目录：%LOCALAPPDATA%\LiYueNpmMirror
-/// 测试环境可用环境变量 MIRROR_DESKTOP_HOME 覆盖（避免沙箱无法写 LOCALAPPDATA 时无法冒烟）。
-pub fn home_dir() -> PathBuf {
+/// 桌面配置目录候选（带说明，用于回退告警与引导提示）。
+struct HomeCandidate {
+  /// 人类可读的目录用途说明
+  label: &'static str,
+  path: PathBuf,
+  /// 是否为首选目录（%LOCALAPPDATA%\LiYueNpmMirror）
+  preferred: bool,
+}
+
+/// 桌面配置目录解析结果。
+pub struct HomeResolution {
+  /// 实际使用的配置目录
+  pub path: PathBuf,
+  /// 是否发生了回退（未使用首选用户配置目录）
+  pub fallback: bool,
+  /// 逐个候选探测失败的说明（含系统错误），供日志/冒烟报告/引导提示使用
+  pub warnings: Vec<String>,
+}
+
+/// 探测目录是否可写：创建目录 + 写/删报告探针文件。
+fn probe_writable(dir: &Path) -> Result<(), String> {
+  fs::create_dir_all(dir).map_err(|err| format!("创建目录失败：{err}"))?;
+  let probe = dir.join(format!(".write-probe-{}", std::process::id()));
+  let write_result = (|| -> std::io::Result<()> {
+    let mut file = fs::OpenOptions::new()
+      .write(true)
+      .create(true)
+      .truncate(true)
+      .open(&probe)?;
+    file.write_all(b"ok")?;
+    file.flush()
+  })();
+  let _ = fs::remove_file(&probe);
+  write_result.map_err(|err| format!("写入探针失败：{err}"))
+}
+
+/// 解析桌面配置目录。顺序：
+/// ① MIRROR_DESKTOP_HOME（设置则权威，不可用直接报清晰错误）
+/// ② %LOCALAPPDATA%\LiYueNpmMirror（首选）
+/// ③ <exe 目录>\LiYueNpmMirror
+/// ④ %TEMP%\LiYueNpmMirror
+/// ⑤ <exe 目录>\.LiYueNpmMirror
+///
+/// 例外环境（DSH 沙箱、预览面板等受限 token）写不了 %LOCALAPPDATA% 时自动回退，
+/// 不再让程序在启动阶段直接失败；回退情况通过 fallback/warnings 暴露给日志与提示框。
+pub fn effective_home() -> Result<HomeResolution, String> {
+  // 环境变量显式指定时视为权威：不可写则明确报错，不静默改用其它目录
   if let Some(value) = std::env::var_os("MIRROR_DESKTOP_HOME") {
     if !value.is_empty() {
-      return PathBuf::from(value);
+      let dir = PathBuf::from(value);
+      return match probe_writable(&dir) {
+        Ok(()) => Ok(HomeResolution {
+          path: dir,
+          fallback: false,
+          warnings: Vec::new(),
+        }),
+        Err(err) => Err(format!(
+          "环境变量 MIRROR_DESKTOP_HOME 指定的配置目录不可用 {}：{err}",
+          dir.display()
+        )),
+      };
     }
   }
+
+  let mut candidates: Vec<HomeCandidate> = Vec::new();
   if let Some(base) = std::env::var_os("LOCALAPPDATA") {
     if !base.is_empty() {
-      return PathBuf::from(base).join("LiYueNpmMirror");
+      candidates.push(HomeCandidate {
+        label: "用户配置目录",
+        path: PathBuf::from(base).join("LiYueNpmMirror"),
+        preferred: true,
+      });
     }
   }
-  // 极端兜底：与 exe 同目录（只用于环境变量缺失的非常规环境）
-  exe_dir().join(".LiYueNpmMirror")
+  candidates.push(HomeCandidate {
+    label: "程序目录配置目录",
+    path: exe_dir().join("LiYueNpmMirror"),
+    preferred: false,
+  });
+  if let Some(temp) = std::env::var_os("TEMP") {
+    if !temp.is_empty() {
+      candidates.push(HomeCandidate {
+        label: "临时目录配置目录",
+        path: PathBuf::from(temp).join("LiYueNpmMirror"),
+        preferred: false,
+      });
+    }
+  }
+  candidates.push(HomeCandidate {
+    label: "程序目录备用配置目录",
+    path: exe_dir().join(".LiYueNpmMirror"),
+    preferred: false,
+  });
+
+  let mut warnings: Vec<String> = Vec::new();
+  for candidate in &candidates {
+    match probe_writable(&candidate.path) {
+      Ok(()) => {
+        return Ok(HomeResolution {
+          path: candidate.path.clone(),
+          fallback: !candidate.preferred,
+          warnings,
+        })
+      }
+      Err(err) => warnings.push(format!(
+        "{} {} 不可用：{err}",
+        candidate.label,
+        candidate.path.display()
+      )),
+    }
+  }
+  Err(format!(
+    "没有可写入的桌面配置目录：\n{}",
+    warnings.join("\n")
+  ))
 }
 
 pub fn data_pointer_path(home: &Path) -> PathBuf {

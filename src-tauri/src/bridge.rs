@@ -278,8 +278,20 @@ fn dispatch(app: &AppHandle, method: &str, params: &Value) -> Result<Value, Brid
       let dir = std::path::PathBuf::from(&raw);
       paths::validate_data_dir(&dir)
         .map_err(|err| BridgeError::new("EINVALID", format!("数据目录校验失败：{err}")))?;
-      paths::write_pointer(&state.home_dir, &dir)
-        .map_err(|err| BridgeError::new("EPOINTER", err))?;
+      // 指针文件写入失败不致命：本次运行仍切换成功，只是下次启动可能回退（受限环境常见）
+      match paths::write_pointer(&state.home_dir, &dir) {
+        Ok(()) => {}
+        Err(err) => {
+          logging::warn(format!(
+            "写入数据目录指针失败（本次切换仍生效，重启后可能回退）：{err}"
+          ));
+          node_proc::log_to_gui(
+            app,
+            "warn",
+            format!("写入数据目录指针失败（重启后可能回退）：{err}"),
+          );
+        }
+      }
       state.set_data_dir(dir.clone(), "pointer");
       logging::info(format!("主数据目录已切换为：{}（即将重启程序）", dir.display()));
       node_proc::log_to_gui(app, "info", format!("主数据目录已切换为：{}，程序即将重启", dir.display()));

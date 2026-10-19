@@ -63,8 +63,12 @@ pub struct NodeRuntime {
 }
 
 pub struct AppState {
-  /// 桌面配置目录（%LOCALAPPDATA%\LiYueNpmMirror）
+  /// 桌面配置目录（正常情况下 %LOCALAPPDATA%\LiYueNpmMirror，受限环境自动回退）
   pub home_dir: PathBuf,
+  /// 配置目录是否发生回退（未使用首选用户配置目录）
+  pub home_fallback: bool,
+  /// 配置目录回退过程中的探测告警（供日志/冒烟报告）
+  pub home_warnings: Vec<String>,
   /// 当前主数据目录
   pub data_dir: Mutex<PathBuf>,
   /// 主数据目录来源（cli/env/pointer/default）
@@ -106,6 +110,8 @@ impl AppState {
   #[allow(clippy::too_many_arguments)]
   pub fn new(
     home_dir: PathBuf,
+    home_fallback: bool,
+    home_warnings: Vec<String>,
     data_dir: PathBuf,
     data_dir_source: String,
     runtime_dir: PathBuf,
@@ -115,6 +121,8 @@ impl AppState {
   ) -> Self {
     Self {
       home_dir,
+      home_fallback,
+      home_warnings,
       data_dir: Mutex::new(data_dir),
       data_dir_source: Mutex::new(data_dir_source),
       runtime_dir,

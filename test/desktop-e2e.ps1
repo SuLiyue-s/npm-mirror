@@ -12,12 +12,15 @@
         - exe 可启动，镜像源服务 /-/ping 返回 200
         - admin.port 不监听（默认关闭网页版管理）
         - 桌面窗口存在（窗口标题/窗口 URL=内部回环管理端口，能加载现有管理界面）
-        - 托盘图标与菜单项：打开窗口 / 关闭窗口 / 重启镜像源服务 / 退出程序；
-          默认关闭网页版管理时没有「重启管理界面」
+        - 托盘图标与菜单项：关闭网页版管理时 4 项（打开窗口 / 关闭窗口 /
+          重启镜像源服务 / 退出程序），没有「打开管理界面」「重启管理界面」
         - 关闭窗口后进程存活、服务仍在线（关闭=隐藏）；托盘菜单「打开窗口 / 关闭窗口」
         - 单实例：第二个实例自动退出，原服务不受影响
         - 数据目录内写出 config.json / logs
     · 阶段 1e：config.json 里写入非法 storage.dir 时服务仍能启动并回退默认 storage
+    · 阶段 1g：程序配置目录回退——%LOCALAPPDATA% 不可写、未设 MIRROR_DESKTOP_HOME 时
+      自动回退到 <exe目录>\LiYueNpmMirror（v0.0.2 修复；0.0.1 会报「创建桌面配置目录 …
+      拒绝访问 (os error 5)」）
     · 阶段 2（admin.enabled=true）
         - 两个端口都监听，浏览器可访问管理界面（GET / 200 + HTML）
         - /desktop/info 字段校验（版本、数据目录、默认数据目录、webAdmin、internal 端口）
@@ -28,9 +31,12 @@
         - service.restartRegistry 动作、autostart.get（只读）动作
         - 开机自启：当前未开启时做「开启 → 校验 HKCU\...\Run 值 → 关闭 → 校验清除」
           往返（当前已开启则只读校验，不覆盖用户已有自启配置）
-        - 托盘菜单出现「重启管理界面」，且菜单「重启管理界面 / 重启镜像源服务」动作生效
+        - 托盘菜单为 6 项（多出「打开管理界面」「重启管理界面」），且菜单
+          「重启管理界面 / 重启镜像源服务」动作生效；「打开管理界面」动作可执行
+          （受限会话无法真正拉起浏览器时记 SKIP 并注明）
         - PUT /config 拒绝路径穿越（storage.dir='..\..\evil' 返回 400）
-        - PUT /config 关闭 admin.enabled 后管理端口断开、镜像源端口不受影响
+        - PUT /config 关闭 admin.enabled 后管理端口断开、镜像源端口不受影响，
+          托盘菜单实时缩回 4 项（≤1s）
     · 阶段 3（admin.enabled=true）
         - 服务重启后控制台增量参数 after=旧 seq 不崩溃（seq 重置兼容）
         - app.quit 优雅退出：进程结束、两个监听都消失、无残留 node 进程
@@ -39,8 +45,10 @@
 
   窗口与托盘断言通过产品内置的测试挂钩驱动（启动参数 --smoke-report / --smoke-cmd，
   环境变量 MIRROR_DESKTOP_SMOKE=1；正常启动时挂钩完全惰性）。挂钩里的菜单 id 与
-  真实托盘菜单项一一对应（tray-open / tray-hide / tray-restart-webadmin /
-  tray-restart-registry / tray-quit），等价于右键点击对应菜单项，但不是鼠标级模拟。
+  真实托盘菜单项一一对应（tray-open / tray-hide / tray-open-webadmin /
+  tray-restart-webadmin / tray-restart-registry / tray-quit），等价于右键点击对应
+  菜单项，但不是鼠标级模拟。「打开管理界面」在受限会话里无法真正拉起系统浏览器，
+  因此只断言菜单动作被执行（命令回执）并记 SKIP 说明。
 
   不能自动化的部分（托盘左键单击的鼠标事件、窗口视觉风格、原生目录选择器对话框、
   控制台页按钮交互、工具页 import/cache 小样本等）在 tmp\audit-desktop.md 里标注为
@@ -565,13 +573,27 @@ function Get-AppWindows {
 # 启动 / 配置 / 数据目录
 # ---------------------------------------------------------------------------
 function Start-DesktopApp {
+  param(
+    # 可选：用另一个 exe 启动（阶段 1g 程序配置目录回退测试用复制到临时目录的 exe）
+    [string]$Exe = '',
+    # 可选：显式数据目录；空 = 使用 $script:DataDir
+    [string]$DataDirArg = '',
+    # 可选：不设置 MIRROR_DESKTOP_HOME（让程序走 %LOCALAPPDATA% / 回退逻辑）
+    [switch]$NoDesktopHome,
+    # 可选：覆盖子进程的 LOCALAPPDATA（阶段 1g 用一个「不可创建」的路径模拟受限账户）
+    [string]$LocalAppData = '',
+    # 报告/命令文件名前缀，避免不同阶段互相覆盖
+    [string]$ReportPrefix = 'smoke'
+  )
   $script:LaunchCount++
-  $reportPath = Join-Path $script:DesktopHome ('smoke-report-' + $script:LaunchCount + '.json')
-  $cmdPath = Join-Path $script:DesktopHome ('smoke-cmd-' + $script:LaunchCount + '.txt')
+  $reportPath = Join-Path $script:DesktopHome ($ReportPrefix + '-report-' + $script:LaunchCount + '.json')
+  $cmdPath = Join-Path $script:DesktopHome ($ReportPrefix + '-cmd-' + $script:LaunchCount + '.txt')
   if (Test-Path $cmdPath) { Remove-Item $cmdPath -Force -ErrorAction SilentlyContinue }
   $script:SmokeReportPath = $reportPath
   $script:SmokeCmdPath = $cmdPath
-  $argLine = '--data-dir "' + $script:DataDir + '" --smoke-report "' + $reportPath + '" --smoke-cmd "' + $cmdPath + '"'
+  $exeToRun = if ($Exe) { $Exe } else { $script:ExePath }
+  $dataDirToUse = if ($DataDirArg) { $DataDirArg } else { $script:DataDir }
+  $argLine = '--data-dir "' + $dataDirToUse + '" --smoke-report "' + $reportPath + '" --smoke-cmd "' + $cmdPath + '"'
   # 沙箱/受限环境通常不允许写 %LOCALAPPDATA%，用 Rust 壳支持的 MIRROR_DESKTOP_HOME
   # 把桌面配置/日志/解压运行时/WebView2 用户数据放到仓库 tmp 下。
   # MIRROR_DESKTOP_SMOKE=1 是产品内置的测试挂钩（正常启动时完全惰性，不产生行为）：
@@ -580,22 +602,30 @@ function Start-DesktopApp {
   $oldHome = $env:MIRROR_DESKTOP_HOME
   $oldWebView2 = $env:WEBVIEW2_USER_DATA_FOLDER
   $oldSmoke = $env:MIRROR_DESKTOP_SMOKE
-  $env:MIRROR_DESKTOP_HOME = $script:DesktopHome
-  $env:WEBVIEW2_USER_DATA_FOLDER = (Join-Path $script:DesktopHome 'webview2')
+  $oldLocalAppData = $env:LOCALAPPDATA
+  if (-not $NoDesktopHome) {
+    $env:MIRROR_DESKTOP_HOME = $script:DesktopHome
+    $env:WEBVIEW2_USER_DATA_FOLDER = (Join-Path $script:DesktopHome 'webview2')
+  } else {
+    Remove-Item Env:\MIRROR_DESKTOP_HOME -ErrorAction SilentlyContinue
+    Remove-Item Env:\WEBVIEW2_USER_DATA_FOLDER -ErrorAction SilentlyContinue
+  }
+  if ($LocalAppData) { $env:LOCALAPPDATA = $LocalAppData }
   $env:MIRROR_DESKTOP_SMOKE = '1'
   try {
     # 不用 Start-Process：受限会话/后台作业里启动 GUI 子系统 exe 时，ShellExecute 可能返回
     # 「The operation was canceled by the user.」。改用 .NET ProcessStartInfo（UseShellExecute=false）
     # 直接 CreateProcess，两条环境（普通会话 / 受限沙箱）都能稳定拉起。
     $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $script:ExePath
+    $psi.FileName = $exeToRun
     $psi.Arguments = $argLine
     $psi.UseShellExecute = $false
-    $psi.WorkingDirectory = (Split-Path -Parent $script:ExePath)
+    $psi.WorkingDirectory = (Split-Path -Parent $exeToRun)
     $proc = [System.Diagnostics.Process]::Start($psi)
   } finally {
     $env:MIRROR_DESKTOP_HOME = $oldHome
     $env:WEBVIEW2_USER_DATA_FOLDER = $oldWebView2
+    $env:LOCALAPPDATA = $oldLocalAppData
     $env:MIRROR_DESKTOP_SMOKE = $oldSmoke
   }
   $script:AppProc = $proc
@@ -1034,12 +1064,14 @@ if ($rep1Ready) {
   $trayLabels1 = @(Get-Prop $tray1 'labels')
   $needLabels = @('打开窗口', '关闭窗口', '重启镜像源服务', '退出程序')
   $missing1 = @($needLabels | Where-Object { -not ($trayLabels1 -contains $_) })
-  Assert-True '托盘菜单包含「打开窗口 / 关闭窗口 / 重启镜像源服务 / 退出程序」' ($missing1.Count -eq 0) ('实际菜单：' + ($trayLabels1 -join ' / ') + '；缺少：' + ($missing1 -join '、'))
+  Assert-True '默认托盘菜单包含 4 项「打开窗口 / 关闭窗口 / 重启镜像源服务 / 退出程序」' (($missing1.Count -eq 0) -and ($trayLabels1.Count -eq 4)) ('实际菜单（' + $trayLabels1.Count + ' 项）：' + ($trayLabels1 -join ' / ') + '；缺少：' + ($missing1 -join '、'))
+  Assert-True '默认关闭网页版管理时托盘菜单不含「打开管理界面」' (-not ($trayLabels1 -contains '打开管理界面')) ('实际菜单：' + ($trayLabels1 -join ' / '))
   Assert-True '默认关闭网页版管理时托盘菜单不含「重启管理界面」' (-not ($trayLabels1 -contains '重启管理界面')) ('实际菜单：' + ($trayLabels1 -join ' / '))
 
   # 阶段 1f：直接编辑 config.json 的 admin.enabled（模拟用户/其它工具改配置），
-  # 验证 Rust 壳的 1 秒配置轮询能把「重启管理界面」菜单项在 ≤2s 内加/减（Lead 指定断言）。
-  Section '阶段 1f：直接编辑 config.json → 托盘菜单 ≤2s 刷新'
+  # 验证 Rust 壳的 1 秒配置轮询能把「打开管理界面 / 重启管理界面」菜单项加/减
+  # （带兜底轮询，阈值放宽到 ≤2s；走桥事件的正常开关路径在阶段 2e 按 ≤1s 断言）。
+  Section '阶段 1f：直接编辑 config.json → 托盘菜单刷新（≤2s，配置轮询兜底）'
   $cfgPath1f = Join-Path $script:DataDir 'config.json'
   $sw1f = [System.Diagnostics.Stopwatch]::StartNew()
   try {
@@ -1051,12 +1083,12 @@ if ($rep1Ready) {
     $appearedRep = Wait-SmokeReport {
       param($r)
       $lb = @(Get-Prop (Get-Prop $r 'tray') 'labels')
-      return ($lb -contains '重启管理界面')
-    } 4 200
+      return (($lb -contains '打开管理界面') -and ($lb -contains '重启管理界面'))
+    } 5 200
     $sw1f.Stop()
     $appearedMs = $sw1f.ElapsedMilliseconds
     $appearedLabels = @(Get-Prop (Get-Prop $appearedRep 'tray') 'labels')
-    Assert-True '直接改 config.json admin.enabled=true 后托盘出现「重启管理界面」（≤2s）' (($null -ne $appearedRep) -and $appearedMs -le 2000) ('耗时=' + $appearedMs + 'ms；实际菜单：' + ($appearedLabels -join ' / '))
+    Assert-True '直接改 config.json admin.enabled=true 后托盘出现「打开管理界面」「重启管理界面」（≤2s）' (($null -ne $appearedRep) -and $appearedMs -le 2000) ('耗时=' + $appearedMs + 'ms；实际菜单：' + ($appearedLabels -join ' / '))
 
     $sw1fRevert = [System.Diagnostics.Stopwatch]::StartNew()
     $cfg1fRevert = Get-Content $cfgPath1f -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -1066,11 +1098,11 @@ if ($rep1Ready) {
     $disappearedRep = Wait-SmokeReport {
       param($r)
       $lb = @(Get-Prop (Get-Prop $r 'tray') 'labels')
-      return (-not ($lb -contains '重启管理界面'))
-    } 4 200
+      return ((-not ($lb -contains '打开管理界面')) -and (-not ($lb -contains '重启管理界面')))
+    } 5 200
     $sw1fRevert.Stop()
     $disappearedMs = $sw1fRevert.ElapsedMilliseconds
-    Assert-True '直接改回 admin.enabled=false 后「重启管理界面」从托盘消失（≤2s）' (($null -ne $disappearedRep) -and $disappearedMs -le 2000) ('耗时=' + $disappearedMs + 'ms')
+    Assert-True '直接改回 admin.enabled=false 后两项从托盘消失（≤2s）' (($null -ne $disappearedRep) -and $disappearedMs -le 2000) ('耗时=' + $disappearedMs + 'ms')
     Assert-True '配置轮询刷新后镜像源服务仍在线（/-/ping 200）' (Test-Ping $RegistryPort)
   } catch {
     Assert-True '直接编辑 config.json 触发托盘刷新（阶段 1f）' $false ('异常：' + $_.Exception.Message)
@@ -1217,6 +1249,65 @@ if ($injectOk) {
   $portsFreed1e = Wait-Until { (-not (Test-Port $RegistryPort)) -and (-not (Test-Port $AdminPort)) } 15 300
   Assert-True '阶段 1e 清理后测试端口全部释放' $portsFreed1e
 }
+
+# ---------------------------------------------------------------------------
+# 阶段 1g：程序配置目录回退（v0.0.2 修复）
+# 模拟 v0.0.1 用户遇到的受限环境：%LOCALAPPDATA% 不可写（这里指向一个「同名文件」，
+# 任何在其下创建目录的操作都会失败）。未设置 MIRROR_DESKTOP_HOME 时，程序应自动
+# 回退到 <exe 所在目录>\LiYueNpmMirror 并继续启动，而不是报
+# 「创建桌面配置目录 … 拒绝访问 (os error 5)」直接退出。
+# 用 exe 的副本在临时目录里测试，不污染 dist；结束时清理进程与临时目录。
+# ---------------------------------------------------------------------------
+Section '阶段 1g：程序配置目录回退（%LOCALAPPDATA% 不可写 → <exe目录>\LiYueNpmMirror）'
+$fallbackRoot = Join-Path $script:Root 'tmp\e2e-fallback'
+if (Test-Path $fallbackRoot) { Remove-Item $fallbackRoot -Recurse -Force -ErrorAction SilentlyContinue }
+$fallbackExeDir = Join-Path $fallbackRoot 'app'
+[void](New-Item -ItemType Directory -Path $fallbackExeDir -Force)
+$fallbackExe = Join-Path $fallbackExeDir ('npm-mirror-desktop-' + $script:PkgVersion + '.exe')
+Copy-Item $script:ExePath $fallbackExe -Force
+$fallbackData = Join-Path $fallbackRoot 'data'
+[void](New-Item -ItemType Directory -Path $fallbackData -Force)
+# 让 LOCALAPPDATA 指向一个「文件」：<LOCALAPPDATA>\LiYueNpmMirror 必然创建失败。
+$blockedLocalAppData = Join-Path $fallbackRoot 'blocked-localappdata'
+[System.IO.File]::WriteAllText($blockedLocalAppData, 'not a directory', (New-Object System.Text.UTF8Encoding($false)))
+$expectFallbackHome = Join-Path $fallbackExeDir 'LiYueNpmMirror'
+
+$oldDataDir1g = $script:DataDir
+$script:DataDir = $fallbackData
+$seeded1g = Set-TestConfig -WebAdminEnabled $false
+$script:DataDir = $oldDataDir1g
+Assert-True '已生成阶段 1g 测试配置（admin.enabled=false）' $seeded1g
+
+$p1g = Start-DesktopApp -Exe $fallbackExe -DataDirArg $fallbackData -NoDesktopHome -LocalAppData $blockedLocalAppData -ReportPrefix 'fallback'
+Info ('已用 exe 副本启动桌面进程 PID=' + $p1g.Id + '，LOCALAPPDATA=' + $blockedLocalAppData + '，未设置 MIRROR_DESKTOP_HOME…')
+$rep1g = Wait-SmokeReport {
+  param($r)
+  $h = Get-Prop $r 'home'
+  $n = Get-Prop $r 'node'
+  return (((Get-Prop $h 'fallback') -eq $true) -and ((Get-Prop $n 'ready') -eq $true))
+} 150 400
+if ($null -ne $rep1g) {
+  $home1g = Get-Prop $rep1g 'home'
+  $homePath1g = [string](Get-Prop $home1g 'path')
+  Assert-True 'smoke 报告 home.fallback=true（程序配置目录已回退）' ((Get-Prop $home1g 'fallback') -eq $true) ('实际：' + ($home1g | ConvertTo-Json -Compress))
+  Assert-True ('回退目录 = <exe目录>\LiYueNpmMirror（' + $expectFallbackHome + '）') ((Normalize-Path $homePath1g) -eq (Normalize-Path $expectFallbackHome)) ('实际：' + $homePath1g)
+  Assert-True '回退目录不在不可写的 %LOCALAPPDATA% 下' (-not $homePath1g.StartsWith($blockedLocalAppData, [System.StringComparison]::OrdinalIgnoreCase)) ('实际：' + $homePath1g)
+  Assert-True '回退后桌面日志写在回退目录下（desktop.log 存在）' (Test-Path (Join-Path $expectFallbackHome 'desktop.log')) ('目录：' + $expectFallbackHome)
+  $fallbackNode = Get-Prop $rep1g 'node'
+  $fallbackNodePid = [int](Get-Prop $fallbackNode 'pid')
+  if ($fallbackNodePid -gt 0 -and -not ($script:TrackedNodePids -contains $fallbackNodePid)) { [void]$script:TrackedNodePids.Add($fallbackNodePid) }
+} else {
+  Assert-Skip '程序配置目录回退（smoke 报告 home.fallback）' '等待超时或报告未包含 home 字段（旧 exe 不支持该字段时无法判定），需人工确认'
+}
+$ping1g = Wait-Until { Test-Ping $RegistryPort } 60 400
+Assert-True '回退后镜像源服务正常启动（/-/ping 200）' $ping1g
+Assert-True '回退后仍按测试配置不监听管理端口（admin.enabled=false）' (-not (Test-Port $AdminPort))
+
+Stop-TrackedProcesses
+$portsFreed1g = Wait-Until { (-not (Test-Port $RegistryPort)) -and (-not (Test-Port $AdminPort)) } 15 300
+Assert-True '阶段 1g 清理后测试端口全部释放' $portsFreed1g
+if (Test-Path $fallbackRoot) { Remove-Item $fallbackRoot -Recurse -Force -ErrorAction SilentlyContinue }
+Assert-True '阶段 1g 临时目录已清理' (-not (Test-Path $fallbackRoot))
 
 # ---------------------------------------------------------------------------
 # 阶段 2：admin.enabled=true，验证网页版管理、桌面 API、一键脚本
@@ -1387,14 +1478,15 @@ Section '阶段 2c-1：托盘菜单（网页版管理开启后的菜单项）'
 $rep2 = Wait-SmokeReport {
   param($report)
   $labels = @(Get-Prop (Get-Prop $report 'tray') 'labels')
-  return ($labels -contains '重启管理界面')
+  return (($labels -contains '打开管理界面') -and ($labels -contains '重启管理界面'))
 } 30 400
 $trayLabels2 = @()
 if ($null -ne $rep2) { $trayLabels2 = @(Get-Prop (Get-Prop $rep2 'tray') 'labels') }
+Assert-True '开启网页版管理后托盘菜单出现「打开管理界面」' ($trayLabels2 -contains '打开管理界面') ('实际菜单：' + ($trayLabels2 -join ' / '))
 Assert-True '开启网页版管理后托盘菜单出现「重启管理界面」' ($trayLabels2 -contains '重启管理界面') ('实际菜单：' + ($trayLabels2 -join ' / '))
-$needLabels2 = @('打开窗口', '关闭窗口', '重启管理界面', '重启镜像源服务', '退出程序')
+$needLabels2 = @('打开窗口', '关闭窗口', '打开管理界面', '重启管理界面', '重启镜像源服务', '退出程序')
 $missing2 = @($needLabels2 | Where-Object { -not ($trayLabels2 -contains $_) })
-Assert-True '开启网页版管理后托盘菜单项齐全（5 项）' ($missing2.Count -eq 0) ('实际菜单：' + ($trayLabels2 -join ' / '))
+Assert-True '开启网页版管理后托盘菜单项齐全（6 项）' (($missing2.Count -eq 0) -and ($trayLabels2.Count -eq 6)) ('实际菜单（' + $trayLabels2.Count + ' 项）：' + ($trayLabels2 -join ' / ') + '；缺少：' + ($missing2 -join '、'))
 if ($null -ne $rep2) {
   $repWebAdmin = Get-Prop $rep2 'webAdmin'
   Assert-True '桌面壳报告 webAdmin.enabled=true（与 /desktop/info 一致）' ((Get-Prop $repWebAdmin 'enabled') -eq $true) ('报告 webAdmin=' + ($repWebAdmin | ConvertTo-Json -Compress))
@@ -1432,6 +1524,18 @@ $regBack = Wait-Until { Test-Ping $RegistryPort } 60 500
 Assert-True '托盘重启镜像源服务后服务恢复在线（/-/ping 200）' $regBack
 Assert-True '托盘重启镜像源服务后桌面进程仍存活' (-not $p2run.HasExited)
 Assert-True '托盘重启镜像源服务后网页版管理仍可访问' ((Invoke-Api ($adminBase + '/') 'GET' $null 10).Status -eq 200)
+
+# 托盘菜单「打开管理界面」：用系统默认浏览器打开网页版管理页面。
+# 受限会话里系统浏览器拉不起来（且无法枚举浏览器窗口），只断言菜单动作被执行；
+# 真实浏览器打开效果留人工验收。
+$openWaReport = Send-SmokeCommand 'menu:tray-open-webadmin' 30
+$openWaCmd = @()
+if ($null -ne $openWaReport) {
+  $openWaCmd = @(@(Get-Prop $openWaReport 'commands') | Where-Object { (Get-Prop $_ 'command') -eq 'menu:tray-open-webadmin' })
+}
+Assert-True '托盘菜单「打开管理界面」动作被执行（命令回执 ok）' ($openWaCmd.Count -gt 0 -and (Get-Prop $openWaCmd[0] 'ok') -eq $true) ('回执：' + ($openWaCmd | ConvertTo-Json -Compress))
+Assert-True '「打开管理界面」动作不影响程序（进程存活、镜像源在线、网页版管理仍可访问）' ((-not $p2run.HasExited) -and (Test-Ping $RegistryPort) -and ((Invoke-Api ($adminBase + '/') 'GET' $null 10).Status -eq 200))
+Assert-Skip '「打开管理界面」实际拉起系统浏览器' '受限会话无法确认浏览器进程/窗口，需在普通桌面会话人工点击验收（菜单动作已自动验证）'
 
 $autostartResp = Invoke-Api ($api + '/desktop/action') 'POST' @{ action = 'autostart.get'; params = @{} } 20
 $autostartData = Get-Data (Get-Json $autostartResp)
@@ -1489,6 +1593,7 @@ Assert-True 'PUT /config 拒绝多级路径穿越（400）' ($badResp2.Status -e
 
 # 关闭网页版管理：PUT /config -> admin.enabled=false，端口即时断开
 Section '阶段 2e：关闭网页版管理（PUT /config admin.enabled=false）'
+$swOff = [System.Diagnostics.Stopwatch]::StartNew()
 $offResp = Invoke-Api ($api + '/config') 'PUT' @{ config = @{ admin = @{ enabled = $false } } } 25
 $offJson = Get-Json $offResp
 $offData = Get-Data $offJson
@@ -1502,6 +1607,17 @@ if ($null -ne $offWebAdmin) {
 $adminClosed = Wait-Until { -not (Test-Port $AdminPort) } 12 300
 Assert-True '关闭后管理端口断开（不再监听）' $adminClosed ('端口 ' + $AdminPort)
 Assert-True '关闭网页版管理后镜像源服务不受影响（/-/ping 200）' (Test-Ping $RegistryPort)
+
+# 托盘菜单实时性：走桥事件（非配置轮询兜底）时，开关后菜单应在 ≤1s 内更新
+$menuShrunkRep = Wait-SmokeReport {
+  param($r)
+  $lb = @(Get-Prop (Get-Prop $r 'tray') 'labels')
+  return (($lb.Count -eq 4) -and (-not ($lb -contains '打开管理界面')) -and (-not ($lb -contains '重启管理界面')))
+} 4 100
+$swOff.Stop()
+$menuShrunkMs = $swOff.ElapsedMilliseconds
+$menuShrunkLabels = @(Get-Prop (Get-Prop $menuShrunkRep 'tray') 'labels')
+Assert-True '关闭网页版管理后托盘菜单实时缩回 4 项（≤1s，桥事件路径）' (($null -ne $menuShrunkRep) -and $menuShrunkMs -le 1000) ('耗时=' + $menuShrunkMs + 'ms；实际菜单：' + ($menuShrunkLabels -join ' / '))
 
 # 阶段 2 清理
 Section '阶段 2f：清理测试实例'

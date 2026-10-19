@@ -63,11 +63,14 @@ fn run(args: state::StartupArgs) -> Result<(), String> {
     return Ok(());
   }
 
-  // 桌面配置目录（%LOCALAPPDATA%\LiYueNpmMirror，测试可用 MIRROR_DESKTOP_HOME 覆盖）
-  let home = paths::home_dir();
-  std::fs::create_dir_all(&home)
-    .map_err(|err| format!("创建桌面配置目录 {} 失败：{err}", home.display()))?;
-  logging::init(&home)?;
+  // 桌面配置目录：MIRROR_DESKTOP_HOME > %LOCALAPPDATA%\LiYueNpmMirror > 程序目录 > %TEMP% > 程序目录备用。
+  // 受限环境（沙箱/预览面板继承受限 token）写不了 %LOCALAPPDATA% 时自动回退，不再启动即失败。
+  let home_resolution = paths::effective_home()?;
+  let home = home_resolution.path.clone();
+  // 日志初始化失败不阻断启动（配置目录可用但日志文件被占用等极端情况）
+  if let Err(err) = logging::init(&home) {
+    eprintln!("初始化桌面日志失败（继续运行）：{err}");
+  }
   logging::info(format!(
     "==== 桌面程序启动：{} v{} pid={} ====",
     paths::PRODUCT_NAME,
@@ -75,10 +78,40 @@ fn run(args: state::StartupArgs) -> Result<(), String> {
     std::process::id()
   ));
   logging::info(format!(
-    "exe={} home={} args={args:?}",
+    "exe={} home={} homeFallback={} args={args:?}",
     paths::exe_path().display(),
-    home.display()
+    home.display(),
+    home_resolution.fallback
   ));
+  for warning in &home_resolution.warnings {
+    logging::warn(warning);
+  }
+  if home_resolution.fallback {
+    logging::warn(format!(
+      "用户配置目录不可写，已改用备用配置目录：{}",
+      home.display()
+    ));
+    // 非冒烟模式：启动后弹一次说明框，引导用户从资源管理器双击运行（避免受限/沙盒环境）
+    if !smoke::enabled() {
+      let reason = home_resolution
+        .warnings
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "用户配置目录不可写".to_string());
+      let fallback_path = home.display().to_string();
+      thread::spawn(move || {
+        // 稍微延迟，让主窗口/托盘先建立，提示框不会挡住启动流程
+        thread::sleep(Duration::from_millis(1_500));
+        winutil::message_box(
+          format!(
+            "无法写入用户配置目录：\n\n{reason}\n\n已改用：{fallback_path}\n\n若主窗口无法显示或功能异常，请从资源管理器直接双击本程序（不要从受限/沙盒环境启动）。"
+          ),
+          paths::PRODUCT_NAME,
+          false,
+        );
+      });
+    }
+  }
 
   // 主数据目录：--data-dir > MIRROR_DATA_DIR > 指针文件 > <exe 目录>/data
   let resolution = paths::resolve_data_dir(&args, &home)?;
@@ -97,6 +130,8 @@ fn run(args: state::StartupArgs) -> Result<(), String> {
   let log_path = logging::log_path();
   let app_state = AppState::new(
     home.clone(),
+    home_resolution.fallback,
+    home_resolution.warnings.clone(),
     resolution.path,
     resolution.source.as_str().to_string(),
     runtime_dir,

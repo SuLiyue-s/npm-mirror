@@ -1,6 +1,6 @@
 [package]
 name = "npm-mirror-desktop"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 description = "离月私人 npm 镜像源 · 桌面版"
 authors = ["苏离月 (SuLiyue)"]

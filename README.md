@@ -5,7 +5,7 @@
 - 运行环境：Node.js **>= 18**（实测 Node.js 24），Windows / macOS / Linux 均可运行服务本体（一键脚本为 Windows `.cmd` / PowerShell）
 - 默认地址：镜像源（npm registry）<http://127.0.0.1:4873>，管理界面 <http://127.0.0.1:4874>（**两个独立监听**：管理界面只监听 `127.0.0.0/8` 本地回环，只有本机访问才能打开；端口不可与镜像源端口相同，可在配置页/`data/config.json` 的 `admin` 段修改）
 - 依赖数量：**0**（`dependencies` 与 `devDependencies` 均为空）
-- 桌面版：**单 exe（版本 0.0.1）**，`dist/npm-mirror-desktop-0.0.1.exe`，双击即用、内嵌 Node 运行时，带托盘 / 控制台页 / 工具页 / 主数据目录选择 / 开机自启，详见 [桌面版（单 exe）](#桌面版单-exe)
+- 桌面版：**单 exe（版本 0.0.2）**，`dist/npm-mirror-desktop-0.0.2.exe`，双击即用、内嵌 Node 运行时，带托盘 / 控制台页 / 工具页 / 主数据目录选择 / 开机自启，详见 [桌面版（单 exe）](#桌面版单-exe)
 - 许可证：[MIT](LICENSE)
 
 ![管理界面概览](截图/管理界面-概览.png)
@@ -62,17 +62,18 @@ node cli.js start
 
 | 项目 | 说明 |
 | --- | --- |
-| 版本 | **0.0.1**（`package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` 三处一致） |
-| 构建产物 | `dist/npm-mirror-desktop-0.0.1.exe`（单文件，内嵌 Node 运行时与全部程序文件） |
-| 下载 | [GitHub Releases v0.0.1](https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.1)（exe + `SHA256SUMS.txt`，建议先校验再运行） |
+| 版本 | **0.0.2**（`package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` 三处一致） |
+| 构建产物 | `dist/npm-mirror-desktop-0.0.2.exe`（单文件，内嵌 Node 运行时与全部程序文件） |
+| 下载 | [GitHub Releases v0.0.2](https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.2)（exe + `SHA256SUMS.txt`，建议先校验再运行） |
 | 系统要求 | Windows 10/11 x64；需要系统自带 **WebView2 运行时**（Win11 默认已装，Win10 可装 Evergreen Runtime） |
 | 数据目录 | 默认 `<exe 所在目录>\data`，与网页版 / 命令行版共用同一套数据格式 |
+| 程序配置目录 | 默认 `%LOCALAPPDATA%\LiYueNpmMirror\`（运行时解压缓存 / 桌面日志 / 上次选择的目录记录）；**v0.0.2 起不可写时自动回退到 `<exe 所在目录>\LiYueNpmMirror\` 并给出提示**（v0.0.1 在此情况会报「创建桌面配置目录 … 拒绝访问 (os error 5)」） |
 | 与网页版的关系 | 窗口里显示的就是现有管理界面（同一套 `public/`），另外多出「控制台」「工具」两个页面；镜像源监听、管理 API、令牌机制完全一致 |
 
 ### 桌面版特性
 
-- **单文件运行**：exe 内嵌 node.exe 与全部程序文件，首次运行解压到 `%LOCALAPPDATA%\LiYueNpmMirror\runtime\<版本>\`，之后直接复用；目标机器无需安装 Node.js。
-- **托盘常驻**：关闭窗口只是隐藏，托盘图标继续运行镜像源；左键单击打开窗口，右键有「打开窗口 / 关闭窗口 / 重启管理界面 / 重启镜像源服务 / 退出程序」（「重启管理界面」只在网页版管理开启时出现）。
+- **单文件运行**：exe 内嵌 node.exe 与全部程序文件，首次运行解压到 `%LOCALAPPDATA%\LiYueNpmMirror\runtime\<版本>\`，之后直接复用；目标机器无需安装 Node.js。**v0.0.2 起若 `%LOCALAPPDATA%` 不可写（受限账户 / 沙盒 / 安全软件拦截），会自动回退到 `<exe 所在目录>\LiYueNpmMirror\` 并提示，不再直接启动失败。**
+- **托盘常驻**：关闭窗口只是隐藏，托盘图标继续运行镜像源；左键单击打开窗口。右键菜单随网页版管理开关实时变化（**≤1 秒**）：关闭时 **4 项**「打开窗口 / 关闭窗口 / 重启镜像源服务 / 退出程序」；开启时 **6 项**「打开窗口 / 关闭窗口 / 打开管理界面 / 重启管理界面 / 重启镜像源服务 / 退出程序」。新增的「打开管理界面」用系统默认浏览器打开网页版管理页面（`http://<admin.ip>:<admin.port>/`），「重启管理界面」只重建该监听。
 - **控制台页**：把服务日志、一键脚本输出、桌面端操作日志实时汇总（最多保留 3000 行），可暂停 / 继续 / 清空 / 复制 / 下载，按级别与来源筛选。
 - **工具页**：桌面程序信息（版本 / 程序路径 / 主数据目录 / 运行模式）、重启程序 / 退出程序 / 隐藏窗口、重启镜像源 / 重启管理界面 / 打开网页版管理、开机自启开关、一键脚本（环境自检 / 查看状态 / 从 npm 缓存补包 / 一键导出全部包 / 一键导入离线包）、打开数据目录 / 日志目录 / 配置文件。
 - **网页版管理开关**（`admin.enabled`，默认 **关闭**）：默认桌面版不开放浏览器可访问的管理端口，只能从桌面窗口管理；需要浏览器 / 局域网访问时在「配置 → 桌面 / 网页管理」打开，端口即 `admin.ip` / `admin.port`（默认 `127.0.0.1:4874`），保存即时生效、不用重启程序。
@@ -102,22 +103,26 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/build-desktop.ps1
 
 ### 桌面版使用要点
 
-1. 双击 `dist\npm-mirror-desktop-0.0.1.exe`。首次启动会自动初始化数据目录（默认 exe 同级的 `data\`）并生成配置与访问令牌。
+1. 双击 `dist\npm-mirror-desktop-0.0.2.exe`。首次启动会自动初始化数据目录（默认 exe 同级的 `data\`）并生成配置与访问令牌。**请从资源管理器直接双击运行**；在沙盒 / IDE 预览面板等受限环境里启动会继承受限权限，v0.0.1 会因此报「创建桌面配置目录 … 拒绝访问 (os error 5)」，v0.0.2 虽会回退到 exe 目录但窗口功能仍不保证。
 2. 窗口打开的就是管理界面；「控制台」「工具」页在左侧导航里（`MONITOR` / `SYSTEM` 分组）。
 3. 点窗口右上角 **×** 只是隐藏窗口，镜像源继续运行；要彻底退出请用托盘右键「退出程序」或工具页的「退出程序」。
 4. 换数据目录：配置页 →「桌面 / 网页管理」→「选择目录…」→ 选一个**已存在**的文件夹 → 确认后程序自动重启并切到新目录。**数据不会自动搬迁**，需要迁移时先退出程序，把旧 `data\` 整个复制到新位置再启动。
 5. 从旧版迁移：把 exe 放进现有项目根目录运行即可沿用 `项目根\data`；或把旧 `data\` 复制到 exe 同级的 `data\`。
-6. 卸载：退出程序后删除 exe 与 `data\` 即可；开机自启在工具页关掉（或删除注册表 `LiYueNpmMirror` 值），首次运行解压缓存位于 `%LOCALAPPDATA%\LiYueNpmMirror\runtime\`（可删）。
+6. 卸载：退出程序后删除 exe 与 `data\` 即可；开机自启在工具页关掉（或删除注册表 `LiYueNpmMirror` 值），程序配置目录 `%LOCALAPPDATA%\LiYueNpmMirror\`（回退时为 `<exe 所在目录>\LiYueNpmMirror\`，含运行时解压缓存 / 桌面日志 / 目录记录）可一并删除。
 
 完整图文操作见 **[使用说明.md 第十三章「桌面版（Tauri 单 exe）」](使用说明.md#十三桌面版tauri-单-exe)**。
 
 ### 桌面版常见问题
 
+**Q：v0.0.1 启动就报「创建桌面配置目录 … 拒绝访问 (os error 5)」怎么办？**
+这是**从受限环境启动**导致的（例如在沙盒、IDE / 本会话的预览面板里点运行）：程序继承了受限 token，写不了 `%LOCALAPPDATA%\LiYueNpmMirror\` 这个默认程序配置目录，于是在创建窗口前就退出了。
+正确处理：到**资源管理器里直接双击** `dist\npm-mirror-desktop-0.0.2.exe`（或把 exe 复制到桌面 / 其它普通文件夹再双击）。v0.0.2 已加入**可写目录回退**——`%LOCALAPPDATA%` 不可写时自动改用 `<exe 所在目录>\LiYueNpmMirror\` 并在桌面日志里提示；但受限环境下的窗口（WebView2）功能仍不保证，**请始终用资源管理器启动**。
+
 **Q：双击没反应 / 窗口白屏？**
-先确认系统装了 **WebView2 运行时**（Win11 自带；Win10 可从微软官网安装 Evergreen Runtime）。仍失败可看 `%LOCALAPPDATA%\LiYueNpmMirror\desktop.log` 与数据目录 `logs\` 下的日志。
+先确认系统装了 **WebView2 运行时**（Win11 自带；Win10 可从微软官网安装 Evergreen Runtime）。仍失败可看桌面日志 `desktop.log`（默认在 `%LOCALAPPDATA%\LiYueNpmMirror\desktop.log`，回退时在 `<exe 所在目录>\LiYueNpmMirror\desktop.log`）与数据目录 `logs\` 下的日志。
 
 **Q：杀毒软件报毒 / SmartScreen 拦截？**
-exe 未做代码签名，SmartScreen 会提示「Windows 已保护你的电脑」，点「更多信息 → 仍要运行」。杀软对「单文件内嵌 node.exe」比较敏感，可把 exe 与 `%LOCALAPPDATA%\LiYueNpmMirror\` 加入白名单；发布资产在 GitHub Releases 附带 `SHA256SUMS.txt`，可先校验再运行。
+exe 未做代码签名，SmartScreen 会提示「Windows 已保护你的电脑」，点「更多信息 → 仍要运行」。杀软对「单文件内嵌 node.exe」比较敏感，可把 exe 与程序配置目录（`%LOCALAPPDATA%\LiYueNpmMirror\`，或回退的 `<exe 所在目录>\LiYueNpmMirror\`）加入白名单；发布资产在 GitHub Releases 附带 `SHA256SUMS.txt`，可先校验再运行。
 
 **Q：端口被占用 / 启动失败？**
 桌面版镜像源默认用 `server.port`（4873），被别的程序占用时改 `data\config.json` 的 `server.port`。`admin.port`（4874）只在开启网页版管理时才监听，同样不能与 `server.port` 相同。
@@ -285,7 +290,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File test/desktop-e2e.ps1  # 桌�
 | `test/tray-check.js` | 托盘脚本/项目图标/启动脚本/favicon 路由契约（含右键菜单 5 项「打开/隐藏控制台」「打开管理界面」「重启管理界面」「重启镜像源服务」「退出镜像源」、左键单击打开管理界面、`Restart-AdminUi` / `Restart-MirrorService` 分项重启、重启期间健康检查暂停、自检输出 `adminPort`/`registryPort`/`managementUrl` 且管理地址与镜像源地址分离）、**开机自启（`.vbs` 隐藏启动项 / UTF-16LE BOM / 旧 `.cmd` 清理 / `off` 幂等，临时目录真跑）**，并真跑一次托盘自检（Windows）、**托盘健康检查的进程存活保护（服务忙但进程还活着只提示「忙碌」、不关窗口）、启动脚本 prestart 同端口不重复启动（退出码 10/11）**、**服务已在运行时补注册托盘（退出码 10 分支前台拉起 `tools\tray.ps1` 并置 `MIRROR_TRAY_RESTORE`、单实例互斥体、按标题接管被隐藏的原命令行窗口、`data\logs\tray.pid`、托盘图标注册日志）、退出镜像源按 `mirror.pid` 进程是否真的退出做 `Stop-Process -Force` 兜底、健康检查连续失败先重读配置** | **66/66 通过** |
 | `test/tray-e2e.ps1` | 托盘端到端：隔离副本启动 → 窗口隐藏 → 可重新显示 → **强杀托盘进程模拟图标没了 → 再跑一次启动脚本 → 断言托盘补注册成功、接管原来被隐藏的控制台、服务不受影响（场景 A）** → 停服务后托盘退出并关窗 | **12/12 通过（手工）** |
 | `test/desktop-path-test.js` | 桌面版数据根与路径穿越防护单测：普通相对路径、旧 `data/` 前缀、`../` / `..\` / `a/../../x`、绝对路径、NUL、磁盘根、空串、`C:foo` 等 | **24/24 通过（exit 0）** |
-| `test/desktop-e2e.ps1` | 桌面版端到端验收（Windows / PowerShell 7）：`dist` exe 存在与版本信息 → 启动进程/窗口（窗口标题、URL=内部回环管理端口、加载现有管理界面）→ 内部管理 API → 控制台 API 与增量 `after` → 一键脚本 `doctor`/`status` → `admin.enabled` 端口监听开关与即时生效 → 默认数据目录 `<exe目录>\data` → `/desktop/files` 白名单与穿越参数 → `PUT /config` 路径穿越 400 → 单实例 → 关闭窗口后服务仍在线 → 托盘菜单（打开/关闭窗口、重启管理界面、重启镜像源服务、退出程序）→ 开机自启注册表往返（已开启时只读跳过）→ 退出后无残留进程与监听。临时数据目录 `tmp/e2e-data`、桌面 home `tmp/e2e-home`、测试端口 14873/14874；退出码 `0`=通过、`1`=失败、`3`=仅因当前会话无法创建/显示 WebView2 窗口的环境限制 | **119 通过 / 5 失败（均为窗口类环境限制）/ 4 跳过，exit 3**（2026-10-19，dist 0.0.1；非窗口类失败 0） |
+| `test/desktop-e2e.ps1` | 桌面版端到端验收（Windows / PowerShell 7）：`dist` exe 存在与版本信息 → 启动进程/窗口（窗口标题、URL=内部回环管理端口、加载现有管理界面）→ 内部管理 API → 控制台 API 与增量 `after` → 一键脚本 `doctor`/`status` → `admin.enabled` 端口监听开关与即时生效 → 默认数据目录 `<exe目录>\data` → `/desktop/files` 白名单与穿越参数 → `PUT /config` 路径穿越 400 → 单实例 → 关闭窗口后服务仍在线 → 托盘菜单（关闭网页版管理时 **4 项** / 开启时 **6 项**，含「打开管理界面」「重启管理界面」，开关后 ≤2 秒实时切换；菜单动作用产品内置测试挂钩驱动，等价点菜单项）→ 程序配置目录回退（`%LOCALAPPDATA%` 不可写时回退 `<exe目录>\LiYueNpmMirror`）→ 开机自启注册表往返（已开启时只读跳过）→ 退出后无残留进程与监听。临时数据目录 `tmp/e2e-data`、桌面 home `tmp/e2e-home`、测试端口 14873/14874；退出码 `0`=通过、`1`=失败、`3`=仅因当前会话无法创建/显示 WebView2 窗口的环境限制 | **0.0.2 实测：143 项 = 133 通过 / 5 失败（均为窗口类环境限制）/ 5 跳过，exit 3，非窗口类失败 0**（0.0.1 历史：119 通过 / 5 失败 / 4 跳过，exit 3） |
 | `test/acceptance-npm.ps1` | 真实 `npm install / publish / dist-tag / deprecate / unpublish` | **16/16 通过** |
 | `test/ui-e2e-*.js` | 浏览器端端到端（需要 Chrome 调试端口，可选） | 需本机 Chrome CDP 环境 |
 

@@ -15,6 +15,9 @@
 .PARAMETER Bump
   版本递增方式，默认 patch（即 0.0.1 -> 0.0.2）。
 
+.PARAMETER NoBump
+  不升级版本号，直接使用当前版本（用于「版本号已提前升好、构建已提前完成」的重跑场景）。
+
 .PARAMETER NoBuild
   跳过构建（复用已有 dist 产物，仅提交流水线用，慎用）。
 
@@ -39,6 +42,7 @@
 [CmdletBinding()]
 param(
   [string]$Bump = 'patch',
+  [switch]$NoBump,
   [switch]$NoBuild,
   [switch]$NoPush,
   [switch]$SkipRelease,
@@ -74,11 +78,17 @@ if ($status.Count -gt 0) {
 }
 
 Step '升级版本号'
-& node tools\version.js --bump $Bump
-if ($LASTEXITCODE -ne 0) { Fail '版本号升级失败。' }
-$ver = (& node -e "console.log(require('./package.json').version)").Trim()
-if ($LASTEXITCODE -ne 0 -or -not ($ver -match '^\d+\.\d+\.\d+$')) { Fail '无法读取新版本号。' }
-Write-Host ('新版本：v' + $ver)
+if ($NoBump) {
+  $ver = (& node -e "console.log(require('./package.json').version)").Trim()
+  if ($LASTEXITCODE -ne 0 -or -not ($ver -match '^\d+\.\d+\.\d+$')) { Fail '无法读取当前版本号。' }
+  Write-Host ('-NoBump：使用当前版本 v' + $ver)
+} else {
+  & node tools\version.js --bump $Bump
+  if ($LASTEXITCODE -ne 0) { Fail '版本号升级失败。' }
+  $ver = (& node -e "console.log(require('./package.json').version)").Trim()
+  if ($LASTEXITCODE -ne 0 -or -not ($ver -match '^\d+\.\d+\.\d+$')) { Fail '无法读取新版本号。' }
+  Write-Host ('新版本：v' + $ver)
+}
 $tag = 'v' + $ver
 
 Step '构建桌面版单 exe'

@@ -219,6 +219,11 @@ fn build_report(app: &AppHandle, elapsed: Duration) -> Value {
     "pid": std::process::id(),
     "exePath": paths::exe_path().to_string_lossy(),
     "exeDir": paths::exe_dir().to_string_lossy(),
+    "home": {
+      "path": state.home_dir.to_string_lossy(),
+      "fallback": state.home_fallback,
+      "warnings": state.home_warnings,
+    },
     "homeDir": state.home_dir.to_string_lossy(),
     "runtimeDir": state.runtime_dir.to_string_lossy(),
     "appRoot": state.app_root.to_string_lossy(),
@@ -248,7 +253,8 @@ fn build_report(app: &AppHandle, elapsed: Duration) -> Value {
     "smokeCommandHelp": [
       "show", "hide", "quit", "restart-node", "restart-registry", "restart-webadmin",
       "show-webadmin", "autostart-on", "autostart-off", "reload-config", "renderer-info",
-      "menu:tray-open", "menu:tray-hide", "menu:tray-restart-webadmin", "menu:tray-restart-registry"
+      "menu:tray-open", "menu:tray-hide", "menu:tray-open-webadmin",
+      "menu:tray-restart-webadmin", "menu:tray-restart-registry"
     ],
     "webAdmin": {
       "enabled": web_admin.enabled,
