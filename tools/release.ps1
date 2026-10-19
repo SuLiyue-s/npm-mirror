@@ -108,7 +108,8 @@ if ($LASTEXITCODE -ne 0) {
   # 没有可提交内容时继续（例如仅重发）
   Write-Host '没有需要提交的改动（可能已提交），继续打 tag。'
 }
-& git tag -d $tag 2>$null | Out-Null
+$existingTags = @(& git tag --list $tag)
+if ($existingTags.Count -gt 0) { & git tag -d $tag | Out-Null }
 & git tag -a $tag -m ('桌面版 v' + $ver)
 if ($LASTEXITCODE -ne 0) { Fail '创建 tag 失败：' + $tag }
 
