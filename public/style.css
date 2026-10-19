@@ -953,7 +953,10 @@ pre.code{
 /* 「补 tarball」逐包行：整行本身就是该包的下载进度条（包名与进度文字压在条内），左侧不再用色条 */
 .taskrow.tr-fillrow{position:relative;overflow:hidden;padding:0;border-left-width:1px;display:block}
 .taskrow.tr-fillrow .tr-in{position:relative;z-index:1;display:flex;gap:8px;align-items:baseline;justify-content:space-between;padding:6px 9px}
-.taskrow.tr-fillrow .tr-name{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* 包名是行内唯一可收缩项：min-width:0 才能让 text-overflow:ellipsis 真正生效（否则长包名会把右侧内容挤出可视区） */
+.taskrow.tr-fillrow .tr-name{min-width:0;flex:1 1 auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* 并发路数徽标（复用 .badge 组件）：不参与收缩、靠右常显；无路数时由 [hidden] 隐藏 */
+.taskrow.tr-fillrow .tr-in>.tr-lanes{flex:0 0 auto;align-self:center;margin-left:2px}
 .taskrow.tr-fillrow .tr-fill{position:absolute;left:0;top:0;bottom:0;width:0;background:rgba(255,255,255,.05);transition:width .35s linear;z-index:0}
 .taskrow.tr-fillrow.pending .tr-fill{background:rgba(255,255,255,.04)}
 .taskrow.tr-fillrow.busy .tr-fill{background:linear-gradient(90deg,rgba(255,190,90,.14),rgba(255,190,90,.30))}

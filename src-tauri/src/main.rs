@@ -1,6 +1,7 @@
 // 桌面程序入口：
-// 单实例 -> 解析主数据目录 -> 解压内嵌运行时 -> 创建隐藏主窗口/托盘 -> 启动 Node 子进程 ->
-// 收到 Node ready 后导航到内部管理界面并显示窗口；关闭窗口只隐藏，退出时优雅关闭 Node。
+// 单实例 -> 解析配置目录/主数据目录 -> 解压内嵌运行时 -> 创建隐藏主窗口/托盘（并校验 WebView2 可用性）
+// -> 启动 Node 子进程 -> 收到 Node ready 后导航到内部管理界面并显示窗口；
+// 关闭窗口只隐藏，退出时优雅关闭 Node。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod autostart;
@@ -20,7 +21,7 @@ mod winutil;
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -28,29 +29,159 @@ use tauri::{AppHandle, Manager, RunEvent};
 
 use crate::state::AppState;
 
+/// 启动失败分类：窗口/WebView2 校验失败给出可操作提示；其余错误给出通用提示。
+#[derive(Clone)]
+enum StartupError {
+  Window(window::WindowFailure),
+  Other(String),
+}
+
+impl StartupError {
+  fn kind(&self) -> &'static str {
+    match self {
+      StartupError::Window(failure) => failure.kind,
+      StartupError::Other(_) => "other",
+    }
+  }
+
+  fn message(&self) -> String {
+    match self {
+      StartupError::Window(failure) => format!(
+        "主窗口/WebView2 校验失败：{}（{}）",
+        failure.reason, failure.detail
+      ),
+      StartupError::Other(message) => message.clone(),
+    }
+  }
+}
+
+impl std::fmt::Display for StartupError {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    formatter.write_str(&self.message())
+  }
+}
+
+impl From<String> for StartupError {
+  fn from(message: String) -> Self {
+    StartupError::Other(message)
+  }
+}
+
+// 启动阶段已收集的环境摘要（写失败报告用；setup 闭包出错后 AppState 不可访问，故提前缓存）
+static STARTUP_SUMMARY: Mutex<Option<serde_json::Value>> = Mutex::new(None);
+// setup 闭包中的启动失败信息：build() 返回 Err 后由 main 统一写报告/弹提示框
+static STARTUP_FAILURE: Mutex<Option<StartupError>> = Mutex::new(None);
+
+fn set_startup_failure(error: StartupError) {
+  if let Ok(mut guard) = STARTUP_FAILURE.lock() {
+    *guard = Some(error);
+  }
+}
+
+fn take_startup_failure() -> Option<StartupError> {
+  STARTUP_FAILURE.lock().ok().and_then(|mut guard| guard.take())
+}
+
 fn main() {
   let args = parse_args();
   let smoke_mode = smoke::enabled();
   let error_report_path = args.smoke_report.clone();
-  if let Err(err) = run(args) {
-    eprintln!("桌面程序启动失败：{err}");
-    logging::error(format!("启动失败：{err}"));
+  let result = run(args);
+  // setup 闭包里的失败信息优先（包含窗口/WebView2 失败细节）
+  let setup_failure = take_startup_failure();
+  if let Err(err) = result {
+    let error = setup_failure.unwrap_or(err);
+    let message = error.message();
+    eprintln!("桌面程序启动失败：{message}");
+    logging::error(format!("启动失败：{message}"));
+    // smoke 模式统一由主程序写一份失败报告后退出（不弹框），便于受限环境 e2e 断言
     if let Some(path) = &error_report_path {
-      let payload = serde_json::json!({ "error": err, "smoke": smoke_mode });
+      let payload = build_failure_report(&message, error.kind());
       let _ = std::fs::write(path, format!("{payload}\n"));
     }
     if !smoke_mode {
-      winutil::message_box(
-        format!("{} 启动失败：\n\n{err}", paths::PRODUCT_NAME),
-        paths::PRODUCT_NAME,
-        true,
-      );
+      match &error {
+        StartupError::Window(failure) => show_window_failure_box(failure),
+        StartupError::Other(_) => winutil::message_box(
+          format!(
+            "{} 启动失败：\n\n{message}\n\n请查看日志：{}",
+            paths::PRODUCT_NAME,
+            logging::log_path()
+              .map(|path| path.display().to_string())
+              .unwrap_or_else(|| "desktop.log".to_string())
+          ),
+          paths::PRODUCT_NAME,
+          true,
+        ),
+      }
     }
     std::process::exit(1);
   }
 }
 
-fn run(args: state::StartupArgs) -> Result<(), String> {
+/// 窗口/WebView2 不可用时给用户的可操作提示（区分「WebView2 缺失」与「受限环境」）。
+fn show_window_failure_box(failure: &window::WindowFailure) {
+  let webview2 = winutil::webview2_version();
+  let (hint, need_webview2) = match webview2 {
+    Some(version) => (
+      format!(
+        "已检测到 WebView2 Runtime（{version}）。\n\n若主窗口一直无法显示，通常是因为从受限/沙盒环境（预览面板、受限 token）启动，\
+无法完成 WebView2 渲染进程通信。请从资源管理器直接双击本程序重试。"
+      ),
+      false,
+    ),
+    None => (
+      "未检测到 Microsoft Edge WebView2 Runtime。Windows 10 1803 及以上通常已自带；\
+若缺失请安装 WebView2 Runtime 后重试。".to_string(),
+      true,
+    ),
+  };
+  let title = if need_webview2 {
+    format!("{} 无法显示主窗口", paths::PRODUCT_NAME)
+  } else {
+    format!("{} 无法显示主窗口（环境受限）", paths::PRODUCT_NAME)
+  };
+  winutil::message_box(
+    format!(
+      "主窗口/WebView2 校验失败：\n\n{}\n\n{hint}\n\n详细信息：{}\n\n日志：{}",
+      failure.reason,
+      failure.detail,
+      logging::log_path()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "desktop.log".to_string())
+    ),
+    title,
+    true,
+  );
+}
+
+/// 非 smoke 模式下 setup 阶段失败：尽量写一份失败报告（若指定 --smoke-report）、
+/// 弹可操作说明框，然后退出。此时尚未启动 Node，不会残留子进程/托盘图标。
+fn handle_startup_failure(app: &AppHandle, error: &StartupError) {
+  if let Some(path) = app.state::<AppState>().args.smoke_report.clone() {
+    let payload = build_failure_report(&error.message(), error.kind());
+    let _ = std::fs::write(path, format!("{payload}\n"));
+  }
+  match error {
+    StartupError::Window(failure) => show_window_failure_box(failure),
+    StartupError::Other(message) => winutil::message_box(
+      format!(
+        "{} 启动失败：\n\n{message}\n\n若本程序是从聊天窗口/预览面板/受限终端启动的，\
+请改为从 Windows 资源管理器直接双击程序重试。\n\n日志：{}",
+        paths::PRODUCT_NAME,
+        logging::log_path()
+          .map(|path| path.display().to_string())
+          .unwrap_or_else(|| "desktop.log".to_string())
+      ),
+      paths::PRODUCT_NAME,
+      true,
+    ),
+  }
+  logging::error("桌面壳初始化失败，进程退出");
+  std::process::exit(1);
+}
+
+fn run(args: state::StartupArgs) -> Result<(), StartupError> {
   // 单实例：已有实例在运行时，尝试唤醒它的窗口后退出
   if let single_instance::InstanceCheck::AlreadyRunning = single_instance::acquire() {
     let activated = single_instance::activate_existing();
@@ -65,6 +196,7 @@ fn run(args: state::StartupArgs) -> Result<(), String> {
 
   // 桌面配置目录：MIRROR_DESKTOP_HOME > %LOCALAPPDATA%\LiYueNpmMirror > 程序目录 > %TEMP% > 程序目录备用。
   // 受限环境（沙箱/预览面板继承受限 token）写不了 %LOCALAPPDATA% 时自动回退，不再启动即失败。
+  // 提示框统一在主窗口校验之后给出（见 setup_app），避免同一问题弹两次。
   let home_resolution = paths::effective_home()?;
   let home = home_resolution.path.clone();
   // 日志初始化失败不阻断启动（配置目录可用但日志文件被占用等极端情况）
@@ -88,41 +220,55 @@ fn run(args: state::StartupArgs) -> Result<(), String> {
   }
   if home_resolution.fallback {
     logging::warn(format!(
-      "用户配置目录不可写，已改用备用配置目录：{}",
-      home.display()
-    ));
-    // 非冒烟模式：启动后弹一次说明框，引导用户从资源管理器双击运行（避免受限/沙盒环境）
-    if !smoke::enabled() {
-      let reason = home_resolution
+      "用户配置目录不可写，已改用备用配置目录：{}（原因：{}）",
+      home.display(),
+      home_resolution
         .warnings
         .first()
         .cloned()
-        .unwrap_or_else(|| "用户配置目录不可写".to_string());
-      let fallback_path = home.display().to_string();
-      thread::spawn(move || {
-        // 稍微延迟，让主窗口/托盘先建立，提示框不会挡住启动流程
-        thread::sleep(Duration::from_millis(1_500));
-        winutil::message_box(
-          format!(
-            "无法写入用户配置目录：\n\n{reason}\n\n已改用：{fallback_path}\n\n若主窗口无法显示或功能异常，请从资源管理器直接双击本程序（不要从受限/沙盒环境启动）。"
-          ),
-          paths::PRODUCT_NAME,
-          false,
-        );
-      });
-    }
+        .unwrap_or_else(|| "用户配置目录不可写".to_string())
+    ));
+    // 受限 shell 提前给出可操作提示（不影响 smoke 模式；正式桌面且窗口正常时用户可忽略）
+    logging::warn(
+      "运行环境似乎是受限 shell（用户配置目录回退）。若界面显示/操作异常，请从资源管理器直接双击本程序。",
+    );
   }
 
-  // 主数据目录：--data-dir > MIRROR_DATA_DIR > 指针文件 > <exe 目录>/data
+  // WebView2 Runtime 版本仅用于日志/报告（缺失会导致窗口创建失败，提示框会说明）
+  let webview2_version = winutil::webview2_version();
+  logging::info(format!(
+    "WebView2 Runtime 版本：{}",
+    webview2_version.clone().unwrap_or_else(|| "未检测到".to_string())
+  ));
+
+  // 主数据目录：--data-dir > MIRROR_DATA_DIR > 指针文件 > 自动发现/默认
   let resolution = paths::resolve_data_dir(&args, &home)?;
   for warning in &resolution.warnings {
     logging::warn(warning);
   }
+  let data_dir_default = paths::exe_dir().join("data");
   logging::info(format!(
-    "主数据目录：{}（来源：{}）",
+    "主数据目录：{}（来源：{}，默认值：{}）",
     resolution.path.display(),
-    resolution.source.as_str()
+    resolution.source.as_str(),
+    data_dir_default.display()
   ));
+
+  // 缓存启动环境摘要供失败报告使用
+  *STARTUP_SUMMARY.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(serde_json::json!({
+    "home": {
+      "path": home.display().to_string(),
+      "fallback": home_resolution.fallback,
+      "warnings": &home_resolution.warnings,
+    },
+    "dataDir": resolution.path.display().to_string(),
+    "dataDirSource": resolution.source.as_str(),
+    "dataDirDefault": data_dir_default.display().to_string(),
+    "webview2Version": webview2_version,
+    "exePath": paths::exe_path().display().to_string(),
+    "exeDir": paths::exe_dir().display().to_string(),
+    "logPath": logging::log_path().map(|path| path.display().to_string()),
+  }));
 
   // 解压内嵌运行时（node.exe + app 资产）
   let runtime_dir = embed::ensure_runtime(&home)?;
@@ -147,22 +293,30 @@ fn run(args: state::StartupArgs) -> Result<(), String> {
       let handle = app.handle().clone();
       if let Err(err) = setup_app(&handle) {
         logging::error(format!("桌面程序初始化失败：{err}"));
-        if !smoke::enabled() {
-          winutil::message_box(
-            format!("{} 初始化失败：\n\n{err}", paths::PRODUCT_NAME),
-            paths::PRODUCT_NAME,
-            true,
-          );
+        set_startup_failure(err.clone());
+        if smoke::enabled() {
+          // smoke 模式：窗口/托盘校验失败仍继续运行（受限环境 e2e 依赖 Node 服务/托盘挂钩），
+          // 失败原因写入 --smoke-report 的 window 字段，由测试断言。
+          logging::warn(format!(
+            "smoke 模式：桌面壳初始化失败仍继续运行（窗口/托盘能力可能不可用）：{err}"
+          ));
+          return Ok(());
         }
-        return Err(std::io::Error::new(std::io::ErrorKind::Other, err).into());
+        // 非 smoke：交给事件循环启动后的后台线程弹说明框再退出。
+        // （setup 钩子运行在事件循环初始化阶段，部分受限环境下消息框无法正常显示）
+        let handle_failure = handle.clone();
+        thread::spawn(move || {
+          thread::sleep(Duration::from_millis(120));
+          handle_startup_failure(&handle_failure, &err);
+        });
       }
       Ok(())
     })
     .build(tauri::generate_context!())
-    .map_err(|err| format!("创建桌面应用失败：{err}"))?;
+    .map_err(|err| StartupError::Other(format!("创建桌面应用失败：{err}")))?;
 
   app.run(|app_handle, event| match event {
-    RunEvent::ExitRequested { api, .. } => {
+    RunEvent::ExitRequested { code: _, api, .. } => {
       // 未走退出流程时拦截退出（Alt+F4/任务栏关闭等应由托盘「退出程序」或 Node 请求触发）
       let state = app_handle.state::<AppState>();
       if !state.allow_exit.load(Ordering::SeqCst) {
@@ -179,7 +333,7 @@ fn run(args: state::StartupArgs) -> Result<(), String> {
   Ok(())
 }
 
-fn setup_app(app: &AppHandle) -> Result<(), String> {
+fn setup_app(app: &AppHandle) -> Result<(), StartupError> {
   let state = app.state::<AppState>();
   let data_dir = state.data_dir_snapshot();
   // 初始读取配置（admin.enabled / ui.title），后续由 config_watch 每秒轮询
@@ -190,10 +344,36 @@ fn setup_app(app: &AppHandle) -> Result<(), String> {
   ));
   *state::lock(&state.config) = config;
 
-  // 主窗口先隐藏创建，等 Node ready 后再导航并显示
-  window::create(app)?;
-  // 托盘（图标 + 右键菜单 + 左键单击）
-  tray::init(app)?;
+  let smoke_mode = smoke::enabled();
+  let mut window_failure: Option<window::WindowFailure> = None;
+  // 1) 主窗口先隐藏创建，并校验 WebView2 是否真的可用（受限环境会在此失败）
+  match window::create(app) {
+    Ok(_) => logging::info("主窗口创建并通过 WebView2 校验"),
+    Err(failure) if smoke_mode => {
+      logging::warn(format!(
+        "主窗口校验失败（smoke 模式继续启动 Node/托盘，供受限环境 e2e 使用）：{}（{}）",
+        failure.reason, failure.detail
+      ));
+      window_failure = Some(failure);
+    }
+    Err(failure) => return Err(StartupError::Window(failure)),
+  }
+
+  // 2) 托盘（图标 + 右键菜单 + 左键单击）
+  match tray::init(app) {
+    Ok(()) => {}
+    Err(err) if smoke_mode => {
+      logging::warn(format!("托盘创建失败（smoke 模式继续启动 Node）：{err}"));
+    }
+    Err(err) => return Err(StartupError::Other(format!("创建托盘失败：{err}"))),
+  }
+
+  // 3) 窗口/托盘校验通过后再启动 Node（受限环境 smoke 模式允许窗口校验失败但仍启动，便于 e2e）
+  if window_failure.is_none() {
+    logging::info("窗口/托盘校验通过，开始启动 Node");
+  } else {
+    logging::warn("窗口校验未通过（受限环境），继续启动 Node 子进程");
+  }
   // 配置文件轮询：admin.enabled -> 托盘菜单；ui.title -> 窗口标题
   config_watch::start(app.clone());
   // 启动 Node 子进程
@@ -242,6 +422,41 @@ fn start_initial_node(app: &AppHandle) {
       });
     }
   }
+}
+
+/// 构造启动失败报告：smoke 模式下写 --smoke-report（fields 与成功报告尽量兼容）。
+fn build_failure_report(message: &str, kind: &str) -> serde_json::Value {
+  let summary = STARTUP_SUMMARY
+    .lock()
+    .ok()
+    .and_then(|guard| guard.clone())
+    .unwrap_or_else(|| serde_json::json!({}));
+  let window_failure = window::startup_failure();
+  let window_status = window::failure_snapshot();
+  let tray_labels = tray::labels_snapshot();
+  let mut report = serde_json::json!({
+    "smoke": true,
+    "startupOk": false,
+    "error": message,
+    "errorKind": kind,
+    "startupFailure": window_failure.as_ref().map(|failure| serde_json::json!({
+      "kind": failure.kind,
+      "reason": failure.reason,
+      "detail": failure.detail,
+    })),
+    "window": window_status,
+    "tray": { "labels": tray_labels },
+    "pid": std::process::id(),
+    "version": env!("CARGO_PKG_VERSION"),
+    "logPath": logging::log_path().map(|path| path.display().to_string()),
+  });
+  // 合并启动阶段环境摘要（home/dataDir/dataDirSource/webview2Version 等）
+  if let (Some(object), Some(extra)) = (report.as_object_mut(), summary.as_object()) {
+    for (key, value) in extra {
+      object.entry(key.clone()).or_insert_with(|| value.clone());
+    }
+  }
+  report
 }
 
 fn parse_args() -> state::StartupArgs {

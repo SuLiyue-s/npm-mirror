@@ -188,6 +188,10 @@ pub enum DataDirSource {
   CliArg,
   Env,
   Pointer,
+  /// 程序目录 / 上级目录中已存在的数据（自动发现）
+  Internal,
+  /// 从 <exe目录>/../data 自动发现的项目根数据
+  ParentProject,
   Default,
 }
 
@@ -197,6 +201,8 @@ impl DataDirSource {
       DataDirSource::CliArg => "cli",
       DataDirSource::Env => "env",
       DataDirSource::Pointer => "pointer",
+      DataDirSource::Internal => "internal",
+      DataDirSource::ParentProject => "parent-project",
       DataDirSource::Default => "default",
     }
   }
@@ -209,7 +215,26 @@ pub struct DataDirResolution {
   pub warnings: Vec<String>,
 }
 
-/// 解析主数据目录：--data-dir > MIRROR_DATA_DIR > 指针文件 > <exe 目录>/data。
+/// 判断目录内是否已有既有数据（config.json 或 storage/），用于数据目录自动发现。
+fn has_existing_data(dir: &Path) -> bool {
+  dir.join("config.json").is_file() || dir.join("storage").is_dir()
+}
+
+/// 目录是否不存在或为空目录。
+fn is_missing_or_empty_dir(dir: &Path) -> bool {
+  if !dir.exists() {
+    return true;
+  }
+  match fs::read_dir(dir) {
+    Ok(mut entries) => entries.next().is_none(),
+    Err(_) => false,
+  }
+}
+
+/// 解析主数据目录：
+/// --data-dir > MIRROR_DATA_DIR > 指针文件 > 自动发现（<exe目录>/data 已有数据 → 用它；
+/// <exe目录>/data 不存在或为空且 <exe目录>/../data/config.json 存在 → 上级项目数据；
+/// 否则 <exe目录>/data 默认目录）。
 pub fn resolve_data_dir(args: &StartupArgs, home: &Path) -> Result<DataDirResolution, String> {
   let mut warnings: Vec<String> = Vec::new();
 
@@ -245,7 +270,7 @@ pub fn resolve_data_dir(args: &StartupArgs, home: &Path) -> Result<DataDirResolu
       }
       Err(err) => {
         let message = format!(
-          "数据目录指针 {} 指向的目录无效（{err}），已回退到默认目录",
+          "数据目录指针 {} 指向的目录无效（{err}），已忽略并继续自动发现",
           dir.display()
         );
         logging::warn(&message);
@@ -254,12 +279,44 @@ pub fn resolve_data_dir(args: &StartupArgs, home: &Path) -> Result<DataDirResolu
     }
   }
 
-  let default_dir = exe_dir().join("data");
-  fs::create_dir_all(&default_dir)
-    .map_err(|e| format!("创建默认数据目录失败 {}：{e}", default_dir.display()))?;
-  validate_data_dir(&default_dir)?;
+  let exe_data = exe_dir().join("data");
+  // 第 4 档：程序目录下已有既有数据（dist 双击场景下用户把数据放在 exe 旁边）
+  if has_existing_data(&exe_data) {
+    validate_data_dir(&exe_data)?;
+    logging::info(format!(
+      "主数据目录自动发现：使用程序目录现有数据 {}",
+      exe_data.display()
+    ));
+    return Ok(DataDirResolution {
+      path: exe_data,
+      source: DataDirSource::Internal,
+      warnings,
+    });
+  }
+  // 第 5 档：程序目录 data 不存在或为空目录，且上级目录 data 已有 config.json → 项目根数据
+  if is_missing_or_empty_dir(&exe_data) {
+    if let Some(parent) = exe_dir().parent() {
+      let parent_data = parent.join("data");
+      if parent_data.join("config.json").is_file() {
+        validate_data_dir(&parent_data)?;
+        logging::info(format!(
+          "检测到上级目录现有数据：{}（自动使用项目根数据目录）",
+          parent_data.display()
+        ));
+        return Ok(DataDirResolution {
+          path: parent_data,
+          source: DataDirSource::ParentProject,
+          warnings,
+        });
+      }
+    }
+  }
+  // 第 6 档：默认 <exe 目录>/data（保持历史默认语义，不存在则创建）
+  fs::create_dir_all(&exe_data)
+    .map_err(|e| format!("创建默认数据目录失败 {}：{e}", exe_data.display()))?;
+  validate_data_dir(&exe_data)?;
   Ok(DataDirResolution {
-    path: default_dir,
+    path: exe_data,
     source: DataDirSource::Default,
     warnings,
   })

@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Manager};
 
 use crate::state::{self, AppState};
-use crate::{autostart, config_watch, logging, node_proc, paths, tray, window};
+use crate::{autostart, config_watch, logging, node_proc, paths, tray, window, winutil};
 
 pub fn enabled() -> bool {
   matches!(std::env::var("MIRROR_DESKTOP_SMOKE").ok().as_deref(), Some("1"))
@@ -214,6 +214,8 @@ fn build_report(app: &AppHandle, elapsed: Duration) -> Value {
   };
   json!({
     "smoke": true,
+    // 启动阶段窗口/WebView2 校验是否通过（受限环境 sandbox 下为 false，但 smoke 模式继续供 e2e 使用）
+    "startupOk": window::startup_failure().is_none(),
     "productName": state.product_name,
     "version": state.version,
     "pid": std::process::id(),
@@ -229,6 +231,9 @@ fn build_report(app: &AppHandle, elapsed: Duration) -> Value {
     "appRoot": state.app_root.to_string_lossy(),
     "dataDir": state.data_dir_snapshot().to_string_lossy(),
     "dataDirSource": state.data_dir_source_snapshot(),
+    "dataDirDefault": paths::exe_dir().join("data").to_string_lossy(),
+    "restricted": state.home_fallback,
+    "webview2Version": winutil::webview2_version(),
     "logPath": state.log_path.as_ref().map(|path| path.to_string_lossy().to_string()),
     "uptimeSecs": elapsed.as_secs_f64(),
     "autostart": {
@@ -248,6 +253,7 @@ fn build_report(app: &AppHandle, elapsed: Duration) -> Value {
     "webview2Dir": state.home_dir.join("webview2").to_string_lossy(),
     "tray": {
       "id": tray::TRAY_ID,
+      "created": app.tray_by_id(tray::TRAY_ID).is_some(),
       "labels": tray_labels,
     },
     "smokeCommandHelp": [

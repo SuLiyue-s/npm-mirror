@@ -1,6 +1,7 @@
 // 系统托盘：合成图标、动态右键菜单、左键单击显示窗口
 // 菜单项：打开窗口 / 关闭窗口 / [打开管理界面 / 重启管理界面（仅网页版管理开启时显示）] /
 //         重启镜像源服务 / 退出程序
+use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
@@ -24,10 +25,22 @@ pub const MENU_QUIT: &str = "tray-quit";
 // 由 tools/compose-desktop-icon.ps1 生成，纯 RGBA 字节（32x32）
 static TRAY_ICON: &[u8] = include_bytes!("../icons/tray-32.rgba");
 
+// 最近一次构建的菜单项文本（启动失败报告用，无需 AppHandle）
+static LAST_LABELS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// 读取最近一次托盘菜单文本（报告/诊断用）。
+pub fn labels_snapshot() -> Vec<String> {
+  LAST_LABELS
+    .lock()
+    .map(|guard| guard.clone())
+    .unwrap_or_default()
+}
+
 pub fn init(app: &AppHandle) -> Result<(), String> {
   let state = app.state::<AppState>();
-  let web_admin_enabled = state.web_admin_snapshot().enabled;
-  let menu = build_menu(app, web_admin_enabled)?;
+  // 与 config_watch 的实时刷新保持一致：config.admin.enabled 或 Node 桥报告已开启都算开启
+  let menu_enabled = state.config_snapshot().admin_enabled || state.web_admin_snapshot().enabled;
+  let menu = build_menu(app, menu_enabled)?;
   let tooltip = format!("{}（单击打开窗口）", state.product_name);
   TrayIconBuilder::with_id(TRAY_ID)
     .icon(Image::new(TRAY_ICON, 32, 32))
@@ -91,7 +104,10 @@ fn build_menu(app: &AppHandle, web_admin_enabled: bool) -> Result<Menu<Wry>, Str
   labels.push("重启镜像源服务".to_string());
   labels.push("退出程序".to_string());
   let state = app.state::<AppState>();
-  *state::lock(&state.tray_labels) = labels;
+  *state::lock(&state.tray_labels) = labels.clone();
+  if let Ok(mut guard) = LAST_LABELS.lock() {
+    *guard = labels;
+  }
   Ok(menu)
 }
 

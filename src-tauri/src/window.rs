@@ -18,6 +18,76 @@ static WINDOW_ICON: &[u8] = include_bytes!("../icons/window-256.rgba");
 // 窗口 API 在 WebView2 初始化失败等异常下会返回 Err，这里显式记录错误而不是静默丢弃。
 static LAST_WINDOW_ACTION: Mutex<Option<String>> = Mutex::new(None);
 
+/// 主窗口创建/WebView2 可用性校验失败信息：用于非 smoke 模式的可操作提示框与 smoke 报告。
+#[derive(Clone, Debug)]
+pub struct WindowFailure {
+  /// 失败类别（webview/window），写入冒烟报告
+  pub kind: &'static str,
+  /// 面向用户的简短原因
+  pub reason: String,
+  /// 底层错误详情（WebView2 的 runtime error 文本等）
+  pub detail: String,
+}
+
+// 启动阶段窗口校验失败信息（smoke 模式继续运行时供报告读取；成功启动后保持 None）
+static STARTUP_FAILURE: Mutex<Option<WindowFailure>> = Mutex::new(None);
+
+fn set_startup_failure(failure: &WindowFailure) {
+  if let Ok(mut guard) = STARTUP_FAILURE.lock() {
+    *guard = Some(failure.clone());
+  }
+}
+
+fn clear_startup_failure() {
+  if let Ok(mut guard) = STARTUP_FAILURE.lock() {
+    *guard = None;
+  }
+}
+
+/// 读取启动阶段窗口失败信息（无失败返回 None）。
+pub fn startup_failure() -> Option<WindowFailure> {
+  STARTUP_FAILURE.lock().ok().and_then(|guard| guard.clone())
+}
+
+// 最近一次窗口校验状态快照：窗口创建失败时无法拿到 AppHandle 写详细报告，先记录关键字段。
+static LAST_WINDOW_STATUS: Mutex<Option<serde_json::Value>> = Mutex::new(None);
+
+fn record_status(patch: serde_json::Value) {
+  if let Ok(mut guard) = LAST_WINDOW_STATUS.lock() {
+    let mut merged = guard.take().unwrap_or_else(|| serde_json::json!({}));
+    if let (Some(target), Some(extra)) = (merged.as_object_mut(), patch.as_object()) {
+      for (key, value) in extra {
+        target.insert(key.clone(), value.clone());
+      }
+    }
+    *guard = Some(merged);
+  }
+}
+
+/// 读取最近一次窗口校验状态快照（启动失败报告用）。
+pub fn failure_snapshot() -> serde_json::Value {
+  LAST_WINDOW_STATUS
+    .lock()
+    .ok()
+    .and_then(|guard| guard.clone())
+    .unwrap_or_else(|| serde_json::json!({}))
+}
+
+fn window_failure(kind: &'static str, reason: &str, detail: impl Into<String>) -> WindowFailure {
+  let failure = WindowFailure {
+    kind,
+    reason: reason.to_string(),
+    detail: detail.into(),
+  };
+  logging::error(format!(
+    "窗口校验失败：kind={} reason={} detail={}",
+    failure.kind, failure.reason, failure.detail
+  ));
+  set_startup_failure(&failure);
+  failure
+}
+
+
 fn record_action(message: String) {
   logging::info(format!("窗口动作：{message}"));
   if let Ok(mut guard) = LAST_WINDOW_ACTION.lock() {
@@ -62,6 +132,7 @@ pub fn diagnostics(app: &AppHandle) -> serde_json::Value {
     },
     None => (None, Some("窗口对象不存在".to_string())),
   };
+  let startup_failure = startup_failure();
   serde_json::json!({
     "label": WINDOW_LABEL,
     "created": created,
@@ -71,19 +142,26 @@ pub fn diagnostics(app: &AppHandle) -> serde_json::Value {
     "url": url,
     "urlError": url_error,
     "lastAction": last_action(),
+    // 启动阶段窗口/WebView2 校验失败原因（正常启动为 null）
+    "failureKind": startup_failure.as_ref().map(|failure| failure.kind),
+    "failureReason": startup_failure.as_ref().map(|failure| failure.reason.clone()),
+    "failureDetail": startup_failure.as_ref().map(|failure| failure.detail.clone()),
   })
 }
 
 
-pub fn create(app: &AppHandle) -> Result<WebviewWindow, String> {
+pub fn create(app: &AppHandle) -> Result<WebviewWindow, WindowFailure> {
   let state = app.state::<AppState>();
   let prefs = state::lock(&state.prefs).clone();
   let width = prefs.width.unwrap_or(1280.0).max(1024.0);
   let height = prefs.height.unwrap_or(860.0).max(700.0);
   // 初始先打开空白页，等 Node ready 后再导航到内部管理地址
-  let placeholder = "about:blank"
-    .parse()
-    .map_err(|err| format!("解析初始 URL 失败：{err}"))?;
+  let placeholder = match "about:blank".parse::<tauri::Url>() {
+    Ok(url) => url,
+    Err(err) => {
+      return Err(window_failure("window", "解析初始 URL 失败", err.to_string()));
+    }
+  };
   let mut builder = WebviewWindowBuilder::new(app, WINDOW_LABEL, WebviewUrl::External(placeholder))
     .title(state.window_title())
     .inner_size(width, height)
@@ -112,22 +190,103 @@ pub fn create(app: &AppHandle) -> Result<WebviewWindow, String> {
     "创建主窗口（隐藏）：label={WINDOW_LABEL} size={width}x{height} webview2Dir={}",
     webview_data_dir.display()
   ));
-  let webview_window = match builder
-    .icon(Image::new(WINDOW_ICON, 256, 256))
-    .map_err(|err| format!("设置窗口图标失败：{err}"))?
-    .build()
-  {
-    Ok(webview_window) => webview_window,
+  let icon = Image::new(WINDOW_ICON, 256, 256);
+  let built = builder.icon(icon);
+  let built = match built {
+    Ok(builder_with_icon) => builder_with_icon,
     Err(err) => {
-      logging::error(format!("创建主窗口失败：{err}"));
-      return Err(format!("创建主窗口失败：{err}"));
+      record_status(serde_json::json!({
+        "created": false,
+        "failureKind": "window",
+        "failureReason": "设置窗口图标失败",
+        "failureDetail": err.to_string(),
+      }));
+      return Err(window_failure("window", "设置窗口图标失败", err.to_string()));
     }
   };
-  let created_hwnd = webview_window.hwnd().ok().map(|handle| handle.0 as isize);
-  let created_visible = webview_window.is_visible().map_err(|err| err.to_string());
+  let webview_window = match built.build() {
+    Ok(webview_window) => webview_window,
+    Err(err) => {
+      record_status(serde_json::json!({
+        "created": false,
+        "failureKind": "window",
+        "failureReason": "创建主窗口失败",
+        "failureDetail": err.to_string(),
+      }));
+      return Err(window_failure("window", "创建主窗口失败", err.to_string()));
+    }
+  };
+  // 关键校验：窗口对象创建成功不代表 WebView2 可用。受限环境（沙箱/预览面板/受限 token）
+  // 下 build() 可能返回 Ok，但窗口句柄/is_visible/url 均返回 runtime error，导致窗口永远不可见。
+  let created_hwnd = match webview_window.hwnd() {
+    Ok(hwnd) => hwnd.0 as isize,
+    Err(err) => {
+      record_status(serde_json::json!({
+        "created": true,
+        "hwnd": null,
+        "hwndError": err.to_string(),
+        "failureKind": "webview",
+        "failureReason": "窗口句柄不可用：WebView2 运行时初始化失败",
+      }));
+      return Err(window_failure(
+        "webview",
+        "窗口句柄不可用：WebView2 运行时初始化失败",
+        err.to_string(),
+      ));
+    }
+  };
+  let created_visible = match webview_window.is_visible() {
+    Ok(value) => value,
+    Err(err) => {
+      record_status(serde_json::json!({
+        "created": true,
+        "hwnd": created_hwnd,
+        "visible": null,
+        "visibleError": err.to_string(),
+        "failureKind": "webview",
+        "failureReason": "WebView2 渲染进程不可用：窗口无法显示",
+      }));
+      return Err(window_failure(
+        "webview",
+        "WebView2 渲染进程不可用：窗口无法显示",
+        err.to_string(),
+      ));
+    }
+  };
+  if let Err(err) = webview_window.url() {
+    record_status(serde_json::json!({
+      "created": true,
+      "hwnd": created_hwnd,
+      "visible": created_visible,
+      "url": null,
+      "urlError": err.to_string(),
+      "failureKind": "webview",
+      "failureReason": "WebView2 通信失败：无法读取窗口地址",
+    }));
+    return Err(window_failure(
+      "webview",
+      "WebView2 通信失败：无法读取窗口地址",
+      err.to_string(),
+    ));
+  }
+  clear_startup_failure();
   logging::info(format!(
-    "主窗口已创建：hwnd={created_hwnd:?} is_visible={created_visible:?}"
+    "主窗口校验通过：hwnd={created_hwnd} is_visible={created_visible}（WebView2 可用）"
   ));
+  record_action(format!(
+    "主窗口创建并校验通过：hwnd={created_hwnd} is_visible={created_visible}"
+  ));
+  record_status(serde_json::json!({
+    "label": WINDOW_LABEL,
+    "created": true,
+    "hwnd": created_hwnd,
+    "visible": created_visible,
+    "url": null,
+    "urlError": null,
+    "failureKind": null,
+    "failureReason": null,
+    "failureDetail": null,
+  }));
   if prefs.maximized {
     let _ = webview_window.maximize();
   }

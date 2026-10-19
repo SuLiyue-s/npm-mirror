@@ -22,7 +22,8 @@ const STILL_ACTIVE_CODE: u32 = 259;
 
 pub fn message_box(text: impl AsRef<str>, title: impl AsRef<str>, error: bool) {
   let text = HSTRING::from(text.as_ref());
-  let title = HSTRING::from(title.as_ref());
+  let title_text = title.as_ref().to_string();
+  let title = HSTRING::from(title_text.as_str());
   let style = if error {
     MESSAGEBOX_STYLE(MB_OK.0 | MB_ICONERROR.0 | MB_SETFOREGROUND.0)
   } else {
@@ -30,7 +31,13 @@ pub fn message_box(text: impl AsRef<str>, title: impl AsRef<str>, error: bool) {
   };
   unsafe {
     // 有主窗口时挂到主窗口上，消息框居中于窗口而不是屏幕
-    MessageBoxW(current_process_main_window(), &text, &title, style);
+    let owner = current_process_main_window();
+    let result = MessageBoxW(owner, &text, &title, style);
+    // 记录消息框结果，便于受限环境（无交互桌面/窗口创建被拒绝）排查
+    crate::logging::info(format!(
+      "消息框已返回：title={title_text:?} result={} owner={:?}",
+      result.0, owner
+    ));
   }
 }
 
@@ -198,7 +205,6 @@ struct ProcessReader<'a> {
   current_pid: u32,
   found: Option<HWND>,
 }
-
 unsafe extern "system" fn enum_windows_for_exe(window: HWND, lparam: LPARAM) -> windows::core::BOOL {
   let reader = unsafe { &mut *(lparam.0 as *mut ProcessReader) };
   let mut pid = 0u32;
@@ -218,4 +224,67 @@ unsafe extern "system" fn enum_windows_for_exe(window: HWND, lparam: LPARAM) -> 
     }
     _ => true.into(),
   }
+}
+
+/// 读取 WebView2 Runtime 版本（注册表 EdgeUpdate Clients 键，读不到时扫描安装目录）。
+/// 仅用于启动日志与冒烟报告，WebView2 本身由系统安装；缺失时窗口会创建失败。
+pub fn webview2_version() -> Option<String> {
+  use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ};
+  use winreg::RegKey;
+
+  const CLIENT_GUID: &str = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}";
+  let candidates = [
+    (
+      HKEY_LOCAL_MACHINE,
+      format!("SOFTWARE\\WOW6432Node\\Microsoft\\EdgeUpdate\\Clients\\{CLIENT_GUID}"),
+    ),
+    (
+      HKEY_LOCAL_MACHINE,
+      format!("SOFTWARE\\Microsoft\\EdgeUpdate\\Clients\\{CLIENT_GUID}"),
+    ),
+    (
+      HKEY_CURRENT_USER,
+      format!("Software\\Microsoft\\EdgeUpdate\\Clients\\{CLIENT_GUID}"),
+    ),
+  ];
+  for (root, path) in candidates {
+    if let Ok(key) = RegKey::predef(root).open_subkey_with_flags(&path, KEY_READ) {
+      if let Ok(version) = key.get_value::<String, _>("pv") {
+        let version = version.trim().to_string();
+        if !version.is_empty() {
+          return Some(version);
+        }
+      }
+    }
+  }
+  // 注册表不可读时（受限/便携环境）扫描常见安装目录
+  for env_name in ["ProgramFiles(x86)", "ProgramFiles"] {
+    if let Some(base) = std::env::var_os(env_name) {
+      let dir = PathBuf::from(base)
+        .join("Microsoft")
+        .join("EdgeWebView")
+        .join("Application");
+      if let Ok(entries) = std::fs::read_dir(dir) {
+        let mut found: Option<String> = None;
+        for entry in entries.flatten() {
+          let name = entry.file_name().to_string_lossy().to_string();
+          let looks_version = name
+            .chars()
+            .next()
+            .map(|ch| ch.is_ascii_digit())
+            .unwrap_or(false);
+          if !looks_version {
+            continue;
+          }
+          if found.as_ref().map(|current| name > *current).unwrap_or(true) {
+            found = Some(name);
+          }
+        }
+        if found.is_some() {
+          return found;
+        }
+      }
+    }
+  }
+  None
 }

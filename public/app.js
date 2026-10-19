@@ -2230,17 +2230,25 @@
           var fill = el('i', { class: 'tr-fill', style: 'width:0' });
           var tv = el('span', { class: 'tv', text: '' });
           var nameEl = el('span', { class: 'tr-name', text: p.name });
+          /* 并发路数独立成右侧徽标：行内只有包名可收缩（省略号），徽标 flex-shrink:0 始终可见 */
+          var lanesEl = el('span', { class: 'badge dim tr-lanes', hidden: true });
           var row = el('div', { class: 'taskrow tr-fillrow busy' }, [
             fill,
-            el('div', { class: 'tr-in' }, [nameEl, tv])
+            el('div', { class: 'tr-in' }, [nameEl, tv, lanesEl])
           ]);
-          it = map[p.name] = { row: row, fill: fill, tv: tv, nameEl: nameEl };
+          it = map[p.name] = { row: row, fill: fill, tv: tv, nameEl: nameEl, lanesEl: lanesEl };
           box.appendChild(row);
         }
         /* 每行显示「被分配了几路并行」：导入时同一个包可能被多个 worker（lane）一起处理，
-         * 右侧进度详情要能直接看出这个包分到了几路（lane 数随任务快照的 inFlight 一起下来）。 */
+         * 路数单独放在行尾徽标里（不拼进包名），窄栏下也不会被包名的省略号吃掉；
+         * lane 数随任务快照的 inFlight 一起下来，没有路数时徽标隐藏。 */
         var lanes = Math.max(0, Number(p.lanes) || 0);
-        var nameTxt = p.name + (lanes > 0 ? ' · ' + lanes + ' 路' : '');
+        it.lanesEl.hidden = !(lanes > 0);
+        if (lanes > 0) {
+          it.lanesEl.textContent = lanes + ' 路';
+          setTip(it.lanesEl, '该包分配了 ' + lanes + ' 路并行任务');
+        }
+        var nameTxt = p.name;
         if (p.spin) {
           /* 并行打包：一个正在压缩的文件一行，显示文件大小 + 「压缩中…」（完成后由左栏逐包列表接管） */
           it.nameEl.textContent = nameTxt;

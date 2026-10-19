@@ -3,9 +3,11 @@
 /*
  * 一键跑完所有自检：
  *   1. 先确认镜像源在运行（不在运行会给出提示）
- *   2. Windows 下先跑 test/tray-check.js（托盘项目图标 / 启动脚本 / 左键右键行为 / favicon，
+ *   2. 跑 test/desktop-cancel-test.js（离线包导入取消回归：解包/扫描/写存储任一阶段取消都要
+ *      2 秒内收敛、临时目录清理；只写仓库 tmp/，不依赖服务与端口，失败不阻断后续自检）
+ *   3. Windows 下再跑 test/tray-check.js（托盘项目图标 / 启动脚本 / 左键右键行为 / favicon，
  *      非 Windows 或沙箱禁止子进程时其中需真跑 PowerShell 的几项会自动跳过）
- *   3. 再跑 test/api-test.js（注册表协议 + 管理 API + 发布/删除 + 离线包导入导出 + 安全回归；
+ *   4. 最后跑 test/api-test.js（注册表协议 + 管理 API + 发布/删除 + 离线包导入导出 + 安全回归；
  *      环境不足 / 破坏性用例会显式 SKIP）
  * 用法：node test/run-all.js [--base 管理界面地址] [--registry-base 镜像源地址] [--destructive]
  *   --base           管理界面监听地址（管理 API + 网页控制台，默认 config.admin.ip:admin.port）
@@ -65,6 +67,14 @@ function runNode(script, args) {
   process.stdout.write('服务在线，开始自检。\n');
   process.stdout.write('\x1b[2m自检模式：快速（不包含大量导包类耗时用例）\x1b[0m\n');
 
+  /* 离线包导入取消回归（v0.0.3）：不依赖服务（只写仓库 tmp/，不监听端口），所以放在最前面；
+   * 退出码非 0 记为失败、继续跑其余自检，最终以非 0 退出（不掩盖后续结果）。 */
+  process.stdout.write('\n===== 离线包导入取消回归（test/desktop-cancel-test.js）=====\n');
+  let cancelCode = await runNode('desktop-cancel-test.js', []);
+  if (cancelCode !== 0) {
+    process.stdout.write(`\x1b[31m离线包导入取消回归未通过（退出码 ${cancelCode}），继续跑其余自检。\x1b[0m\n`);
+  }
+
   if (process.platform === 'win32' && fs.existsSync(path.join(__dirname, 'tray-check.js'))) {
     process.stdout.write('\n===== 托盘 / 图标 / 启动脚本自检（test/tray-check.js）=====\n');
     const trayCode = await runNode('tray-check.js', ['--base', BASE, '--registry-base', REG_BASE]);
@@ -74,5 +84,7 @@ function runNode(script, args) {
   process.stdout.write('\n===== 接口与功能自检（test/api-test.js）=====\n');
   const apiArgs = ['--base', BASE, '--registry-base', REG_BASE];
   if (DESTRUCTIVE) apiArgs.push('--destructive');
-  process.exit(await runNode('api-test.js', apiArgs));
+  const apiCode = await runNode('api-test.js', apiArgs);
+  // 取消回归失败（api 通过时）也要以非 0 退出，让一键自检如实报告失败
+  process.exit(apiCode !== 0 ? apiCode : (cancelCode || 0));
 })();

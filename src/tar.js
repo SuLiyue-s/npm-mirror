@@ -576,10 +576,12 @@ function makeReader(stream) {
  *   onEntry(relPath, writtenBytes)              每个文件解出后的回调
  *   maxTotalBytes / maxEntries / maxEntryBytes / maxPaxBytes  覆盖默认上限
  *   concurrency                                 并发写盘的文件数（默认 1，建议 4~32，SSD/多核可到 64；tar 流仍是单流顺序读）
+ *   shouldAbort()                               返回 true 时抛 code=ECANCELED（主循环每个条目、写文件每块数据都会检查，
+ *                                               取消解包不必等整个大包解完；已解出的半成品由本函数清理）
  */
 async function extractTarGz(file, destDir, opts = {}) {
   const {
-    filter, onEntry,
+    filter, onEntry, shouldAbort,
     maxTotalBytes = DEFAULT_MAX_TOTAL_BYTES,
     maxEntries = DEFAULT_MAX_ENTRIES,
     maxEntryBytes = DEFAULT_MAX_ENTRY_BYTES,
@@ -598,6 +600,9 @@ async function extractTarGz(file, destDir, opts = {}) {
   let consumed = 0;
   let headers = 0;
   let zeroRun = 0;          // 连续全零块计数：两个即归档结束
+  /** 取消检查：主循环每个条目、写文件每块数据、跳过条目流式丢弃时都会调用，
+   *  保证取消后最多再处理一块（1MB）就中断，不用等整个大包解完。 */
+  const abortCheck = () => { if (shouldAbort && shouldAbort()) throw canceledError('解包已取消'); };
 
   /* 多并发写盘：tar.gz 的 gzip 解压是单流顺序读，但「open/write/close 每个条目」可以流水化。
    * 单文件写流收尾（close）期间不阻塞主循环继续读下一条目，最多同时保留 concurrency 个未收尾写流，
@@ -657,6 +662,7 @@ async function extractTarGz(file, destDir, opts = {}) {
   async function drain(n, what) {
     let remain = n;
     while (remain > 0) {
+      abortCheck();
       if (avail() === 0) {
         if (!(await need(Math.min(remain, 1 << 20)))) throw truncated(what);
       }
@@ -703,6 +709,7 @@ async function extractTarGz(file, destDir, opts = {}) {
 
   try {
     while (true) {
+      abortCheck();
       if (!(await need(BLOCK))) break;
       const header = take(BLOCK);
       addConsumed(BLOCK);
@@ -790,6 +797,7 @@ async function extractTarGz(file, destDir, opts = {}) {
       let remaining = size;
       while (remaining > 0) {
         if (pendingWriteErr) throw pendingWriteErr;
+        abortCheck();
         if (avail() === 0) {
           if (!(await need(Math.min(remaining, 1 << 20)))) throw truncated('文件内容');
         }

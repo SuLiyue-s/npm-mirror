@@ -21,6 +21,10 @@
     · 阶段 1g：程序配置目录回退——%LOCALAPPDATA% 不可写、未设 MIRROR_DESKTOP_HOME 时
       自动回退到 <exe目录>\LiYueNpmMirror（v0.0.2 修复；0.0.1 会报「创建桌面配置目录 …
       拒绝访问 (os error 5)」）
+    · 阶段 1h：数据目录自动发现（v0.0.3 新增）——exe 放在 <项目>\portable\dist\ 下、
+      不传 --data-dir 且未设 MIRROR_DATA_DIR 时，若 <exe目录>\data 不存在/为空而
+      上级 <项目>\portable\data\config.json 存在，应自动使用上级 data
+      （smoke 报告 dataDir=上级 data、dataDirSource=parent-project）
     · 阶段 2（admin.enabled=true）
         - 两个端口都监听，浏览器可访问管理界面（GET / 200 + HTML）
         - /desktop/info 字段校验（版本、数据目录、默认数据目录、webAdmin、internal 端口）
@@ -578,6 +582,8 @@ function Start-DesktopApp {
     [string]$Exe = '',
     # 可选：显式数据目录；空 = 使用 $script:DataDir
     [string]$DataDirArg = '',
+    # 可选：不传 --data-dir（阶段 1h 数据目录自动发现测试用；同时不得设置 MIRROR_DATA_DIR）
+    [switch]$NoDataDir,
     # 可选：不设置 MIRROR_DESKTOP_HOME（让程序走 %LOCALAPPDATA% / 回退逻辑）
     [switch]$NoDesktopHome,
     # 可选：覆盖子进程的 LOCALAPPDATA（阶段 1g 用一个「不可创建」的路径模拟受限账户）
@@ -593,7 +599,10 @@ function Start-DesktopApp {
   $script:SmokeCmdPath = $cmdPath
   $exeToRun = if ($Exe) { $Exe } else { $script:ExePath }
   $dataDirToUse = if ($DataDirArg) { $DataDirArg } else { $script:DataDir }
-  $argLine = '--data-dir "' + $dataDirToUse + '" --smoke-report "' + $reportPath + '" --smoke-cmd "' + $cmdPath + '"'
+  $argLine = '--smoke-report "' + $reportPath + '" --smoke-cmd "' + $cmdPath + '"'
+  if (-not $NoDataDir) {
+    $argLine = '--data-dir "' + $dataDirToUse + '" ' + $argLine
+  }
   # 沙箱/受限环境通常不允许写 %LOCALAPPDATA%，用 Rust 壳支持的 MIRROR_DESKTOP_HOME
   # 把桌面配置/日志/解压运行时/WebView2 用户数据放到仓库 tmp 下。
   # MIRROR_DESKTOP_SMOKE=1 是产品内置的测试挂钩（正常启动时完全惰性，不产生行为）：
@@ -1127,6 +1136,18 @@ if ($rep1Ready) {
   } else {
     Assert-True '窗口加载的现有管理界面可访问（GET 内部管理地址 200 + HTML）' $false '窗口 URL 为空，窗口尚未导航（见上方失败明细）' 'window'
   }
+
+  # v0.0.3 启动诊断：窗口初始化失败时必须能看到可读原因（window.failureReason），
+  # 而不是只留下一个「进程在跑但看不到窗口」的黑盒状态。
+  $diagWin = Get-Prop $script:LastSmokeReport 'window'
+  $diagFailProp = $null
+  if ($null -ne $diagWin) { $diagFailProp = $diagWin.PSObject.Properties['failureReason'] }
+  if ($winUrl1.Length -eq 0) {
+    $diagReason = if ($null -ne $diagFailProp) { [string]$diagFailProp.Value } else { '' }
+    Assert-True '窗口不可用时报告给出可操作的失败原因（window.failureReason 非空）' ($null -ne $diagFailProp -and $diagReason.Length -gt 0) ('实际：' + $diagReason) 'window'
+  } else {
+    Assert-True '窗口正常时报告仍包含启动诊断字段 window.failureReason' ($null -ne $diagFailProp)
+  }
 }
 
 Assert-True '默认配置下网页版管理端口不监听（admin.enabled=false）' (-not (Test-Port $AdminPort)) ('端口 ' + $AdminPort)
@@ -1308,6 +1329,65 @@ $portsFreed1g = Wait-Until { (-not (Test-Port $RegistryPort)) -and (-not (Test-P
 Assert-True '阶段 1g 清理后测试端口全部释放' $portsFreed1g
 if (Test-Path $fallbackRoot) { Remove-Item $fallbackRoot -Recurse -Force -ErrorAction SilentlyContinue }
 Assert-True '阶段 1g 临时目录已清理' (-not (Test-Path $fallbackRoot))
+
+# ---------------------------------------------------------------------------
+# 阶段 1h：数据目录自动发现（v0.0.3 新增）
+# 场景：便携布局 <项目>\portable\dist\<exe> + <项目>\portable\data\config.json。
+# 启动时不传 --data-dir、不设 MIRROR_DATA_DIR：程序应识别「<exe目录>\data 不存在
+# 或为空、上级 data\config.json 存在」，自动使用上级 data 目录（source=parent-project），
+# 而不是在 dist\ 下新建 data\。用 exe 副本在临时目录测试，结束清理。
+# ---------------------------------------------------------------------------
+Section '阶段 1h：数据目录自动发现（dist 运行 → 上级项目 data，dataDirSource=parent-project）'
+$portableRoot = Join-Path $script:Root 'tmp\e2e-portable'
+if (Test-Path $portableRoot) { Remove-Item $portableRoot -Recurse -Force -ErrorAction SilentlyContinue }
+$portableDist = Join-Path $portableRoot 'portable\dist'
+$portableData = Join-Path $portableRoot 'portable\data'
+[void](New-Item -ItemType Directory -Path $portableDist -Force)
+[void](New-Item -ItemType Directory -Path $portableData -Force)
+$portableExe = Join-Path $portableDist ('npm-mirror-desktop-' + $script:PkgVersion + '.exe')
+Copy-Item $script:ExePath $portableExe -Force
+
+# 在「上级项目 data」里生成测试配置（端口 14873/14874、admin.enabled=false），
+# 再把 $script:DataDir 恢复为全局测试数据目录（本阶段不传 --data-dir）。
+$oldDataDir1h = $script:DataDir
+$script:DataDir = $portableData
+$seeded1h = Set-TestConfig -WebAdminEnabled $false
+$script:DataDir = $oldDataDir1h
+Assert-True '已生成阶段 1h 测试配置（上级项目 data\config.json，admin.enabled=false）' ($seeded1h -and (Test-Path (Join-Path $portableData 'config.json')))
+
+$p1h = Start-DesktopApp -Exe $portableExe -NoDataDir -ReportPrefix 'portable'
+Info ('已用 exe 副本启动桌面进程 PID=' + $p1h.Id + '（未传 --data-dir，未设 MIRROR_DATA_DIR），验证数据目录自动发现…')
+$rep1h = Wait-SmokeReport {
+  param($r)
+  $n = Get-Prop $r 'node'
+  $dd = [string](Get-Prop $r 'dataDir')
+  return (((Get-Prop $n 'ready') -eq $true) -and ($dd.Length -gt 0))
+} 150 400
+if ($null -ne $rep1h) {
+  $dataDir1h = [string](Get-Prop $rep1h 'dataDir')
+  $dataSrc1h = [string](Get-Prop $rep1h 'dataDirSource')
+  Assert-True ('自动发现的数据目录 = 上级项目 data（' + $portableData + '）') ((Normalize-Path $dataDir1h) -eq (Normalize-Path $portableData)) ('实际：' + $dataDir1h)
+  Assert-True 'dataDirSource = parent-project（自动发现而非默认 <exe目录>\data）' ($dataSrc1h -eq 'parent-project') ('实际：' + $dataSrc1h)
+  Assert-True '未在 dist\ 下新建 data 目录（第 4 档未被误判）' (-not (Test-Path (Join-Path $portableDist 'data'))) ('路径：' + (Join-Path $portableDist 'data'))
+} else {
+  Assert-Skip '数据目录自动发现（smoke 报告 dataDir / dataDirSource）' '等待超时或报告未包含相关字段（旧 exe 不支持时无法判定），需人工确认'
+}
+$ping1h = Wait-Until { Test-Ping $RegistryPort } 60 400
+Assert-True '自动发现数据目录后镜像源服务正常启动（/-/ping 200）' $ping1h
+if ($ping1h) {
+  Update-TrackedNodePidsFromLog
+  Assert-True '自动发现路径下读到了测试配置（admin.enabled=false，管理端口不监听）' (-not (Test-Port $AdminPort))
+  Assert-True '自动发现数据目录内已创建 logs（服务确实使用该数据根）' (Test-Path (Join-Path $portableData 'logs')) ('目录：' + (Join-Path $portableData 'logs'))
+} else {
+  Exit-IfWindowBlocked -Proc $p1h -Detail '阶段 1h 未等到镜像源服务'
+  Show-Diagnostics
+}
+
+Stop-TrackedProcesses
+$portsFreed1h = Wait-Until { (-not (Test-Port $RegistryPort)) -and (-not (Test-Port $AdminPort)) } 15 300
+Assert-True '阶段 1h 清理后测试端口全部释放' $portsFreed1h
+if (Test-Path $portableRoot) { Remove-Item $portableRoot -Recurse -Force -ErrorAction SilentlyContinue }
+Assert-True '阶段 1h 临时目录已清理' (-not (Test-Path $portableRoot))
 
 # ---------------------------------------------------------------------------
 # 阶段 2：admin.enabled=true，验证网页版管理、桌面 API、一键脚本

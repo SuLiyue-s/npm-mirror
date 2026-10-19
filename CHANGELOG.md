@@ -36,6 +36,35 @@
 - `test/run-all.js` 一键自检（约 40~60 秒，`--destructive` 含破坏性用例），已移除 `--full` 完整回归参数；与 6 个 `test/ui-e2e-*.js` 默认地址改为管理界面端口并分别探测两个监听
 - 破坏性用例（重启镜像源服务 / 重启管理界面 / 清空日志）默认跳过，加 `--destructive` 才执行
 
+## [0.0.3] - 2026-10-19
+
+**桌面版可观测性与启动方式修复版（本地构建，未发布到 GitHub Releases）**：修复受限环境启动后「没有窗口、没有托盘却进程在跑」的可见性问题，新增数据目录自动发现与一键启动脚本，并修复离线包导入取消卡死、进度弹窗并发路数被长包名截掉的问题。
+
+> 本版本按用户要求**只在本机构建**，产物保留在 `dist\npm-mirror-desktop-0.0.3.exe`，**不推送 GitHub、不发布 Release**；需要从 GitHub 下载安装的用户请继续使用 [v0.0.2](https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.2) 发布版。
+
+### 修复
+
+- 修复从受限环境启动后**看不到窗口和托盘、但进程仍在运行**的问题（用户反馈第 2、3 条）：v0.0.3 在创建窗口与托盘后会校验 WebView2 / 托盘是否真的可用；不可用时弹出**可操作的说明框**（提示「请用 Windows 资源管理器打开程序所在目录，双击 exe 运行；不要在聊天窗口 / 沙盒 / 受限终端中启动」，以及安装 WebView2 Runtime 的指引），随后清理 Node 子进程与托盘并退出，不再留下「静默跑着但看不到」的进程。用户 v0.0.2 的日志（`%LOCALAPPDATA%` 创建目录被拒 `os error 5`、WebView2 `runtime error: failed to receive message from webview`）表明其启动环境是受限环境。测试模式（`MIRROR_DESKTOP_SMOKE=1`）下不弹框、继续运行，以便自动化验收。
+- 修复「配置目录不可写」时的回退**提示弹框**（用户反馈第 1 条）：去掉这个只有一行「创建目录失败」、关掉后仍无界面的弹框，改为**静默回退 + 桌面日志 WARN**；程序配置目录仍按五级顺序探测：`MIRROR_DESKTOP_HOME` → `%LOCALAPPDATA%\LiYueNpmMirror` → `<exe 所在目录>\LiYueNpmMirror` → `%TEMP%\LiYueNpmMirror` → `<exe 所在目录>\.LiYueNpmMirror`。
+- 修复「导入离线包」在**解包阶段点取消后任务一直卡在「等待开始…」**永不结束的问题（用户反馈第 4 条）：取消现在会中止解包 / 扫描 / 写入存储各阶段并清理未完成包的临时目录，任务在约 1~2 秒内进入「已取消」终态；正常导入 / 导出 / 上传不受影响。
+- 修复任务进度弹窗右栏的「包名 · N 路」在**包名过长时把并发路数截掉**的问题（用户反馈第 5 条）：并发路数改为独立、右对齐、不参与省略号的角标元素，包名再长也能看到「N 路」。
+- 修复桌面版在 `dist\` 目录直接运行时把数据建到 `dist\data`、读不到项目根 `data\` 的问题（用户反馈第 1 条中「程序在运行目录建 data」）。
+
+### 新增
+
+- **数据目录自动发现**：启动优先级为 `--data-dir` > `MIRROR_DATA_DIR`（环境变量）> 上次「选择目录…」的记录 > `<exe 所在目录>\data`（若其下已有 `config.json` 或 `storage\`）> **若 `<exe 所在目录>\data` 不存在或为空、且上级目录 `..\data\config.json` 存在，则自动改用上级项目的 `data\`**（日志记「检测到上级目录现有数据」，数据来源上报 `parent-project`）> 否则 `<exe 所在目录>\data`（来源 `default`）。把 exe 放进项目的 `dist\` 内双击即可直接读到 `项目根\data` 的现有数据。
+- **`启动桌面版.cmd`**：在仓库根（或放有 `dist\` 的目录）双击即可启动 `dist\` 下最新的 `npm-mirror-desktop-*.exe`，启动前打印窗口 / 托盘 / 网页版管理与启动方式提示；找不到 exe 时给出构建或放置提示。网页版 / 命令行的 `启动镜像源.cmd` 流程保持不变。
+- 启动诊断信息增强：桌面日志与测试报告增加程序配置目录解析结果（`home.path` / `home.fallback`）、实际数据目录来源（`dataDirSource`）与窗口初始化失败原因（`window.failureReason`），便于排查启动环境问题。
+
+### 文档
+
+- README / 使用说明新增 **「启动必读」**：桌面版**必须从 Windows 资源管理器双击 exe（或 `启动桌面版.cmd`）运行**；从聊天窗口、沙盒、IDE 预览面板、受限终端启动会继承受限权限，导致 WebView2 窗口 / 托盘不可用（v0.0.3 会弹出说明框并退出）；补充托盘图标可能收在任务栏「^」溢出区、数据目录自动发现规则、以及「本版本为本地构建、未发布 GitHub Releases」的说明。
+
+### 测试
+
+- `test/desktop-e2e.ps1` 适配 0.0.3：新增**「数据目录自动发现」**阶段——把 exe 复制到 `tmp` 布局的 `portable\dist\`、在上一级 `portable\data\config.json` 放测试配置、使用临时程序配置目录（`MIRROR_DESKTOP_HOME`），断言报告里 `dataDir` 指向上级 `data`、`dataDirSource=parent-project`、镜像源 ready；新增 smoke 报告 `window.failureReason` 可观测性断言；「程序配置目录回退」阶段保留（0.0.3 改静默回退）；版本 / 产物断言自动跟随 `package.json`（0.0.3）。
+- **v0.0.3 实测（`dist\npm-mirror-desktop-0.0.3.exe`，96,870,400 B，SHA256 `8f89fcb2…790c6`，2026-10-19 11:54:49）：153 项 = 143 通过 / 5 失败（均为窗口类环境限制）/ 5 跳过，退出码 3（ENVIRONMENT-LIMITED），非窗口类失败 0**；新增断言全部通过：程序配置目录回退 9/9、数据目录自动发现 9/9（`dataDirSource=parent-project`）、托盘关闭 4 项 / 开启 6 项（含「打开管理界面」「重启管理界面」）与实时切换（≤2s / ≤1s）、`window.failureReason` 非空。补充：`desktop-path-test.js` 24/24、`desktop-bridge-test.js` 11/11、`desktop-cancel-test.js` 13/13（取消 122ms 内收敛）；Lead 独立冒烟 42/42。历史 0.0.2：143 项 = 133/5/5，exit 3。
+
 ## [0.0.2] - 2026-10-19
 
 **桌面版修复版**：修复以受限权限启动时无法创建程序配置目录导致启动失败的问题，并新增托盘「打开管理界面」菜单项。

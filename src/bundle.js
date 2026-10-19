@@ -1188,17 +1188,35 @@ async function importBundle({
     let extracted = 0;
     const expectedPkgs = Number(mstats.packages) || 0;
     emit({ phase: 'extract', bytes: 0, totalBytes, packages: expectedPkgs });
-    await tar.extractTarGz(file, tmp, {
-      filter: rel => rel === 'manifest.json' || rel.startsWith('storage/'),
-      onEntry: (rel, written) => {
-        extracted += Number(written) || 0;
-        emit({ phase: 'extract', bytes: extracted, totalBytes, current: rel });
-      },
-      // 解包不再逐文件串行：读 tar 是单流，但写盘/建目录可以多路并行收尾
-      concurrency: Math.max(1, Math.min(64, Math.floor(Number(extractConcurrency)) || 1)),
-      maxTotalBytes: Math.max(2 * 1024 * 1024 * 1024, bundleSize * 4),
-      maxEntries: 2000000,
-    });
+    /* 解包可能持续几十秒到几分钟（整机镜像几个 GB）。取消检查必须下沉到 tar 的读写循环里，
+     * 否则用户点了取消还要等整包解完，界面一直停在「解包中」。取消时 tar 抛 ECANCELED，
+     * 这里收敛成「已取消」的部分结果（临时目录由外层 finally 清理）。 */
+    let aborted = false;
+    try {
+      await tar.extractTarGz(file, tmp, {
+        filter: rel => rel === 'manifest.json' || rel.startsWith('storage/'),
+        onEntry: (rel, written) => {
+          extracted += Number(written) || 0;
+          emit({ phase: 'extract', bytes: extracted, totalBytes, current: rel });
+        },
+        // 解包不再逐文件串行：读 tar 是单流，但写盘/建目录可以多路并行收尾
+        concurrency: Math.max(1, Math.min(64, Math.floor(Number(extractConcurrency)) || 1)),
+        maxTotalBytes: Math.max(2 * 1024 * 1024 * 1024, bundleSize * 4),
+        maxEntries: 2000000,
+        shouldAbort: canceled,
+      });
+    } catch (e) {
+      if (canceled() && e && e.code === 'ECANCELED') {
+        result.canceled = true;
+        aborted = true;
+      } else {
+        throw e;
+      }
+    }
+    if (aborted) {
+      if (logger) logger.info(`导入离线包已取消（解包阶段）：${result.file}`);
+      return result;
+    }
     const storageDir = path.join(tmp, 'storage');
     let dirs = [];
     try {
@@ -1217,6 +1235,8 @@ async function importBundle({
     const scanConc = Math.max(1, Math.min(64, Math.floor(Number(scanConcurrency)) || 8));
     let scannedCount = 0;
     const scanned = await mapLimit(dirs, scanConc, async (dir) => {
+      // 取消后不再继续读盘：每个包立刻返回，让扫描阶段毫秒级收敛（旧实现要扫完才响应）
+      if (canceled()) return null;
       try {
         const pkgDir = path.join(storageDir, dir);
         let st = null;
@@ -1237,6 +1257,15 @@ async function importBundle({
       }
     });
     emit({ phase: 'scan-done', scanned: scannedCount, total: dirs.length });
+    /* 用户反馈的场景：「解包完成后、写入本地存储前」点取消。
+     * 旧实现这里会掉进 laneLoop 的 waitForWork 空转（取消后不再开新包，
+     * 而终止条件要求 nextPkg 走完所有包），任务永不结束、界面一直「等待开始…」。
+     * 现在扫描结束发现已取消就直接返回已取消结果，不进入并行导入阶段。 */
+    if (canceled()) {
+      result.canceled = true;
+      if (logger) logger.info(`导入离线包已取消（扫描阶段）：${result.file}`);
+      return result;
+    }
     const pkgDirs = scanned.filter((row) => row && !row.__error && row.pkgDir && row.incomingPackument);
     if (pkgDirs.length < dirs.length && logger) {
       logger.warn(`导入离线包：${dirs.length - pkgDirs.length} 个包目录缺少/损坏 packument.json，已跳过`);
@@ -1567,8 +1596,12 @@ async function importBundle({
     /** 每个 lane 的主循环：有没打开过的包就先开新包，没有就抢其它包的版本任务，直到全部完成 */
     async function laneLoop() {
       for (;;) {
+        /* 0) 已取消：立刻退出。已打开的包在本轮循环里已 finalize 过；还有 lane 在跑的任务
+         *    由那个 lane 自己收尾。旧实现取消后不收尾、又不再开新包，会掉进下面的
+         *    waitForWork 空转（nextPkg 没走完、states 也永远不可能全部 finalized），任务永不结束。 */
+        if (canceled()) { result.canceled = true; return; }
         // 1) 还有没打开过的包：优先开新包，保持包级并行
-        if (!canceled() && nextPkg < pkgDirs.length) {
+        if (nextPkg < pkgDirs.length) {
           const st = openState(pkgDirs[nextPkg++]);
           try {
             await prepareState(st);
@@ -1589,13 +1622,14 @@ async function importBundle({
         if (task) { await runStolenTask(task); continue; }
         // 3) 所有包都已收尾 → 结束
         if (nextPkg >= pkgDirs.length && states.every((s) => s.finalized)) return;
-        // 4) 等有进展（版本任务完成 / 包收尾 / 取消）
+        // 4) 等有进展（版本任务完成 / 包收尾 / 取消）；取消后不等 250ms 兜底定时器，立刻退出
+        if (canceled()) { result.canceled = true; return; }
         await waitForWork();
-        if (canceled()) result.canceled = true;
       }
     }
 
     await Promise.all(Array.from({ length: laneCount }, () => laneLoop()));
+    if (canceled()) result.canceled = true;
 
     if (logger) {
       const tail = result.canceled ? '（已取消，保留已导入的部分）' : '';
