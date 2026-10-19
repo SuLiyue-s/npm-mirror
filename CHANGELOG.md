@@ -36,6 +36,47 @@
 - `test/run-all.js` 一键自检（约 40~60 秒，`--destructive` 含破坏性用例），已移除 `--full` 完整回归参数；与 6 个 `test/ui-e2e-*.js` 默认地址改为管理界面端口并分别探测两个监听
 - 破坏性用例（重启镜像源服务 / 重启管理界面 / 清空日志）默认跳过，加 `--destructive` 才执行
 
+## [0.0.1] - 2026-10-19
+
+**首个桌面版（Tauri 单 exe）**：把 Node 镜像源服务、管理界面与托盘打包成一个 `npm-mirror-desktop-0.0.1.exe`，双击即用、目标机器无需安装 Node.js；网页版 / 命令行版行为与数据格式保持不变。
+
+> 下载：[GitHub Releases v0.0.1](https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.1)（附件含 exe 与 `SHA256SUMS.txt`）。
+
+### 新增
+
+- **单 exe 桌面版**：Tauri 2 外壳（Rust）+ 内嵌 node.exe 与全部程序文件，首次运行解压到 `%LOCALAPPDATA%\LiYueNpmMirror\runtime\<版本>\` 后复用；构建脚本 `tools/build-desktop.ps1`（校验三处版本一致 → 嵌入 node.exe → 生成/校验图标 → 用 `tmp/cargo-home` 离线 `cargo build --release` → 输出 `dist/npm-mirror-desktop-<版本>.exe` + `dist/SHA256SUMS.txt`），支持 `-NodeExe` / `-ForceIcon` / `-DebugBuild` / `-NoOffline`。
+- **桌面窗口 = 现有管理界面**：窗口加载本机随机回环端口上的现有网页（顶栏版本 chip 显示 `0.0.1`）；左侧导航新增「控制台」「工具」两页，与现有六个页面共用同一套样式与组件。
+- **控制台页**：环形缓冲最多 3000 行，汇总服务日志（`server`）、一键脚本输出（`script`）与桌面操作事件（`desktop`），每行带 `seq` / 时间戳 / 级别 / 来源；约 1 秒增量轮询，支持暂停 / 继续 / 清空 / 复制 / 下载与级别、来源筛选。
+- **工具页**：桌面程序信息与「重启程序 / 退出程序 / 隐藏窗口」；服务控制「重启镜像源服务 / 重启管理界面 / 打开网页版管理界面」；开机自启开关；一键脚本「环境自检 / 查看状态 / 从 npm 缓存补包 / 一键导出全部包 / 一键导入离线包」；目录与日志「打开数据目录 / 日志目录 / 配置文件 / 复制路径」。
+- **托盘常驻**：左键单击打开窗口；右键「打开窗口 / 关闭窗口 / 重启管理界面（仅网页版管理开启时出现）/ 重启镜像源服务 / 退出程序」；关闭窗口只是隐藏，进程与服务继续运行；托盘菜单随网页版管理开关变化（≤2 秒内更新）。
+- **单实例**：命名互斥体 `Local\LiYueNpmMirrorDesktop`，重复双击只唤出已运行窗口，不会起第二个服务。
+- **网页版管理开关 `admin.enabled`（默认 `false`）**：默认不监听浏览器可访问的固定管理端口，只能从桌面窗口管理；在配置页「桌面 / 网页管理」打开后**即时生效**（无需重启程序）并按 `admin.ip:admin.port` 监听，关闭即断开；网页版 / 命令行模式固定开启、行为不变。开关变化通过桥事件通知托盘，Rust 侧另有 1 秒配置轮询兜底。
+- **主数据目录**：默认 `<exe目录>\data`，与网页版 / 命令行版共用同一数据格式；配置页只读输入框 +「选择目录…」原生文件夹选择器，选后确认并重启程序；非法路径（不存在 / 文件 / 磁盘根 / 相对路径 / NUL）被拒绝并给出中文错误；启动优先级 `--data-dir` > `MIRROR_DATA_DIR` > 记录文件（`%LOCALAPPDATA%\LiYueNpmMirror\data-location.json`）> `<exe目录>\data`。
+- **开机自启**：工具页一键开关，写入 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`（值名 `LiYueNpmMirror`，内容 `"<exe>" --autostart`），登录后隐藏窗口启动到托盘，无需管理员权限。
+- **Node 侧数据根改造**：`src/util.js` 新增 `appRoot()` / `dataRoot()` / `setDataRoot()` / `dataPath()` / `resolveWithinDataRoot()` / `isDesktop()`，全项目 `rootPath('data', …)` 迁移为 `dataPath(…)`；`storage.dir` 兼容旧值 `data/storage` 前缀，非法值回退 `<dataRoot>/storage` 并 warn（不阻塞服务启动）。
+- **一键脚本执行器**：`src/desktop-scripts.js` 白名单固定参数执行 `cli.js doctor / status / export --scope all / scan-cache + import-cache --all / import <文件> --overwrite`；输出逐行进控制台；同一脚本单实例、可取消（`taskkill /T /F`）；导入文件必须是存在的 `.tgz` / `.tar.gz` 且大小大于 0。
+- **Rust ↔ Node stdio 桥**：`@@BRIDGE@@` 前缀逐行 JSON，Node 上报 `ready`（含内部管理端口 / 数据目录 / pid / 网页版管理状态）、`req`、`event`、`bye`，Rust 下发 `res` 与 `cmd`（shutdown / restartWebAdmin / restartRegistry / showWebAdmin / console.log）；Node 子进程崩溃自动重启（最多 3 次，间隔 1s / 3s / 5s）。
+- **桌面 HTTP API**：`GET /desktop/info`、`GET /desktop/files`、`GET/DELETE /desktop/console`、`GET /desktop/scripts`、`POST /desktop/action`（pickFolder / pickFile / setDataDir / autostart / openPath / app.restart / app.quit / window.show|hide / script.run|script.cancel / service.restartRegistry|restartWebAdmin）；非桌面模式返回 400「仅桌面版可用」。
+- **版本与发版工具**：`node tools/version.js [<x.y.z>|--bump patch|minor|major]` 同步 `package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` 三处版本；`tools/release.ps1` 串起 bump → 构建 → 提交 → `tag v<版本>` → GitHub Release（网络受限时保留 commit/tag 并输出人工发布指引）。
+
+### 变更
+
+- 桌面模式下旧 `/service/*` 接口语义适配：「重启管理界面」只重绑网页版管理监听、「重启镜像源服务」只重绑镜像源监听、「重启程序」与「退出程序」走桥命令；桌面模式忽略 `openBrowserOnStart`，不再自动弹浏览器。
+- `PUT /config` 在桌面模式下保存后立即重绑网页版管理监听，响应附带 `webAdmin: { enabled, url, listenError }`，并广播 `webAdminChanged` 事件。
+- 桌面配置（窗口位置等）保存在 `%LOCALAPPDATA%\LiYueNpmMirror\desktop.json`，不写入 `data\config.json`。
+
+### 安全
+
+- 路径穿越防护：`resolveWithinDataRoot()` 对存储目录 / 数据根下的相对路径做规范化校验，`..`、绝对路径、NUL、磁盘根一律拒绝；`PUT /config` 的 `storage.dir` 穿越返回 400 中文错误；单测 `test/desktop-path-test.js` 覆盖。
+- 桌面版内部管理接口只监听 `127.0.0.1` 随机端口（仅窗口内使用）；默认不监听固定 admin 端口（`admin.enabled=false`），打开后仍受 `127/8` 回环校验与令牌鉴权。
+- 单实例互斥体避免多开抢端口与并发写同一份数据。
+
+### 测试
+
+- 新增 `test/desktop-path-test.js`（数据根 / 路径穿越单测）与 `test/desktop-bridge-test.js`（stdio 桥协议，用子进程模拟 Rust 端）。
+- 新增 `test/desktop-e2e.ps1` 桌面版端到端验收：dist exe 存在与版本信息、启动与窗口、内部管理 API、控制台 API、一键脚本 doctor/status、`admin.enabled` 端口监听开关、默认数据目录、关闭窗口后服务仍在线、退出后无残留进程与监听；使用临时数据目录 `tmp/e2e-data` 与端口 14873/14874，不碰真实 `data\`。
+- 桌面版实测结果与逐条验收证据见 `tmp/audit-desktop.md`（发布审计报告）与 `tmp/release-checklist.md`。
+
 ## [1.0.0] - 2026-10-17
 
 首个开源版本。零第三方依赖、可离线迁移的私人 npm 镜像源。
@@ -79,4 +120,5 @@
 - `test/ui-e2e-*.js`：浏览器端端到端脚本（需要本机 Chrome 调试端口，可选）
 - 破坏性用例（重启服务、清空日志）默认跳过，加 `--destructive` 才执行
 
+[0.0.1]: https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.1
 [1.0.0]: https://github.com/SuLiyue-s/npm-mirror/releases/tag/v1.0.0

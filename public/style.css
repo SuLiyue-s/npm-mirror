@@ -370,6 +370,9 @@ code,kbd,pre{font-family:var(--mono)}
   opacity:.42;cursor:not-allowed;filter:grayscale(.5);
 }
 .btn:disabled:hover,.btn-ghost:disabled:hover{background:transparent;box-shadow:none}
+/* 带 data-tip 的禁用按钮：pointer-events:none 会让悬停命中测试落空、tooltip 无法显示，
+ * 这里恢复命中（disabled 仍不可点击），交给 uiTip 用指针落点反查显示提示 */
+.btn[disabled][data-tip]{pointer-events:auto;cursor:not-allowed}
 .link{color:var(--cy);cursor:pointer;border-bottom:1px dashed rgba(46,230,196,.5)}
 .link:hover{color:#8ff0dd}
 
@@ -486,6 +489,8 @@ input.dt-input.is-empty{color:var(--txt-faint)}
 .dt-foot{display:flex;align-items:center;gap:7px;padding:8px 9px;border-top:1px solid var(--line);background:#0b1016}
 .dt-foot .spacer{flex:1}
 input.mono,textarea.mono{font-family:var(--mono);font-size:12px}
+/* 只读输入框（如主数据目录）：不允许编辑，鼠标指针不用文本光标 */
+input[readonly]{cursor:default}
 input:focus,select:focus,textarea:focus{outline:0;border-color:rgba(46,230,196,.6);box-shadow:0 0 0 2px var(--cy-glow);background:#0a1117}
 input::placeholder,textarea::placeholder{color:var(--txt-faint)}
 input[disabled],select[disabled],textarea[disabled]{opacity:.5;cursor:not-allowed}
@@ -776,6 +781,12 @@ input[type=checkbox]:disabled{opacity:.4;cursor:not-allowed}
 .log-line.lv-debug .lv{color:#557084}
 .log-line .lv{font-weight:600}
 
+/* 控制台页（侧边栏菜单页）：复用日志行样式，行内多一个来源角标与级别列 */
+.log-console{white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word}
+.log-console .log-line{padding:1px 0}
+.log-console .badge{margin-right:8px;vertical-align:1px}
+.log-console .lv{margin-right:6px}
+
 /* ---------- 15. 代码块 ---------- */
 pre.code{
   margin:0;padding:9px 11px;overflow:auto;max-height:260px;
@@ -880,6 +891,8 @@ pre.code{
 .toast.err .tico{color:var(--red)}
 .toast.warn{border-left-color:var(--am);box-shadow:0 14px 30px -18px #000,inset 0 0 22px rgba(255,179,71,.06)}
 .toast.warn .tico{color:var(--am)}
+/* toast 上的操作按钮（如「查看控制台」）：点击执行并关闭这条提示 */
+.toast .toast-act{margin-left:8px;flex:none;align-self:center}
 @keyframes toastIn{from{opacity:0;transform:translateX(26px)}to{opacity:1;transform:none}}
 @keyframes toastOut{to{opacity:0;transform:translateX(26px)}}
 

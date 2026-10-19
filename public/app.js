@@ -10,7 +10,9 @@
   var TOKEN_KEY = 'npm-mirror-token';
   var POLL_OVERVIEW = 10000;
   var POLL_LOGS = 5000;
-  var PAGES = ['overview', 'packages', 'migrate', 'config', 'logs', 'service'];
+  var POLL_CONSOLE = 1000;
+  var CONSOLE_MAX = 3000;
+  var PAGES = ['overview', 'console', 'packages', 'migrate', 'config', 'logs', 'service', 'tools'];
   var SOURCE_LABEL = { upstream: '上游', private: '私有', upload: '上传', cache: '缓存' };
 
   /* ================= 状态 ================= */
@@ -24,7 +26,13 @@
     pkg: { q: '', source: 'all', tarballs: 'all', sort: '-updated', page: 1, size: 20, total: 0, items: [], selected: {}, loading: false },
     mig: { bundles: [], limits: null, scope: 'all', scan: null, scanSel: {}, scanFilter: '', scanPage: 1 },
     cfg: { raw: null, baseline: null, path: '', revealed: false, programRestartNeeded: false },
-    logs: { lines: [], level: '' }
+    logs: { lines: [], level: '' },
+    /* 桌面版（Tauri）适配：/desktop/info 结果；null = 尚未取到 */
+    desktop: null,
+    /* 控制台页：内存缓冲最近 3000 行，lastSeq 用于 after= 增量轮询 */
+    console: { lines: [], lastSeq: 0, dropped: 0, paused: false, level: '', source: '', loading: false },
+    /* 工具页：脚本运行状态、开机自启、目录信息 */
+    tools: { scripts: { running: [], last: null }, filesData: null, filesLogs: null, filesCfg: null, tipInited: false }
   };
 
   /* ================= 基础工具 ================= */
@@ -119,17 +127,32 @@
       var t = ev.target;
       return t && t.closest ? t.closest('[data-tip]') : null;
     }
+    /* 禁用控件（disabled 按钮）不派发鼠标事件，事件会落到父级上；
+     * 这里用指针落点反查提示目标，保证「禁用 + 提示」的按钮也能显示自绘 tooltip。 */
+    function tipAtPoint(ev) {
+      if (ev.clientX == null || ev.clientY == null) return null;
+      var n = document.elementFromPoint(ev.clientX, ev.clientY);
+      return n && n.closest ? n.closest('[data-tip]') : null;
+    }
     document.addEventListener('mouseover', function (ev) {
-      var t = closestTip(ev);
+      var t = closestTip(ev) || tipAtPoint(ev);
       if (!t || t === cur) return;
       schedule(t);
     });
     document.addEventListener('mouseout', function (ev) {
       var t = closestTip(ev);
-      if (!t) return;
-      var to = ev.relatedTarget;
-      if (to && t.contains(to)) return;
-      hide();
+      if (t) {
+        var to = ev.relatedTarget;
+        if (to && t.contains(to)) return;
+        hide();
+        return;
+      }
+      /* 事件来自禁用控件的父级：指针已离开当前提示目标时隐藏 */
+      if (cur) {
+        var to2 = ev.relatedTarget;
+        if (to2 && cur.contains(to2)) return;
+        hide();
+      }
     });
     window.addEventListener('scroll', hide, true);
     window.addEventListener('resize', hide);
@@ -298,7 +321,7 @@
 
   /* ================= Toast ================= */
   var TOAST_ICON = { ok: '✓', err: '✕', warn: '!', info: 'i' };
-  function toast(msg, type, ms) {
+  function toast(msg, type, ms, action) {
     type = type || 'info';
     var box = $('#toasts');
     if (!box) return;
@@ -312,6 +335,16 @@
       setTimeout(function () { if (t.parentNode) t.parentNode.removeChild(t); }, 240);
     };
     t.addEventListener('click', kill);
+    /* 可选操作按钮（如「查看控制台」）：点击后执行回调并关闭这条 toast */
+    if (action && action.label) {
+      var act = el('button', { class: 'btn btn-xs toast-act', type: 'button', text: action.label });
+      act.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        kill();
+        if (action.onClick) action.onClick();
+      });
+      t.appendChild(act);
+    }
     box.appendChild(t);
     while (box.children.length > 6) box.removeChild(box.firstChild);
     setTimeout(kill, ms || (type === 'err' ? 7000 : 4200));
@@ -973,6 +1006,7 @@
   function resumePolls() {
     if (state.page === 'overview') { loadOverview(true); startPoll('overview', loadOverview, POLL_OVERVIEW); }
     else if (state.page === 'logs') { loadLogs(true); startPoll('logs', loadLogs, POLL_LOGS); }
+    else if (state.page === 'console' && !state.console.paused && !!(state.desktop && state.desktop.desktop)) { loadConsole(true); startPoll('console', loadConsole, POLL_CONSOLE); }
   }
 
   /* ================= 运行时长（实时刷新） =================
@@ -1131,6 +1165,8 @@
     else if (page === 'config') loadConfig();
     else if (page === 'logs') { loadLogs(); startPoll('logs', loadLogs, POLL_LOGS); }
     else if (page === 'service') loadService();
+    else if (page === 'console') enterConsole();
+    else if (page === 'tools') loadTools();
   }
 
   /* ============================================================
@@ -4575,6 +4611,9 @@
         grid
       ]));
     });
+
+    /* 「桌面 / 网页管理」分组：数据来自 /desktop/info；非桌面模式显示但桌面专属控件禁用 */
+    host.appendChild(buildDesktopCfgGroup());
   }
 
   function collectConfigDiff() {
@@ -4610,6 +4649,8 @@
     api('/config', { method: 'PUT', body: payload, timeout: 60000 }).then(function (d) {
       btnBusy(btn, false);
       state.cfg.raw = d.config || state.cfg.raw;
+      /* 桌面版：保存后若网页版管理界面被即时重绑，响应里带 webAdmin 状态（DESIGN 4.5） */
+      if (d.webAdmin && state.desktop) state.desktop.webAdmin = d.webAdmin;
       state.cfg.baseline = JSON.parse(JSON.stringify(state.cfg.raw));
       state.cfg.revealed = false;   // 保存后返回的令牌是掩码，回到「未显示」状态，避免把掩码当令牌展示/复制
       paintConfig();
@@ -4626,6 +4667,14 @@
       setText('cfg-status', need ? '已保存，需要重启：' + parts.join('、') : '已保存并生效');
       if (need) toast('配置已保存，需要重启' + parts.join('、') + '后生效', 'warn', 7000);
       else toast('配置已保存并生效', 'ok');
+      /* 桌面版：把网页版管理界面的即时生效结果反馈到界面 */
+      if (d.webAdmin) {
+        if (d.webAdmin.listenError) toast('网页版管理界面启动失败：' + d.webAdmin.listenError, 'err', 9000);
+        else if (d.webAdmin.enabled) toast('网页版管理界面已开启' + (d.webAdmin.url ? '：' + d.webAdmin.url : ''), 'ok', 7000);
+        else toast('网页版管理界面已关闭（桌面窗口仍可管理）', 'info', 6000);
+      }
+      if (d.hint) toast(String(d.hint), 'warn', 7000);
+      if (state.page === 'tools') paintTools();
       loadSession().then(syncRestartBanner).catch(function () {});
     }, function (e) { btnBusy(btn, false); setText('cfg-status', '保存失败：' + e.message); handleErr(e); });
   }
@@ -4707,6 +4756,720 @@
   }
 
   /* ============================================================
+   * 5.5 桌面版适配 / 控制台 / 工具
+   * ============================================================ */
+
+  /* ---------- 桌面版公共 ---------- */
+  function isDesktop() { return !!(state.desktop && state.desktop.desktop); }
+
+  /* 控制台文本可能带 ANSI 颜色转义（脚本输出），显示前统一剥离 */
+  function stripAnsi(s) { return String(s == null ? '' : s).replace(/\u001b\[[0-9;]*m/g, ''); }
+
+  /* 统一的外部打开：桌面版走系统默认浏览器（Rust 侧 openPath），网页版 window.open */
+  function openExternal(url) {
+    if (!url) return;
+    if (isDesktop()) {
+      desktopAction('openPath', { target: 'url', url: url }).then(function () {}, function (e) { handleErr(e); });
+    } else {
+      window.open(url, '_blank');
+    }
+  }
+
+  function desktopAction(action, params, timeout) {
+    return api('/desktop/action', {
+      method: 'POST',
+      body: { action: action, params: params || {} },
+      timeout: timeout || 20000
+    });
+  }
+
+  /* 取 /desktop/info：桌面窗口内返回 desktop:true，网页 / CLI 模式返回 desktop:false。
+   * 旧版后端没有该接口时按网页版处理，不阻塞界面、不弹错误框。 */
+  function loadDesktopInfo() {
+    return api('/desktop/info', { timeout: 15000 }).then(function (d) {
+      state.desktop = d || { desktop: false };
+      document.documentElement.dataset.desktop = state.desktop.desktop ? '1' : '0';
+      if (state.desktop.desktop && state.desktop.version) setTip($('#chip-version'), '桌面版 v' + state.desktop.version);
+      else setTip($('#chip-version'), '服务端版本');
+      adaptDesktopUi();
+      updateDesktopCfgGroup();
+      if (state.page === 'tools') paintTools();
+      return state.desktop;
+    }, function (e) {
+      state.desktop = { desktop: false, error: e.message };
+      document.documentElement.dataset.desktop = '0';
+      adaptDesktopUi();
+      updateDesktopCfgGroup();
+      if (state.page === 'tools') paintTools();
+      return state.desktop;
+    }).catch(function () {});
+  }
+
+  /* 服务页在桌面版下的文案：停止 = 退出程序、重启进程 = 重启程序 */
+  function adaptDesktopUi() {
+    var svc = $('#view-service');
+    if (!svc) return;
+    var quitB = svc.querySelector('[data-act="shutdown"] b');
+    var quitI = svc.querySelector('[data-act="shutdown"] i');
+    var procB = svc.querySelector('[data-act="restart-process"] b');
+    var procI = svc.querySelector('[data-act="restart-process"] i');
+    if (isDesktop()) {
+      if (quitB) quitB.textContent = '退出程序';
+      if (quitI) quitI.textContent = '结束桌面程序（含镜像源与管理界面），需手动重新启动';
+      if (procB) procB.textContent = '重启程序';
+      if (procI) procI.textContent = '整个程序重启，管理界面与镜像源都短暂不可用';
+    } else {
+      if (quitB) quitB.textContent = '停止服务';
+      if (quitI) quitI.textContent = '停止镜像源服务，所有客户端将无法安装依赖';
+      if (procB) procB.textContent = '重启程序';
+      if (procI) procI.textContent = '重启整个 Node 进程，镜像源与管理界面短暂不可用';
+    }
+  }
+
+  /* ---------- 控制台页 ---------- */
+  var CONSOLE_SOURCE = {
+    server: { label: '服务', badge: '' },
+    script: { label: '脚本', badge: ' private' },
+    desktop: { label: '桌面', badge: ' cache' }
+  };
+
+  function consoleTime(ts) {
+    var d = ts ? new Date(ts) : null;
+    if (!d || isNaN(d.getTime())) return '--:--:--';
+    return pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
+  }
+
+  function consoleLine(l) {
+    var src = CONSOLE_SOURCE[l.source] || { label: l.source || '—', badge: ' dim' };
+    var lv = String(l.level || 'info').toLowerCase();
+    var row = el('span', { class: 'log-line lv-' + lv });
+    row.appendChild(el('span', { class: 'ts', text: consoleTime(l.ts) + ' ' }));
+    row.appendChild(el('span', { class: 'badge' + src.badge, text: src.label }));
+    row.appendChild(el('span', { class: 'lv', text: lv.toUpperCase() + ' ' }));
+    row.appendChild(document.createTextNode(stripAnsi(l.text)));
+    return row;
+  }
+
+  function consoleMatch(l) {
+    var c = state.console;
+    if (c.level && String(l.level) !== c.level) return false;
+    if (c.source && String(l.source) !== c.source) return false;
+    return true;
+  }
+
+  function consoleText(l) {
+    var src = CONSOLE_SOURCE[l.source] || { label: l.source || '—' };
+    return consoleTime(l.ts) + ' [' + src.label + '] ' + String(l.level || 'info').toUpperCase() + ' ' + stripAnsi(l.text);
+  }
+
+  /* 控制台页头部状态 chip：实时 / 已暂停 */
+  function paintConsoleChip() {
+    var chip = $('#con-live'), lamp = $('#con-live-lamp'), txt = $('#con-live-text');
+    if (!chip) return;
+    if (state.console.paused) {
+      chip.className = 'chip is-am';
+      if (lamp) lamp.className = 'lamp lamp-am';
+      if (txt) txt.textContent = '已暂停';
+      setTip(chip, '已暂停：停止增量拉取，已显示的内容保留；点「继续」恢复');
+    } else {
+      chip.className = 'chip is-cy';
+      if (lamp) lamp.className = 'lamp lamp-cy';
+      if (txt) txt.textContent = '实时';
+      setTip(chip, '控制台输出：程序运行日志与一键脚本输出；打开本页时每 1 秒增量拉取，切走即停止');
+    }
+  }
+
+  /* 底部统计：缓冲行数 / 显示行数 / 丢弃行数 / 最后一行时间 */
+  function updateConsoleMeta() {
+    var c = state.console, view = $('#con-view');
+    var shown = view ? view.querySelectorAll('.log-line').length : 0;
+    var meta = '缓冲 ' + c.lines.length + ' 行 · 显示 ' + shown + ' 行';
+    if (c.dropped) meta += ' · 已丢弃 ' + c.dropped + ' 行';
+    if (c.lines.length) meta += ' · 最后 ' + consoleTime(c.lines[c.lines.length - 1].ts);
+    setText('con-meta', meta);
+  }
+
+  function paintConsole() {
+    paintConsoleChip();
+    setText('con-pause', state.console.paused ? '继续' : '暂停');
+    var view = $('#con-view');
+    if (!view) return;
+    clear(view);
+    var list = state.console.lines.filter(consoleMatch);
+    if (!list.length) {
+      view.appendChild(el('span', { class: 'muted', text: state.console.lines.length ? '当前筛选条件下没有内容' : '暂无控制台输出' }));
+    } else {
+      list.forEach(function (l) { view.appendChild(consoleLine(l)); });
+    }
+    if ($('#con-follow') && $('#con-follow').checked) view.scrollTop = view.scrollHeight;
+    updateConsoleMeta();
+  }
+
+  /* 增量追加：只渲染新行，缓冲与 DOM 都限制在 3000 行（超出从头部裁剪） */
+  function appendConsole(lines) {
+    var view = $('#con-view');
+    if (!view || !lines || !lines.length) return;
+    var ph = view.querySelector('.muted');
+    if (ph && view.children.length === 1) clear(view);
+    var c = state.console;
+    lines.forEach(function (l) {
+      c.lines.push(l);
+      if (consoleMatch(l)) view.appendChild(consoleLine(l));
+    });
+    if (c.lines.length > CONSOLE_MAX) c.lines.splice(0, c.lines.length - CONSOLE_MAX);
+    while (view.children.length > CONSOLE_MAX) view.removeChild(view.firstChild);
+    if ($('#con-follow') && $('#con-follow').checked) view.scrollTop = view.scrollHeight;
+    updateConsoleMeta();
+  }
+
+  /* 网页版：运行控制台接口仅桌面版可用（后端 400 EDESKTOP），页面给出替代说明并停用工具栏 */
+  function paintConsoleDisabled() {
+    stopPoll('console');
+    var view = clear($('#con-view'));
+    if (view) view.appendChild(el('span', { class: 'muted', text: '运行控制台仅桌面版可用：请使用桌面版窗口查看实时输出；网页版可在「日志」页查看服务日志。' }));
+    var chip = $('#con-live'), lamp = $('#con-live-lamp'), txt = $('#con-live-text');
+    if (chip) {
+      chip.className = 'chip is-am';
+      if (lamp) lamp.className = 'lamp lamp-am';
+      if (txt) txt.textContent = '不可用';
+      setTip(chip, '网页版无法获取运行控制台（仅桌面版可用）');
+    }
+    ['con-source', 'con-level', 'con-follow', 'con-pause', 'con-copy', 'con-download', 'con-clear'].forEach(function (id) {
+      var n = $('#' + id);
+      if (!n) return;
+      n.disabled = true;
+      setTip(n, '运行控制台仅桌面版可用');
+    });
+    setText('con-meta', '—');
+  }
+
+  /* 增量轮询：after=lastSeq，limit 上限 1000（这里用 500） */
+  function loadConsole(silent) {
+    var c = state.console;
+    /* 网页版直接停用，连轮询一起停（避免每秒报错） */
+    if (state.desktop && !state.desktop.desktop) { paintConsoleDisabled(); return Promise.resolve(); }
+    if (c.loading || c.paused) return Promise.resolve();
+    c.loading = true;
+    var q = '/desktop/console?limit=500' + (c.lastSeq ? '&after=' + encodeURIComponent(c.lastSeq) : '');
+    return api(q, { timeout: 15000 }).then(function (d) {
+      c.loading = false;
+      var lines = (d && d.lines) || [];
+      appendConsole(lines);
+      c.lastSeq = Number(d && d.lastSeq) || c.lastSeq;
+      c.dropped = Number(d && d.dropped) || 0;
+      updateConsoleMeta();
+      return d;
+    }, function (e) {
+      c.loading = false;
+      if (e && e.code === 'EDESKTOP') { paintConsoleDisabled(); return; }
+      handleErr(e, silent);
+    }).catch(function () { c.loading = false; });
+  }
+
+  function enterConsole() {
+    var c = state.console;
+    /* 桌面状态未知时先等 /desktop/info：网页版页面直接显示不可用，不启动轮询 */
+    var ready = state.desktop ? Promise.resolve() : loadDesktopInfo();
+    ready.then(function () {
+      if (state.page !== 'console') return;
+      if (!(state.desktop && state.desktop.desktop)) { paintConsoleDisabled(); return; }
+      if (!c.lines.length) {
+        var view = $('#con-view');
+        if (view) { clear(view); view.appendChild(el('span', { class: 'muted', text: '加载中…' })); }
+      } else {
+        paintConsole();
+      }
+      if (c.paused) { paintConsoleChip(); setText('con-pause', '继续'); return; }
+      loadConsole(false);
+      startPoll('console', loadConsole, POLL_CONSOLE);
+    }, function () { paintConsoleDisabled(); });
+  }
+
+  function toggleConsolePause() {
+    var c = state.console;
+    if (state.desktop && !state.desktop.desktop) { paintConsoleDisabled(); return; }
+    c.paused = !c.paused;
+    if (c.paused) {
+      stopPoll('console');
+    } else {
+      loadConsole(true);
+      startPoll('console', loadConsole, POLL_CONSOLE);
+    }
+    paintConsole();
+  }
+
+  function consoleExportText() {
+    return state.console.lines.filter(consoleMatch).map(consoleText).join('\r\n');
+  }
+
+  function copyConsole() {
+    var text = consoleExportText();
+    if (!text) { toast('没有可复制的控制台输出', 'warn'); return; }
+    copyText(text, '控制台输出');
+  }
+
+  function downloadConsole() {
+    var text = consoleExportText();
+    if (!text) { toast('没有可下载的控制台输出', 'warn'); return; }
+    var blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+    var url = URL.createObjectURL(blob);
+    var a = el('a', { href: url, download: 'mirror-console-' + nowStamp() + '.txt' });
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+    toast('控制台输出已下载', 'ok');
+  }
+
+  function clearConsole() {
+    confirmBox({
+      title: '清空控制台', danger: true, confirmText: '清空',
+      message: '确定清空控制台缓冲吗？',
+      detail: '只清空内存里的控制台输出（最近 3000 行），不影响磁盘上的日志文件。'
+    }).then(function (ok) {
+      if (!ok) return;
+      api('/desktop/console', { method: 'DELETE', timeout: 15000 }).then(function () {
+        state.console.lines = [];
+        state.console.lastSeq = 0;
+        state.console.dropped = 0;
+        paintConsole();
+        toast('控制台已清空', 'ok');
+      }, function (e) { handleErr(e); });
+    });
+  }
+
+  /* ---------- 工具页 ---------- */
+  var TOOL_LABEL = {
+    doctor: '环境自检',
+    status: '查看状态',
+    'cache-scan-import': '从 npm 缓存补包',
+    'export-all': '一键导出全部包',
+    'import-bundle': '一键导入离线包'
+  };
+  /* 需要二次确认的脚本（耗时 / 有写入） */
+  var TOOL_CONFIRM = {
+    'cache-scan-import': {
+      title: '从 npm 缓存补包', confirmText: '开始补包',
+      message: '确定扫描本机 npm 缓存并导入全部缺失的包吗？',
+      detail: '脚本会扫描本机 npm 缓存（npm cache 目录），把镜像里缺失的包批量导入；包较多时可能耗时较久，输出实时写入「控制台」。'
+    },
+    'export-all': {
+      title: '一键导出全部包', confirmText: '开始导出',
+      message: '确定导出全部镜像数据吗？',
+      detail: '会把全部包打包成离线 bundle，耗时可能很长；输出实时写入「控制台」，完成后可在「迁移备份」页看到生成的离线包。'
+    }
+  };
+
+  function toolButtons() { return $$('#tools-actions [data-tool]'); }
+
+  /* 保存按钮原始 data-tip，禁用时换成说明，恢复时还原 */
+  function toolTipInit() {
+    if (state.tools.tipInited) return;
+    state.tools.tipInited = true;
+    $$('#view-tools [data-tip]').forEach(function (n) {
+      if (n.dataset.tipOrig === undefined) n.dataset.tipOrig = n.getAttribute('data-tip') || '';
+    });
+  }
+
+  function setToolEnabled(id, enabled, offTip) {
+    var b = $('#' + id);
+    if (!b) return;
+    b.disabled = !enabled;
+    if (!enabled) setTip(b, offTip || '仅桌面版可用');
+    else if (b.dataset.tipOrig !== undefined) setTip(b, b.dataset.tipOrig);
+  }
+
+  function loadTools() {
+    setSideHint('LOADING…');
+    var pInfo = loadDesktopInfo();
+    var pOver = state.overview ? Promise.resolve() : api('/overview', { timeout: 15000 }).then(function (d) { state.overview = d; }, function () {});
+    var pData = api('/desktop/files?target=data', { timeout: 15000 }).then(function (d) { state.tools.filesData = d; }, function () {});
+    var pLogs = api('/desktop/files?target=logs', { timeout: 15000 }).then(function (d) { state.tools.filesLogs = d; }, function () {});
+    var pCfg = api('/desktop/files?target=config', { timeout: 15000 }).then(function (d) { state.tools.filesCfg = d; }, function () {});
+    /* 一键脚本接口仅桌面版可用：等 /desktop/info 落定后再决定是否请求 */
+    var pScripts = pInfo.then(function () {
+      if (!(state.desktop && state.desktop.desktop)) return null;
+      return api('/desktop/scripts', { timeout: 15000 }).then(function (d) {
+        state.tools.scripts = d || { running: [], last: null };
+      }, function () {});
+    }).catch(function () {});
+    return Promise.all([pInfo, pOver, pData, pLogs, pCfg, pScripts]).then(function () {
+      /* /desktop/info 里的 autostart 可能为 null（接口允许），桌面模式下再单独取一次状态 */
+      var d = state.desktop || {};
+      if (!d.desktop || d.autostart) return null;
+      return desktopAction('autostart.get', {}, 15000).then(function (a) {
+        if (a) state.desktop.autostart = a;
+      }, function () {});
+    }).then(function () {
+      paintTools();
+      setSideHint('READY');
+      var running = (state.tools.scripts && state.tools.scripts.running) || [];
+      if (running.length) startPoll('tools-scripts', loadToolsScripts, 1500);
+    }, function () { setSideHint('ERROR'); }).catch(function () {});
+  }
+
+  function paintTools() {
+    toolTipInit();
+    var d = state.desktop || { desktop: false };
+    var o = state.overview || {};
+    var desk = !!d.desktop;
+    var wa = d.webAdmin || {};
+
+    var banner = $('#tools-banner');
+    if (banner) banner.hidden = desk;
+
+    /* A. 桌面程序 */
+    var app = clear($('#tools-app-info'));
+    if (app) {
+      [
+        ['运行模式', desk ? '桌面版' : '网页版'],
+        ['程序版本', d.version || o.version || '—'],
+        ['程序路径', d.exePath || '—'],
+        ['主数据目录', d.dataDir || '—'],
+        ['缓存目录', d.cacheDir || '—'],
+        ['Node', d.node || '—'],
+        ['平台', d.platform || '—'],
+        ['PID', d.pid || o.pid || '—']
+      ].forEach(function (kv) { app.appendChild(kvRow(kv[0], kv[1])); });
+    }
+    setToolEnabled('tools-restart', desk, '仅桌面版可用：网页版请在「服务」页操作');
+    setToolEnabled('tools-hidewin', desk, '仅桌面版可用：网页版没有桌面窗口');
+    setToolEnabled('tools-quit', desk, '仅桌面版可用：网页版请在「服务」页停止服务');
+
+    /* B. 服务控制 */
+    var listen = o.listen || {}, internal = d.internal || {};
+    var svc = clear($('#tools-svc-info'));
+    if (svc) {
+      [
+        ['镜像源监听', (listen.ip || listen.port) ? (listen.ip || '?') + ':' + (listen.port || '?') : (o.registryUrl || '—')],
+        ['管理界面监听', desk ? ((internal.ip || '127.0.0.1') + ':' + (internal.port || '—')) : '网页版由服务端监听'],
+        ['网页版管理界面', wa.enabled ? '已开启 · ' + (wa.url || '') : '未开启'],
+        ['监听错误', wa.listenError || '无']
+      ].forEach(function (kv) { svc.appendChild(kvRow(kv[0], kv[1])); });
+    }
+    setToolEnabled('tools-restart-registry', desk, '仅桌面版可用：网页版请在「服务」页重启镜像源');
+    setToolEnabled('tools-restart-admin', desk, '仅桌面版可用：网页版请在「服务」页重启管理界面');
+    setToolEnabled('tools-open-web', !!(wa.enabled && wa.url), '未开启：请到「配置 → 桌面 / 网页管理」开启网页版管理界面');
+
+    /* C. 开机自启动 */
+    var au = (state.desktop && state.desktop.autostart) || null;
+    var autoBox = clear($('#tools-autostart-info'));
+    if (autoBox) {
+      [
+        ['状态', au ? (au.enabled ? '已开启' : '未开启') : (desk ? '未获取到状态' : '仅桌面版可用')],
+        ['启动程序', au && au.exe ? au.exe : '—']
+      ].forEach(function (kv) { autoBox.appendChild(kvRow(kv[0], kv[1])); });
+    }
+    var canAuto = desk && !!au;
+    var autoOff = desk ? '暂未获取到开机自启动状态，请点「刷新」重试' : '仅桌面版可用';
+    setToolEnabled('tools-autostart-on', canAuto, autoOff);
+    setToolEnabled('tools-autostart-off', canAuto, autoOff);
+
+    /* E. 目录与日志 */
+    var fd = state.tools.filesData || {}, fl = state.tools.filesLogs || {}, fc = state.tools.filesCfg || {};
+    var paths = clear($('#tools-paths'));
+    if (paths) {
+      [
+        ['数据目录', d.dataDir || fd.path || '—'],
+        ['日志目录', fl.path || '—'],
+        ['配置文件', fc.path || '—'],
+        ['程序目录', d.exeDir || '—']
+      ].forEach(function (kv) { paths.appendChild(kvRow(kv[0], kv[1])); });
+    }
+    setToolEnabled('tools-open-data', desk, '仅桌面版可用');
+    setToolEnabled('tools-open-logs', desk, '仅桌面版可用');
+    setToolEnabled('tools-open-config', desk, '仅桌面版可用');
+    setToolEnabled('tools-copy-data', !!(d.dataDir || fd.path), '暂无可复制的数据目录');
+
+    /* D. 一键脚本按钮：/desktop/scripts 与 script.run 仅桌面版可用，网页版整体禁用 */
+    toolButtons().forEach(function (b) {
+      if (!desk) {
+        b.disabled = true;
+        setTip(b, '仅桌面版可用：网页版无法运行本机脚本');
+      } else {
+        b.disabled = false;
+        if (b.dataset.tipOrig !== undefined) setTip(b, b.dataset.tipOrig);
+      }
+    });
+
+    setText('tools-meta', '更新于 ' + dtShort(new Date()) + (desk ? '' : ' · 网页版'));
+    paintToolsScripts(null);
+  }
+
+  function loadToolsScripts(silent) {
+    return api('/desktop/scripts', { timeout: 15000 }).then(function (d) {
+      var prev = state.tools.scripts || { running: [], last: null };
+      state.tools.scripts = d || { running: [], last: null };
+      paintToolsScripts(prev);
+      return d;
+    }, function (e) { handleErr(e, silent); }).catch(function () {});
+  }
+
+  /* 根据 /desktop/scripts 渲染运行状态；prev.running 非空而新的为空 = 刚结束，弹完成提示 */
+  function paintToolsScripts(prev) {
+    var s = state.tools.scripts || { running: [], last: null };
+    var running = s.running || [];
+    var names = running.map(function (r) { return r.name; });
+    var web = !isDesktop();
+    toolButtons().forEach(function (b) {
+      var on = names.indexOf(b.getAttribute('data-tool')) >= 0;
+      b.classList.toggle('is-busy', on);
+      b.disabled = web || running.length > 0;
+    });
+    var cancel = $('#tools-cancel');
+    if (cancel) cancel.disabled = web || !running.length;
+    if (running.length) {
+      setText('tools-run-status', '正在运行：' + (TOOL_LABEL[running[0].name] || running[0].name) + '（开始于 ' + consoleTime(running[0].startedAt) + '）');
+      return;
+    }
+    if (web) {
+      setText('tools-run-status', '一键脚本仅桌面版可用：请使用桌面版窗口运行');
+      return;
+    }
+    var last = s.last;
+    if (!last) {
+      setText('tools-run-status', '输出见「控制台」页面');
+      return;
+    }
+    var name = TOOL_LABEL[last.name] || last.name;
+    var dur = '';
+    if (last.startedAt && last.endedAt) {
+      var sec = Math.max(1, Math.round((new Date(last.endedAt) - new Date(last.startedAt)) / 1000));
+      if (isFinite(sec)) dur = ' · 耗时 ' + sec + 's';
+    }
+    if (last.status === 'ok') {
+      setText('tools-run-status', '上次：' + name + ' · 成功（退出码 ' + (last.exitCode == null ? 0 : last.exitCode) + dur + '）');
+    } else if (last.status === 'canceled') {
+      setText('tools-run-status', '上次：' + name + ' · 已取消');
+    } else {
+      setText('tools-run-status', '上次：' + name + ' · 失败（退出码 ' + (last.exitCode == null ? '—' : last.exitCode) + dur + '）');
+    }
+    /* 只在刚从「运行中」变为「已结束」时提示一次 */
+    var wasRunning = prev && (prev.running || []).length > 0;
+    if (!wasRunning) return;
+    stopPoll('tools-scripts');
+    if (last.status === 'ok') {
+      toast(name + ' 已执行完成，输出见「控制台」', 'ok', 8000, { label: '查看控制台', onClick: function () { go('console'); } });
+    } else if (last.status === 'canceled') {
+      toast(name + ' 已取消', 'warn', 6000);
+    } else {
+      toast(name + ' 执行失败，详见「控制台」', 'err', 9000, { label: '查看控制台', onClick: function () { go('console'); } });
+    }
+  }
+
+  function runToolScript(name, file) {
+    if (!isDesktop()) { toast('一键脚本仅桌面版可用', 'warn'); return; }
+    var running = (state.tools.scripts && state.tools.scripts.running) || [];
+    if (running.length) { toast('已有脚本在运行，请等待完成或先取消', 'warn'); return; }
+    var params = { name: name };
+    if (file) params.file = file;
+    desktopAction('script.run', params).then(function (d) {
+      toast('已开始：' + (TOOL_LABEL[name] || name) + '，输出见「控制台」', 'ok', 5000, { label: '查看控制台', onClick: function () { go('console'); } });
+      var list = (state.tools.scripts && state.tools.scripts.running) || [];
+      list.push({ id: d && d.taskId, name: name, startedAt: new Date().toISOString() });
+      state.tools.scripts = state.tools.scripts || { running: [], last: null };
+      state.tools.scripts.running = list;
+      paintToolsScripts(null);
+      startPoll('tools-scripts', loadToolsScripts, 1500);
+      loadToolsScripts(true);
+    }, function (e) { handleErr(e); });
+  }
+
+  function pickAndImportBundle() {
+    if (!isDesktop()) { toast('一键导入离线包仅桌面版可用', 'warn'); return; }
+    desktopAction('pickFile', { title: '选择离线包（.tgz）', filters: ['tgz', 'gz'] }, 120000).then(function (d) {
+      if (!d || d.canceled || !d.path) { toast('已取消选择离线包', 'info', 2600); return; }
+      confirmBox({
+        title: '导入离线包', confirmText: '开始导入',
+        message: '确定导入选中的离线包吗？',
+        detail: '文件：' + d.path + '。导入会把包合并进当前镜像（同名版本覆盖），耗时取决于包大小，输出见「控制台」。'
+      }).then(function (ok) { if (ok) runToolScript('import-bundle', d.path); });
+    }, function (e) { handleErr(e); });
+  }
+
+  function toolAction(name) {
+    if (name === 'import-bundle') { pickAndImportBundle(); return; }
+    var confirm = TOOL_CONFIRM[name];
+    if (confirm) {
+      confirmBox(confirm).then(function (ok) { if (ok) runToolScript(name); });
+      return;
+    }
+    runToolScript(name);
+  }
+
+  function cancelToolScript() {
+    var running = (state.tools.scripts && state.tools.scripts.running) || [];
+    if (!running.length) { toast('当前没有正在运行的脚本', 'warn'); return; }
+    var name = TOOL_LABEL[running[0].name] || running[0].name;
+    confirmBox({
+      title: '取消脚本', danger: true, confirmText: '取消运行',
+      message: '确定取消正在运行的「' + name + '」吗？',
+      detail: '取消后脚本进程会被强制结束（含子进程），未完成的操作不会回滚。'
+    }).then(function (ok) {
+      if (!ok) return;
+      desktopAction('script.cancel', { taskId: running[0].id }).then(function (d) {
+        if (d && d.canceled) toast('已取消脚本运行', 'ok');
+        else toast('脚本已结束，无需取消', 'warn');
+        loadToolsScripts(true);
+      }, function (e) { handleErr(e); });
+    });
+  }
+
+  /* 桌面专属操作统一入口：非桌面直接提示，不静默失败 */
+  function doToolsAction(action, params, okMsg) {
+    if (!isDesktop()) { toast('仅桌面版可用', 'warn'); return Promise.resolve(); }
+    setSideHint('WORKING…');
+    return desktopAction(action, params).then(function (d) {
+      setSideHint('READY');
+      if (okMsg) toast(okMsg, 'ok', 6000);
+      return d;
+    }, function (e) {
+      setSideHint('ERROR');
+      handleErr(e);
+    });
+  }
+
+  function setAutostart(on) {
+    if (!isDesktop()) { toast('开机自启动仅桌面版可用', 'warn'); return; }
+    api('/desktop/action', { method: 'POST', body: { action: 'autostart.set', params: { enabled: !!on } }, timeout: 20000 }).then(function (d) {
+      state.desktop = state.desktop || {};
+      state.desktop.autostart = {
+        enabled: !!(d && d.enabled),
+        exe: (state.desktop.autostart && state.desktop.autostart.exe) || ''
+      };
+      paintTools();
+      toast(d && d.enabled ? '已开启开机自启动' : '已关闭开机自启动', 'ok');
+    }, function (e) { handleErr(e); });
+  }
+
+  /* ---------- 配置页「桌面 / 网页管理」分组 ---------- */
+  function desktopCfgData() {
+    var raw = state.cfg.raw || {};
+    var info = state.desktop || {};
+    var en = raw.admin ? !!raw.admin.enabled : false;
+    return {
+      info: info,
+      desk: !!info.desktop,
+      enabled: en,
+      web: info.webAdmin || {}
+    };
+  }
+
+  /* 该分组由 paintConfig() 在 CFG_GROUPS 之后追加；admin.enabled 仍走原有 PUT /config 保存流程 */
+  function buildDesktopCfgGroup() {
+    var data = desktopCfgData();
+    var info = data.info || {};
+    var desk = data.desk;
+    var group = el('div', { class: 'cfg-group', id: 'cfg-desktop-group' });
+
+    /* 网页版管理界面开关 */
+    var enabledInput = el('input', { type: 'checkbox', id: 'cfg-admin-enabled', 'data-cfg': 'admin.enabled', checked: data.enabled ? true : null });
+    if (!desk) enabledInput.disabled = true;
+    var boolTxt = el('span', { text: data.enabled ? '已开启' : '已关闭' });
+    enabledInput.addEventListener('change', function () { boolTxt.textContent = enabledInput.checked ? '已开启' : '已关闭'; });
+    var item1 = el('div', { class: 'cfg-item' }, [
+      el('label', { text: '开启网页版管理界面' }),
+      el('div', { class: 'bool' }, [enabledInput, boolTxt]),
+      el('p', { class: 'hint', text: '默认关闭。关闭后仍可用桌面窗口管理；开启后可通过浏览器访问同一套管理界面（监听端口沿用「管理界面监听端口」）。' }),
+      el('div', { class: 'row-inline' }, [
+        el('span', { class: 'badge' + (data.enabled ? ' ok' : ' dim'), id: 'cfg-web-badge', text: data.enabled ? '网页版已开启' : '网页版未开启' }),
+        el('span', { class: 'badge dim', id: 'cfg-web-url', text: data.enabled && data.web.url ? data.web.url : '（未开启，无地址）' })
+      ])
+    ]);
+    if (!desk) item1.appendChild(el('p', { class: 'hint warn-text', text: '当前是命令行 / 网页模式：网页版管理界面固定开启，该开关不可修改。' }));
+    group.appendChild(el('div', { class: 'cfg-group-head' }, [el('span', { text: '桌面 / 网页管理' }), el('em', { text: 'DESKTOP' })]));
+
+    var grid = el('div', { class: 'cfg-grid' });
+    grid.appendChild(item1);
+
+    /* 主数据目录：只读 + 原生目录选择 */
+    var dirInput = el('input', { type: 'text', id: 'cfg-data-dir', class: 'mono', readonly: true, value: info.dataDir || '—' });
+    var pickB = el('button', { class: 'btn btn-sm', type: 'button', id: 'cfg-pick-dir', text: '选择目录…' });
+    if (!desk) { pickB.disabled = true; setTip(pickB, '仅桌面版可用：网页 / CLI 模式的数据目录由启动参数决定'); }
+    pickB.addEventListener('click', pickDataDir);
+    var item2 = el('div', { class: 'cfg-item' }, [
+      el('label', { text: '主数据目录' }),
+      el('div', { class: 'row-inline' }, [dirInput, pickB]),
+      el('p', { class: 'hint', id: 'cfg-data-dir-hint', text: '默认 ' + (info.exeDir ? info.exeDir + '\\data' : '<程序目录>\\data') + '；只读，修改后需要重启程序生效。' }),
+      el('div', { class: 'row-inline' }, [
+        el('span', { class: 'badge dim', text: '只读' }),
+        el('span', { class: 'badge dim', id: 'cfg-data-dir-badge', text: desk ? '可更换' : '仅桌面版可更换' })
+      ])
+    ]);
+    grid.appendChild(item2);
+
+    /* 程序信息：只读 */
+    grid.appendChild(el('div', { class: 'cfg-item' }, [
+      el('label', { text: '程序信息' }),
+      el('p', { class: 'hint', id: 'cfg-desktop-path', text: '程序路径：' + (info.exePath || '—') }),
+      el('p', { class: 'hint', id: 'cfg-desktop-node', text: 'Node：' + (info.node || '—') + ' · 构建版本：' + (info.version || '—') }),
+      el('p', { class: 'hint', id: 'cfg-desktop-mode', text: '运行模式：' + (desk ? '桌面版' : '网页版') })
+    ]));
+
+    group.appendChild(grid);
+    return group;
+  }
+
+  /* /desktop/info 到达后、或保存后，就地刷新配置页分组里的只读信息 */
+  function updateDesktopCfgGroup() {
+    if (!$('#cfg-admin-enabled')) return;
+    var data = desktopCfgData();
+    var info = data.info || {};
+    var cb = $('#cfg-admin-enabled');
+    if (cb) {
+      cb.checked = data.enabled;
+      cb.disabled = !data.desk;
+      var span = cb.parentNode.querySelector('span');
+      if (span) span.textContent = data.enabled ? '已开启' : '已关闭';
+    }
+    var badge = $('#cfg-web-badge');
+    if (badge) {
+      badge.className = 'badge' + (data.enabled ? ' ok' : ' dim');
+      badge.textContent = data.enabled ? '网页版已开启' : '网页版未开启';
+    }
+    var url = $('#cfg-web-url');
+    if (url) url.textContent = data.enabled && data.web.url ? data.web.url : '（未开启，无地址）';
+    var dir = $('#cfg-data-dir');
+    if (dir) dir.value = info.dataDir || '—';
+    var hint = $('#cfg-data-dir-hint');
+    if (hint) hint.textContent = '默认 ' + (info.exeDir ? info.exeDir + '\\data' : '<程序目录>\\data') + '；只读，修改后需要重启程序生效。';
+    var pick = $('#cfg-pick-dir');
+    if (pick) {
+      pick.disabled = !data.desk;
+      if (!data.desk) setTip(pick, '仅桌面版可用：网页 / CLI 模式的数据目录由启动参数决定');
+    }
+    var db = $('#cfg-data-dir-badge');
+    if (db) db.textContent = data.desk ? '可更换' : '仅桌面版可更换';
+    setText('cfg-desktop-path', '程序路径：' + (info.exePath || '—'));
+    setText('cfg-desktop-node', 'Node：' + (info.node || '—') + ' · 构建版本：' + (info.version || '—'));
+    setText('cfg-desktop-mode', '运行模式：' + (data.desk ? '桌面版' : '网页版'));
+  }
+
+  /* 选择新的主数据目录：原生目录框 → 二次确认 → setDataDir（程序自动重启） */
+  function pickDataDir() {
+    if (!isDesktop()) { toast('仅桌面版可更换主数据目录', 'warn'); return; }
+    desktopAction('pickFolder', {
+      title: '选择主数据目录',
+      initialDir: (state.desktop && state.desktop.dataDir) || ''
+    }, 120000).then(function (d) {
+      if (!d || d.canceled || !d.path) { toast('已取消选择目录', 'info', 2600); return; }
+      var dir = d.path;
+      confirmBox({
+        title: '切换主数据目录', confirmText: '切换并重启', danger: true,
+        message: '主数据目录将切换到：' + dir,
+        detail: '程序会立即重启才能生效。请确认目录正确，且包含原有镜像数据；若换成空目录，需要重新导入或同步包。'
+      }).then(function (ok) {
+        if (!ok) return;
+        desktopAction('setDataDir', { dir: dir }, 30000).then(function () {
+          var input = $('#cfg-data-dir');
+          if (input) input.value = dir;
+          toast('主数据目录已设置，程序正在重启…', 'ok', 9000);
+        }, function (e) { handleErr(e); });
+      });
+    }, function (e) { handleErr(e); });
+  }
+
+  /* ============================================================
    * 6. 服务
    * ============================================================ */
   function loadService() {
@@ -4760,7 +5523,8 @@
   function serviceAction(kind) {
     if (kind === 'open') {
       var url = (state.overview && state.overview.adminUrl) || location.origin;
-      window.open(url + '/', '_blank');
+      /* 桌面版：交给系统默认浏览器打开（Tauri 外部打开）；网页版仍用 window.open */
+      openExternal(url);
       toast('已打开管理界面 ' + url, 'ok');
       return;
     }
@@ -4788,6 +5552,18 @@
       message = '确定要重启镜像源服务吗？';
       detail = '只重启镜像源监听（npm registry），管理界面不会中断；npm 客户端会短暂不可用（通常几秒）。';
       apiPath = '/service/restart'; watchKind = 'registry';
+    }
+    /* 桌面版语义不同（DESIGN 4.4）：停止 = 退出整个程序；重启进程 = 重启程序 */
+    if (isDesktop()) {
+      if (isStop) {
+        title = '退出程序'; confirmText = '退出程序';
+        message = '确定要退出整个程序吗？';
+        detail = '退出后镜像源服务与管理界面都会停止，所有客户端将无法安装依赖，需要手动重新启动程序。';
+      } else if (isProcess) {
+        title = '重启程序'; confirmText = '重启程序';
+        message = '确定要重启整个程序吗？';
+        detail = '整个程序会重启（镜像源与管理界面短暂不可用，通常几秒），适用于主数据目录等程序级配置的改动。';
+      }
     }
     confirmBox({ title: title, danger: isStop, confirmText: confirmText, message: message, detail: detail }).then(function (ok) {
       if (!ok) return;
@@ -5180,6 +5956,81 @@
       serviceAction(b.getAttribute('data-act'));
     });
 
+    /* 控制台 */
+    on('con-goto-tools', 'click', function () { go('tools'); });
+    on('con-source', 'change', function () { state.console.source = $('#con-source').value; paintConsole(); });
+    on('con-level', 'change', function () { state.console.level = $('#con-level').value; paintConsole(); });
+    on('con-pause', 'click', toggleConsolePause);
+    on('con-follow', 'change', function () {
+      if (!$('#con-follow') || !$('#con-follow').checked) return;
+      var v = $('#con-view');
+      if (v) v.scrollTop = v.scrollHeight;
+    });
+    on('con-copy', 'click', copyConsole);
+    on('con-download', 'click', downloadConsole);
+    on('con-clear', 'click', clearConsole);
+
+    /* 工具 */
+    on('tools-refresh', 'click', function () { loadTools(); toast('已刷新工具状态', 'ok', 1600); });
+    on('tools-restart', 'click', function () {
+      confirmBox({ title: '重启程序', confirmText: '重启程序', message: '确定要重启整个程序吗？', detail: '整个程序会重启（镜像源与管理界面短暂不可用，通常几秒）。' }).then(function (ok) {
+        if (ok) doToolsAction('app.restart', {}, '程序正在重启…');
+      });
+    });
+    on('tools-hidewin', 'click', function () { doToolsAction('window.hide', {}, '窗口已隐藏到系统托盘'); });
+    on('tools-quit', 'click', function () {
+      confirmBox({ title: '退出程序', danger: true, confirmText: '退出程序', message: '确定要退出桌面程序吗？', detail: '退出后镜像源服务与管理界面都会停止，所有客户端将无法安装依赖，需要手动重新启动程序。' }).then(function (ok) {
+        if (ok) doToolsAction('app.quit', {}, '程序正在退出…');
+      });
+    });
+    on('tools-restart-registry', 'click', function () {
+      confirmBox({ title: '重启镜像源服务', confirmText: '重启镜像源服务', message: '确定要重启镜像源监听吗？', detail: '只重启镜像源监听（npm registry），管理界面不会中断；npm 客户端会短暂不可用（通常几秒）。' }).then(function (ok) {
+        if (!ok) return;
+        doToolsAction('service.restartRegistry', {}, null).then(function (d) {
+          if (!d) return;
+          toast('镜像源监听已重启', 'ok', 6000);
+          setTimeout(function () { loadOverview(true); }, 1200);
+        });
+      });
+    });
+    on('tools-restart-admin', 'click', function () {
+      confirmBox({ title: '重启管理界面', confirmText: '重启管理界面', message: '确定要重启网页版管理界面监听吗？', detail: '只重启网页版管理界面监听，镜像源服务不会中断；若开启了网页版，浏览器里的页面可能短暂断开。' }).then(function (ok) {
+        if (!ok) return;
+        setText('tools-meta', '正在重启管理界面…');
+        doToolsAction('service.restartWebAdmin', {}, null).then(function (d) {
+          if (!d) return;
+          state.desktop = state.desktop || {};
+          state.desktop.webAdmin = { enabled: !!d.enabled, url: d.url || null, listenError: d.listenError || '' };
+          paintTools();
+          if (d.listenError) toast('管理界面重启失败：' + d.listenError, 'err', 9000);
+          else toast(d.enabled ? '网页版管理界面已重启：' + (d.url || '') : '网页版管理界面当前未开启', 'ok', 7000);
+        });
+      });
+    });
+    on('tools-open-web', 'click', function () {
+      var wa = (state.desktop && state.desktop.webAdmin) || {};
+      openExternal(wa.url);
+    });
+    on('tools-autostart-on', 'click', function () { setAutostart(true); });
+    on('tools-autostart-off', 'click', function () { setAutostart(false); });
+    on('tools-open-data', 'click', function () { doToolsAction('openPath', { target: 'data' }, '已在文件管理器中打开数据目录'); });
+    on('tools-open-logs', 'click', function () { doToolsAction('openPath', { target: 'logs' }, '已在文件管理器中打开日志目录'); });
+    on('tools-open-config', 'click', function () { doToolsAction('openPath', { target: 'config' }, '已在文件管理器中打开配置文件'); });
+    on('tools-copy-data', 'click', function () {
+      var p = state.desktop && state.desktop.dataDir;
+      if (!p) { toast('暂无可复制的数据目录', 'warn'); return; }
+      copyText(p, '数据目录');
+    });
+    on('tools-cancel', 'click', cancelToolScript);
+    var toolActs = $('#tools-actions');
+    if (toolActs) {
+      toolActs.addEventListener('click', function (ev) {
+        var b = ev.target.closest ? ev.target.closest('[data-tool]') : null;
+        if (!b || b.disabled) return;
+        toolAction(b.getAttribute('data-tool'));
+      });
+    }
+
     /* 标签页可见性：暂停轮询 */
     document.addEventListener('visibilitychange', function () {
       if (document.hidden) { state.paused = true; stopAllPolls(); }
@@ -5400,6 +6251,8 @@
     consumeUrlToken();
     startClock();
     bindGlobal();
+    /* 桌面版信息：桌面窗口内加载时取真实信息，网页 / CLI 模式按网页版处理（失败不阻塞界面） */
+    loadDesktopInfo();
     /* 与镜像源服务的连接状态（顶栏 chip，断线自动重试、恢复后刷新界面） */
     startConnWatch();
     /* 静态的容器框（面板 / 统计卡）在页面加载后统一铺上背景动效；

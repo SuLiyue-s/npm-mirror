@@ -5,6 +5,7 @@
 - 运行环境：Node.js **>= 18**（实测 Node.js 24），Windows / macOS / Linux 均可运行服务本体（一键脚本为 Windows `.cmd` / PowerShell）
 - 默认地址：镜像源（npm registry）<http://127.0.0.1:4873>，管理界面 <http://127.0.0.1:4874>（**两个独立监听**：管理界面只监听 `127.0.0.0/8` 本地回环，只有本机访问才能打开；端口不可与镜像源端口相同，可在配置页/`data/config.json` 的 `admin` 段修改）
 - 依赖数量：**0**（`dependencies` 与 `devDependencies` 均为空）
+- 桌面版：**单 exe（版本 0.0.1）**，`dist/npm-mirror-desktop-0.0.1.exe`，双击即用、内嵌 Node 运行时，带托盘 / 控制台页 / 工具页 / 主数据目录选择 / 开机自启，详见 [桌面版（单 exe）](#桌面版单-exe)
 - 许可证：[MIT](LICENSE)
 
 ![管理界面概览](截图/管理界面-概览.png)
@@ -54,6 +55,80 @@ node cli.js start
 - 用的是系统自带的 Windows PowerShell，不需要额外安装任何东西；脚本在 `tools/tray.ps1`，图标由 `tools/make-icon.ps1` 自绘生成（`public/favicon.ico`）。
 - 停止服务也可以双击 `停止镜像源.cmd`，托盘会在几秒内检测到服务已停止并自动退出。
 - 在 Windows Terminal 里手动输入命令启动时托盘不参与（直接把窗口留着即可）；需要托盘就双击 `.cmd`。若托盘没有出现，命令行窗口会保持显示并给出提示，服务本身不受影响。
+
+## 桌面版（单 exe）
+
+不想装 Node.js、也不想开命令行窗口？用桌面版：**一个 exe 双击即用**，把 Node 运行时、镜像源服务、管理界面与托盘图标打包在一起。
+
+| 项目 | 说明 |
+| --- | --- |
+| 版本 | **0.0.1**（`package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` 三处一致） |
+| 构建产物 | `dist/npm-mirror-desktop-0.0.1.exe`（单文件，内嵌 Node 运行时与全部程序文件） |
+| 下载 | [GitHub Releases v0.0.1](https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.1)（exe + `SHA256SUMS.txt`，建议先校验再运行） |
+| 系统要求 | Windows 10/11 x64；需要系统自带 **WebView2 运行时**（Win11 默认已装，Win10 可装 Evergreen Runtime） |
+| 数据目录 | 默认 `<exe 所在目录>\data`，与网页版 / 命令行版共用同一套数据格式 |
+| 与网页版的关系 | 窗口里显示的就是现有管理界面（同一套 `public/`），另外多出「控制台」「工具」两个页面；镜像源监听、管理 API、令牌机制完全一致 |
+
+### 桌面版特性
+
+- **单文件运行**：exe 内嵌 node.exe 与全部程序文件，首次运行解压到 `%LOCALAPPDATA%\LiYueNpmMirror\runtime\<版本>\`，之后直接复用；目标机器无需安装 Node.js。
+- **托盘常驻**：关闭窗口只是隐藏，托盘图标继续运行镜像源；左键单击打开窗口，右键有「打开窗口 / 关闭窗口 / 重启管理界面 / 重启镜像源服务 / 退出程序」（「重启管理界面」只在网页版管理开启时出现）。
+- **控制台页**：把服务日志、一键脚本输出、桌面端操作日志实时汇总（最多保留 3000 行），可暂停 / 继续 / 清空 / 复制 / 下载，按级别与来源筛选。
+- **工具页**：桌面程序信息（版本 / 程序路径 / 主数据目录 / 运行模式）、重启程序 / 退出程序 / 隐藏窗口、重启镜像源 / 重启管理界面 / 打开网页版管理、开机自启开关、一键脚本（环境自检 / 查看状态 / 从 npm 缓存补包 / 一键导出全部包 / 一键导入离线包）、打开数据目录 / 日志目录 / 配置文件。
+- **网页版管理开关**（`admin.enabled`，默认 **关闭**）：默认桌面版不开放浏览器可访问的管理端口，只能从桌面窗口管理；需要浏览器 / 局域网访问时在「配置 → 桌面 / 网页管理」打开，端口即 `admin.ip` / `admin.port`（默认 `127.0.0.1:4874`），保存即时生效、不用重启程序。
+- **主数据目录可选**：「配置 → 桌面 / 网页管理」里的只读输入框显示当前数据目录，点「选择目录…」用系统原生文件夹选择器换到其它磁盘（如空间更大的 D 盘），切换后程序自动重启并使用新目录。
+- **开机自启**：工具页一键开关，写入当前用户注册表 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`（值名 `LiYueNpmMirror`），登录后隐藏窗口启动到托盘，不需要管理员权限。
+- **单实例**：重复双击 exe 不会起第二个服务，只会把已在运行的窗口调出来。
+- **路径穿越防护**：主数据目录 / `storage.dir` 统一走数据根校验，相对路径不能逃出数据目录（`../`、`..\`、绝对路径、NUL 等一律拒绝），并有单测 `test/desktop-path-test.js` 覆盖。
+- **旧数据直接兼容**：把 exe 放进现有项目根目录（默认数据目录就是 `项目根\data`），即可直接读到原 `config.json`、`storage/` 里的包与日志；旧的 `storage.dir: "data/storage"` 也能正确解析。
+
+### 构建桌面版（本机离线）
+
+```powershell
+# 在仓库根目录执行：校验三处版本号一致 → 嵌入 node.exe → 生成/校验图标 → 离线 cargo build → 输出 dist
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/build-desktop.ps1
+
+# 可选参数
+#   -NodeExe <路径>   指定要内嵌的 node.exe（默认取 PATH 里的 node）
+#   -ForceIcon        强制重新合成图标
+#   -DebugBuild       构建 debug 版（产物 dist/npm-mirror-desktop-debug.exe）
+#   -NoOffline        允许 cargo 走网络（默认强制离线）
+```
+
+- 构建环境：Windows + Rust（msvc toolchain）+ Visual Studio 生成工具 + Windows SDK；仓库已把 cargo 依赖缓存放在 `tmp/cargo-home`（约 357MB，**不要删**），构建脚本默认用 `CARGO_HOME=<repo>\tmp\cargo-home` + `CARGO_NET_OFFLINE=true` 离线构建，无网络也能编译。
+- 产物：`dist/npm-mirror-desktop-<版本>.exe` + `dist/SHA256SUMS.txt`（SHA256 校验清单，可用 `Get-FileHash` 或 `certutil -hashfile` 对照）。
+- 版本号唯一来源是 `package.json`，`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json` 用 `node tools/version.js --bump patch` 同步；发版用 `tools/release.ps1`（bump → 构建 → 提交 → tag → GitHub Release）。
+- `dist/`、`src-tauri/target/`、`src-tauri/embed/node.exe` 均不入库（见 `.gitignore`）。
+
+### 桌面版使用要点
+
+1. 双击 `dist\npm-mirror-desktop-0.0.1.exe`。首次启动会自动初始化数据目录（默认 exe 同级的 `data\`）并生成配置与访问令牌。
+2. 窗口打开的就是管理界面；「控制台」「工具」页在左侧导航里（`MONITOR` / `SYSTEM` 分组）。
+3. 点窗口右上角 **×** 只是隐藏窗口，镜像源继续运行；要彻底退出请用托盘右键「退出程序」或工具页的「退出程序」。
+4. 换数据目录：配置页 →「桌面 / 网页管理」→「选择目录…」→ 选一个**已存在**的文件夹 → 确认后程序自动重启并切到新目录。**数据不会自动搬迁**，需要迁移时先退出程序，把旧 `data\` 整个复制到新位置再启动。
+5. 从旧版迁移：把 exe 放进现有项目根目录运行即可沿用 `项目根\data`；或把旧 `data\` 复制到 exe 同级的 `data\`。
+6. 卸载：退出程序后删除 exe 与 `data\` 即可；开机自启在工具页关掉（或删除注册表 `LiYueNpmMirror` 值），首次运行解压缓存位于 `%LOCALAPPDATA%\LiYueNpmMirror\runtime\`（可删）。
+
+完整图文操作见 **[使用说明.md 第十三章「桌面版（Tauri 单 exe）」](使用说明.md#十三桌面版tauri-单-exe)**。
+
+### 桌面版常见问题
+
+**Q：双击没反应 / 窗口白屏？**
+先确认系统装了 **WebView2 运行时**（Win11 自带；Win10 可从微软官网安装 Evergreen Runtime）。仍失败可看 `%LOCALAPPDATA%\LiYueNpmMirror\desktop.log` 与数据目录 `logs\` 下的日志。
+
+**Q：杀毒软件报毒 / SmartScreen 拦截？**
+exe 未做代码签名，SmartScreen 会提示「Windows 已保护你的电脑」，点「更多信息 → 仍要运行」。杀软对「单文件内嵌 node.exe」比较敏感，可把 exe 与 `%LOCALAPPDATA%\LiYueNpmMirror\` 加入白名单；发布资产在 GitHub Releases 附带 `SHA256SUMS.txt`，可先校验再运行。
+
+**Q：端口被占用 / 启动失败？**
+桌面版镜像源默认用 `server.port`（4873），被别的程序占用时改 `data\config.json` 的 `server.port`。`admin.port`（4874）只在开启网页版管理时才监听，同样不能与 `server.port` 相同。
+
+**Q：数据目录选不了 / 提示路径非法？**
+只接受**已存在的文件夹**；根目录（如 `D:\`）、文件路径、相对路径都会被拒绝。想用新磁盘就先在资源管理器里建好文件夹再选。权限受限的目录（如 `C:\Program Files` 下）可能写不进去，建议放用户目录或数据盘。
+
+**Q：托盘图标不见了？**
+Windows 可能把图标收进「^」溢出区，拖到任务栏即可固定；程序退出后重新双击 exe 即可恢复。
+
+> 网页版 / 命令行版的完整功能在桌面窗口中同样可用；桌面版专属操作细节见 [使用说明.md](使用说明.md)。
 
 ## 让项目用上这个镜像源
 
@@ -128,6 +203,7 @@ node cli.js import npm-mirror-all.tgz
 | --- | --- | --- |
 | `server.ip` / `server.port` | `127.0.0.1` / `4873` | 镜像源（npm registry）监听地址与端口 |
 | `admin.ip` / `admin.port` | `127.0.0.1` / `4874` | 管理界面监听地址与端口。`admin.ip` **只能是 `127.0.0.0/8` 网段的本地回环地址**（如 `127.0.0.1`、`127.0.0.2`；不允许 `0.0.0.0`、`::1`、局域网地址或主机名——只有本机访问这个监听地址才能打开管理界面）；`admin.port` 不能与 `server.port` 相同。修改后只需「重启管理界面」即可生效 |
+| `admin.enabled` | `false` | **是否开放网页版管理界面**（浏览器可访问 `admin.ip:admin.port`）。默认关闭：桌面版只从窗口管理、不监听固定 admin 端口；网页版 / 命令行模式固定开启，不受此项影响。桌面版在配置页打开/关闭后**即时生效**（不用重启程序），保存响应里会带回 `webAdmin` 监听状态；`admin.ip` / `admin.port` 改动仍需「重启管理界面」 |
 | `mode` | `cache` | `cache` / `proxy` / `offline` |
 | `upstream.registry` | `https://registry.npmmirror.com` | 上游公共源 |
 | `upstream.accelerators` | `[]` | 加速镜像源列表（最多 8 个 `http(s)://` 地址）。补 tarball 时并行探测这些镜像，优先走「有这个版本且响应最快」的，缺失/超时/校验不通过自动换下一个，全部不可用再回上游源；保存即热生效，不用重启；配置页可点「测试连通性」逐源只读探测（元数据 + 测试包 tarball，失败显示中文原因），保存时自动忽略空行与首尾空白 |
@@ -170,14 +246,20 @@ npm私人镜像源-离线版/
 │  ├─ config.js           配置读写与字段校验
 │  ├─ http-util.js        HTTP 工具（body/Range/静态文件/安全头）
 │  ├─ logger.js           日志
-│  └─ util.js             工具函数（semver、原子写、包名/版本校验等）
-├─ public/                原生前端（app.js / index.html / style.css / favicon.ico）
-├─ tools/                 启动器辅助脚本（tray.ps1 托盘宿主、make-icon.ps1 自绘图标）
-├─ test/                  自动化测试与验收脚本
+│  ├─ console.js          桌面版控制台环形缓冲（服务日志 / 脚本输出 / 桌面事件）
+│  ├─ desktop-scripts.js  桌面版一键脚本白名单执行器
+│  ├─ desktop-bridge.js   Rust ↔ Node stdio 桥（桌面模式）
+│  ├─ desktop.js          桌面模式初始化接线
+│  └─ util.js             工具函数（semver、原子写、包名/版本校验、数据根与路径穿越防护等）
+├─ public/                原生前端（app.js / index.html / style.css / favicon.ico；桌面版新增控制台页、工具页）
+├─ src-tauri/             Tauri 2 桌面壳（Rust：窗口/托盘/单实例/原生对话框/自启/桥协议；embed/ 内嵌 node.exe）
+├─ tools/                 辅助脚本（tray.ps1 托盘宿主、make-icon.ps1 自绘图标、build-desktop.ps1 桌面版构建、version.js 版本同步、release.ps1 发版）
+├─ test/                  自动化测试与验收脚本（desktop-e2e.ps1 桌面版端到端、desktop-path-test.js 路径穿越单测）
+├─ dist/                  桌面版构建产物（exe + SHA256SUMS.txt，已 gitignore）
 ├─ data/                  运行时数据（包存储/日志/配置/离线包，已 gitignore）
-├─ 使用说明.md            详细操作手册
+├─ 使用说明.md            详细操作手册（第十三章为桌面版）
 ├─ 报告.md                开发过程与验收记录
-├─ 启动镜像源.cmd 等       Windows 一键脚本
+├─ 启动镜像源.cmd 等       Windows 一键脚本（网页版 / 命令行版）
 └─ 截图/                  界面截图
 ```
 
@@ -192,6 +274,8 @@ node test/ui-check.js                # 前端静态契约检查
 node test/tray-check.js              # 只跑托盘/图标/启动脚本自检（Windows）
 powershell -NoProfile -ExecutionPolicy Bypass -File test/tray-e2e.ps1   # 托盘端到端（手工，需真实桌面）
 pwsh -File test/acceptance-npm.ps1   # 真实 npm 客户端验收（Windows / PowerShell 7）
+node test/desktop-path-test.js       # 桌面版数据根 / 路径穿越单测（纯 node，无需服务）
+powershell -NoProfile -ExecutionPolicy Bypass -File test/desktop-e2e.ps1  # 桌面版端到端（需先构建 dist exe）
 ```
 
 | 脚本 | 内容 | 最近结果（2026-10-18，本机） |
@@ -200,6 +284,8 @@ pwsh -File test/acceptance-npm.ps1   # 真实 npm 客户端验收（Windows / Po
 | `test/ui-check.js` | 前端与后端接口/页面元素契约（含导入结果的失败/跳过详情面板、导出自动补依赖勾选项、全部包补全部版本入口、补 tarball 弹窗「版本进度」栏、「缺 tarball / 不缺 tarball」快捷筛选、悬停提示自绘浮层（首页无原生 title、el() 把 title 映射成 data-tip、uiTip 控制器、`.ui-tip` 样式与项目配色变量）、补 tarball 左栏行数上限回收（`reclaimRow` 只收已完成行、失败行保留、提示条）、导出/导入进度弹窗右栏多行进度（`inFlight`：导出按「并行文件」一行一个正在压缩的条目、导入一个包一行）、导出收尾写盘阶段（`concat` 字节进度 → 任务快照 `concatDone/concatTotal` → 右栏「正在写入 · 拼接分片」，压缩阶段最多 95%）、**弹窗/抽屉/面板/统计卡内部背景复用整页动态背景（`.fx-box` 动效层 + `isolation:isolate`，与整页 32px 网格/扫过亮带一致、不挡点击）**、**导出「按添加时间」范围（segbar 与自绘日期时间选择器 `#exp-added-row`、payload `addedFrom/addedTo`、后端 `addedTimeRange` 清单、非法/空范围 400 与提示）与进度弹窗「取消」等待期禁用（`requestTaskCancel` 置灰/「正在取消…」、成功保持禁用、失败恢复可点）**、**原生下拉改项目风格自绘下拉（`csel*` 实现：7 个静态 `<select>` + 动态创建/重建选项的接管、`.csel-btn/.csel-menu` 样式、键盘与点外关闭、保留原生 `change` 语义）**、**搜索框清除叉 / 数字框上下箭头收掉、`:focus-visible` 统一青色描边、原生 `window.confirm` 换 `confirmBox`**、**下拉按钮箭头三态（悬停/键盘聚焦/展开）变青、复选框对勾加粗与全选「半选」横杠、勾选单行时表头全选框同步半选**、**概览页「上游与来源分布」条形图能真正渲染彩色填充（`fill` 用 `display:block`、非零来源最小 2% 宽）**、favicon 声明、**导入备份分片并发上传（`uploadBundleChunked` 与 `/bundles/upload/init|chunk|complete|abort` 四接口）**、**多并发解包（`extractTarGz` 并发写盘）**、**版本级并行调度器（`laneCount/stealTask/runVersionTask/laneLoop`）与右栏「· N 路」显示**、**本地扫描 / 统计全并发（九之四 8 项：`storage.localScanConcurrency` 配置页字段、规划 `mapLimit`、导出统计并发、解包后扫描并发、缓存扫描 / 导入并发、`initAsync` 启动索引并发、详情 cached 用内存索引、CLI 传并发参数）**、**并发异常点审计修复（九之五 7 项：`mapLimit` NaN 兜底与字节预算队列、`__error` 行防护、`verifyFileIntegrity` 流式校验、`putTarballFromFileAsync` 边写边算哈希、altName 拒绝 `.` / `..`、同一分片并发写保护、合并期间 abort 保护）**、**统计阶段进度展示（九之六 6 项：补包规划 `phase:'plan'` 与「已统计 N / M 个包」文案、导入扫描 `phase:scan`/`scan-done`、缓存扫描长任务、`runFill`/`runScan`/导出导入弹窗的进度分支）**、**包详情抽屉版本表表头全选/半选复选框与快捷排序（九之七 6 项：表头三态同步、本页全选/取消、排序下拉 6 种方式、切排序回第 1 页、semver 比较）**、**残缺元数据自愈（九之八 4 项：npm 缓存导入保留仅有元数据的版本号、`meta.metadataComplete` 标记、依赖解析强制回源补全一次、进度明细「N 个仅补元数据」）**、**加速镜像源（九之九 6 项：多源地址推导、HEAD/Range 探测按延迟排序、校验失败自动换源、全部失败回退上游、配置校验与热生效、托盘右键「重启镜像源」与左键打开管理界面）**、**加速镜像源输入框自绘角标与连通性测试（九之十 5 项：隐藏浏览器原生 resize 把手换成项目风格自绘斜纹角标并可指针拖动调整高度、自动清理空行与首尾空白、`POST /upstream/accelerators/test` 只读探测元数据与测试包 tarball、逐源展示可用/不可用 + 耗时 + 中文原因）**、**导出指定版本与依赖按版本解析（九之十一 5 项：迁移页「指定版本」多行框与「生成模板」、`versions` 解析进 payload、bundle 裁剪 packument/meta、接口层 `EBADVERSION/EBADSCOPE`、CLI `--versions` 与位置参数 `包名@版本`）**、**顶栏「管理界面 / 镜像源服务」双连接状态与分项重启（九之十二 11 项：`#chip-conn` 与 `#chip-svc` 两个 chip 的文案与 `.chip-conn.is-red/.is-idle` 样式区分、同一次同源 `/__admin/api/session` 心跳同时得出「管理界面请求成败」与「镜像源 `registry.reachable`」两种探测、只有管理界面断连恢复或管理界面实例标记（`pid` + `admin.startedAt`）变化才 `location.reload()`、镜像源服务状态变化只更新 chip 与 toast、快探测 `CONN_FAST_MS`=250、重启收尾与断线重试文案；另含 4 条真接口断言：管理界面 `/session` 返回 `admin`/`registry` 探测字段、镜像源监听 `/__admin/api/session` 403、镜像源 `/-/ping` 200、本机访问镜像源首页 302）、**运行时长实时刷新与零依赖导出提示（九之十三 4 项：顶栏「运行 xx」以概览快照为基准由本地时钟每秒累加、概览/服务页卡片同步刷新、概览/服务快照重置基准、带依赖导出但所选版本无运行时依赖时成功文案明确提示「只打包了选中的包」）**、**按添加时间导出可选「包 / 版本」口径（九之十四 4 项：迁移页 `#exp-added-by` 下拉、payload `addedBy`、后端 `normalizeAddedBy` 只认 package/version 非法 400 `EBADMODE`、版本口径按 tarball mtime 选版本并复用版本白名单裁剪、CLI `--added-by`）**、**导出面板表单布局与自绘角标（九之十五 3 项：指定版本多行框复用项目风格自绘拖拽角标、表单标签列统一分栏使右列输入框铺满加宽、按添加时间行与上方口径下拉右边缘对齐且两个时间框等宽）**） | **231/231 通过** |
 | `test/tray-check.js` | 托盘脚本/项目图标/启动脚本/favicon 路由契约（含右键菜单 5 项「打开/隐藏控制台」「打开管理界面」「重启管理界面」「重启镜像源服务」「退出镜像源」、左键单击打开管理界面、`Restart-AdminUi` / `Restart-MirrorService` 分项重启、重启期间健康检查暂停、自检输出 `adminPort`/`registryPort`/`managementUrl` 且管理地址与镜像源地址分离）、**开机自启（`.vbs` 隐藏启动项 / UTF-16LE BOM / 旧 `.cmd` 清理 / `off` 幂等，临时目录真跑）**，并真跑一次托盘自检（Windows）、**托盘健康检查的进程存活保护（服务忙但进程还活着只提示「忙碌」、不关窗口）、启动脚本 prestart 同端口不重复启动（退出码 10/11）**、**服务已在运行时补注册托盘（退出码 10 分支前台拉起 `tools\tray.ps1` 并置 `MIRROR_TRAY_RESTORE`、单实例互斥体、按标题接管被隐藏的原命令行窗口、`data\logs\tray.pid`、托盘图标注册日志）、退出镜像源按 `mirror.pid` 进程是否真的退出做 `Stop-Process -Force` 兜底、健康检查连续失败先重读配置** | **66/66 通过** |
 | `test/tray-e2e.ps1` | 托盘端到端：隔离副本启动 → 窗口隐藏 → 可重新显示 → **强杀托盘进程模拟图标没了 → 再跑一次启动脚本 → 断言托盘补注册成功、接管原来被隐藏的控制台、服务不受影响（场景 A）** → 停服务后托盘退出并关窗 | **12/12 通过（手工）** |
+| `test/desktop-path-test.js` | 桌面版数据根与路径穿越防护单测：普通相对路径、旧 `data/` 前缀、`../` / `..\` / `a/../../x`、绝对路径、NUL、磁盘根、空串、`C:foo` 等 | **24/24 通过（exit 0）** |
+| `test/desktop-e2e.ps1` | 桌面版端到端验收（Windows / PowerShell 7）：`dist` exe 存在与版本信息 → 启动进程/窗口（窗口标题、URL=内部回环管理端口、加载现有管理界面）→ 内部管理 API → 控制台 API 与增量 `after` → 一键脚本 `doctor`/`status` → `admin.enabled` 端口监听开关与即时生效 → 默认数据目录 `<exe目录>\data` → `/desktop/files` 白名单与穿越参数 → `PUT /config` 路径穿越 400 → 单实例 → 关闭窗口后服务仍在线 → 托盘菜单（打开/关闭窗口、重启管理界面、重启镜像源服务、退出程序）→ 开机自启注册表往返（已开启时只读跳过）→ 退出后无残留进程与监听。临时数据目录 `tmp/e2e-data`、桌面 home `tmp/e2e-home`、测试端口 14873/14874；退出码 `0`=通过、`1`=失败、`3`=仅因当前会话无法创建/显示 WebView2 窗口的环境限制 | **119 通过 / 5 失败（均为窗口类环境限制）/ 4 跳过，exit 3**（2026-10-19，dist 0.0.1；非窗口类失败 0） |
 | `test/acceptance-npm.ps1` | 真实 `npm install / publish / dist-tag / deprecate / unpublish` | **16/16 通过** |
 | `test/ui-e2e-*.js` | 浏览器端端到端（需要 Chrome 调试端口，可选） | 需本机 Chrome CDP 环境 |
 
@@ -210,6 +296,7 @@ pwsh -File test/acceptance-npm.ps1   # 真实 npm 客户端验收（Windows / Po
 - 默认只监听 `127.0.0.1`，仅本机可访问；**管理界面与镜像源（npm registry）是两个独立监听**：管理界面只监听 `admin.ip`（只能是 `127.0.0.0/8` 本地回环地址，默认 `127.0.0.1:4874`），管理页面与管理 API 只在管理界面监听提供——镜像源监听上 `/__admin/api/*` 一律 403，本机访问镜像源首页 302 跳管理界面、非本机 403 提示；`admin.port` 不能与 `server.port` 相同（保存配置时强校验）。映射到局域网/公网前请先阅读 **[使用说明.md](使用说明.md) 的「安全提示」**。
 - 访问令牌保存在 `data/config.json`，`data/` 已列入 `.gitignore`；**提交代码前确认没有把 `data/` 或令牌带进仓库**。
 - 已实现的防护：包名/版本与路径穿越校验、tarball 路由防任意文件读取、管理接口 Host/Origin 校验与令牌鉴权、常量时间令牌比较、上游重定向逐跳校验与 SSRF 防护、下载完整性校验、tar 解压上限与符号链接拦截、上传大小/格式校验、私有包不回源合并（防依赖混淆）、管理界面独立回环监听（`admin.ip` 强校验 127/8、`admin.port` 不得等于 `server.port`、管理 API/页面不挂在镜像源监听上，满足「只有本机访问管理监听地址才能打开管理界面」）。
+- 桌面版：内部管理接口只监听 `127.0.0.1` 的随机端口（仅窗口内加载页面使用），默认不监听固定 admin 端口（`admin.enabled=false`）；打开网页版管理后才按 `admin.ip/admin.port` 监听（仍受 `127/8` 校验与令牌鉴权）。主数据目录与 `storage.dir` 统一经 `resolveWithinDataRoot()` 校验（`..` 穿越、绝对路径、NUL、磁盘根等拒绝，单测 `test/desktop-path-test.js` 覆盖）；单实例互斥体避免多开抢端口、重复写数据。
 - 发现安全问题请按 **[SECURITY.md](SECURITY.md)** 私下上报，不要直接开公开 issue。
 
 ## 文档

@@ -5,7 +5,7 @@ const path = require('node:path');
 const {
   ok, fail, readJson, readBody, sendJson, streamFile, baseFor, hostAllowed,
 } = require('./http-util');
-const { nowIso, compareVersions, maxSatisfying, pkgBaseName, rootPath, isSafeVersion } = require('./util');
+const { nowIso, compareVersions, maxSatisfying, pkgBaseName, dataPath, isSafeVersion } = require('./util');
 const packumentView = require('./packument');
 const upstreamUtil = require('./upstream');
 
@@ -370,7 +370,7 @@ async function handlePublish(ctx, name) {
   }
 
   // 真正的发布：逐个附件导入
-  const tmpDir = rootPath('data', 'tmp');
+  const tmpDir = dataPath('tmp');
   const published = [];
   try {
     for (const key of attKeys) {

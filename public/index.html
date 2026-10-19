@@ -45,6 +45,7 @@
     <div class="nav-group">
       <div class="nav-label">MONITOR</div>
       <button class="nav-item" data-page="overview"><span class="nav-ico">▤</span><span class="nav-txt">概览</span></button>
+      <button class="nav-item" data-page="console"><span class="nav-ico">❯</span><span class="nav-txt">控制台</span></button>
       <button class="nav-item" data-page="packages"><span class="nav-ico">▦</span><span class="nav-txt">包管理</span></button>
     </div>
     <div class="nav-group">
@@ -56,6 +57,7 @@
       <button class="nav-item" data-page="config"><span class="nav-ico">⚙</span><span class="nav-txt">配置</span></button>
       <button class="nav-item" data-page="logs"><span class="nav-ico">≡</span><span class="nav-txt">日志</span></button>
       <button class="nav-item" data-page="service"><span class="nav-ico">⏻</span><span class="nav-txt">服务</span></button>
+      <button class="nav-item" data-page="tools"><span class="nav-ico">⚒</span><span class="nav-txt">工具</span></button>
     </div>
     <div class="sidebar-foot">
       <div class="loadbar"><i id="side-load"></i></div>
@@ -115,7 +117,58 @@
       </div>
     </section>
 
-    <!-- ───────── 2. 包管理 ───────── -->
+    <!-- ───────── 2. 控制台 ───────── -->
+    <section class="view" id="view-console">
+      <div class="view-head">
+        <div>
+          <h1>控制台</h1>
+          <p class="view-sub">MONITOR / CONSOLE</p>
+        </div>
+        <div class="head-actions">
+          <span class="chip is-cy" id="con-live" data-tip="控制台输出：程序运行日志与一键脚本输出；打开本页时每 1 秒增量拉取，切走即停止"><span class="lamp lamp-cy" id="con-live-lamp"></span><span id="con-live-text">实时</span></span>
+          <span class="muted" id="con-meta">—</span>
+        </div>
+      </div>
+
+      <div class="banner">
+        <span class="lamp lamp-warn"></span>
+        <span>控制台显示<b>程序运行日志</b>与<b>一键脚本输出</b>（内存缓冲最近 3000 行，页面最多保留 3000 行）。</span>
+        <button class="btn btn-sm" id="con-goto-tools">前往工具</button>
+      </div>
+
+      <div class="panel">
+        <div class="toolbar">
+          <div class="field">
+            <label for="con-source">来源</label>
+            <select id="con-source">
+              <option value="">全部</option>
+              <option value="server">服务</option>
+              <option value="script">脚本</option>
+              <option value="desktop">桌面</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="con-level">级别</label>
+            <select id="con-level">
+              <option value="">全部</option>
+              <option value="debug">debug</option>
+              <option value="info">info</option>
+              <option value="warn">warn</option>
+              <option value="error">error</option>
+            </select>
+          </div>
+          <label class="checkline"><input type="checkbox" id="con-follow" checked /> 自动滚动</label>
+          <div class="grow"></div>
+          <button class="btn btn-sm" id="con-pause" data-tip="暂停后停止增量拉取，已显示的内容保留；再次点击继续">暂停</button>
+          <button class="btn btn-sm" id="con-copy">复制</button>
+          <button class="btn btn-sm" id="con-download">下载</button>
+          <button class="btn btn-sm btn-danger" id="con-clear">清空</button>
+        </div>
+        <div class="log-view log-console" id="con-view"><span class="muted">加载中…</span></div>
+      </div>
+    </section>
+
+    <!-- ───────── 3. 包管理 ───────── -->
     <section class="view" id="view-packages">
       <div class="view-head">
         <div>
@@ -222,7 +275,7 @@
       </div>
     </section>
 
-    <!-- ───────── 3. 迁移备份 ───────── -->
+    <!-- ───────── 4. 迁移备份 ───────── -->
     <section class="view" id="view-migrate">
       <div class="view-head">
         <div>
@@ -378,7 +431,7 @@
       </div>
     </section>
 
-    <!-- ───────── 4. 配置 ───────── -->
+    <!-- ───────── 5. 配置 ───────── -->
     <section class="view" id="view-config">
       <div class="view-head">
         <div>
@@ -448,7 +501,7 @@
       </div>
     </section>
 
-    <!-- ───────── 5. 日志 ───────── -->
+    <!-- ───────── 6. 日志 ───────── -->
     <section class="view" id="view-logs">
       <div class="view-head">
         <div>
@@ -491,7 +544,7 @@
       </div>
     </section>
 
-    <!-- ───────── 6. 服务 ───────── -->
+    <!-- ───────── 7. 服务 ───────── -->
     <section class="view" id="view-service">
       <div class="view-head">
         <div>
@@ -533,6 +586,85 @@
           <li>局域网客户端建议<b>关闭免鉴权</b>（<code>security.trustLocalhost=false</code> 或按需开启 <code>requireRead/requirePublish</code>），并分发 token。</li>
           <li>客户端 <code>.npmrc</code> 用本机 IP（见「配置」页生成的接入配置）。</li>
         </ul>
+      </div>
+    </section>
+
+    <!-- ───────── 8. 工具 ───────── -->
+    <section class="view" id="view-tools">
+      <div class="view-head">
+        <div>
+          <h1>工具</h1>
+          <p class="view-sub">SYSTEM / TOOLS</p>
+        </div>
+        <div class="head-actions">
+          <span class="muted" id="tools-meta">—</span>
+          <button class="btn btn-sm" id="tools-refresh">刷新</button>
+        </div>
+      </div>
+
+      <div class="banner" id="tools-banner" hidden>
+        <span class="lamp lamp-warn"></span>
+        <span id="tools-banner-msg">当前是<b>网页版</b>：桌面窗口专属功能（重启 / 退出程序、隐藏窗口、开机自启动、打开目录、一键脚本、原生文件选择等）不可用。</span>
+      </div>
+
+      <div class="grid-2">
+        <div class="panel">
+          <h3 class="panel-title">桌面程序 <em>DESKTOP APP</em></h3>
+          <div class="kv-list" id="tools-app-info"><div class="muted">加载中…</div></div>
+          <div class="panel-actions">
+            <button class="btn" id="tools-restart" data-tip="重启整个程序：镜像源与管理界面都会短暂不可用">重启程序</button>
+            <button class="btn" id="tools-hidewin" data-tip="把窗口隐藏到系统托盘，程序继续运行">隐藏窗口</button>
+            <button class="btn btn-danger" id="tools-quit" data-tip="退出整个程序：所有客户端将无法安装依赖，需手动重新启动">退出程序</button>
+          </div>
+        </div>
+        <div class="panel">
+          <h3 class="panel-title">服务控制 <em>SERVICE</em></h3>
+          <div class="kv-list" id="tools-svc-info"><div class="muted">加载中…</div></div>
+          <div class="panel-actions">
+            <button class="btn" id="tools-restart-registry" data-tip="只重启镜像源监听，管理界面不中断（npm 客户端短暂不可用）">重启镜像源服务</button>
+            <button class="btn" id="tools-restart-admin" data-tip="只重启网页版管理界面监听，镜像源服务不中断">重启管理界面</button>
+            <button class="btn btn-amber" id="tools-open-web" data-tip="在系统默认浏览器中打开网页版管理界面">打开网页版管理界面</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h3 class="panel-title">一键脚本 <em>ONE-CLICK SCRIPTS</em></h3>
+        <div class="action-grid" id="tools-actions">
+          <button class="act" data-tool="doctor" data-tip="检查 Node 版本、主数据目录读写、端口占用等基础环境"><b>环境自检</b><i>检查 Node / 数据目录 / 端口占用</i></button>
+          <button class="act" data-tool="status" data-tip="查看服务与数据的当前运行状态"><b>查看状态</b><i>服务与数据的运行状态</i></button>
+          <button class="act" data-tool="cache-scan-import" data-tip="扫描本机 npm 缓存，把缺失的包导入镜像（会先二次确认）"><b>从 npm 缓存补包</b><i>扫描本机 npm 缓存并全部导入</i></button>
+          <button class="act" data-tool="export-all" data-tip="把全部镜像数据导出为离线 bundle，耗时可能很长（会先二次确认）"><b>一键导出全部包</b><i>打包全部镜像数据为离线包</i></button>
+          <button class="act" data-tool="import-bundle" data-tip="选择一个 .tgz 离线包并全部导入（桌面版原生文件选择框）"><b>一键导入离线包</b><i>选择 .tgz 离线包并全部导入</i></button>
+        </div>
+        <div class="panel-actions">
+          <span class="muted" id="tools-run-status">输出见「控制台」页面</span>
+          <button class="btn btn-sm btn-danger" id="tools-cancel" disabled>取消运行</button>
+        </div>
+        <p class="hint">脚本输出实时写入「控制台」页面；同一时间只允许运行一个脚本。</p>
+      </div>
+
+      <div class="grid-2">
+        <div class="panel">
+          <h3 class="panel-title">开机自启动 <em>AUTOSTART</em></h3>
+          <div class="kv-list" id="tools-autostart-info"><div class="muted">加载中…</div></div>
+          <div class="panel-actions">
+            <button class="btn" id="tools-autostart-on">开启自启动</button>
+            <button class="btn" id="tools-autostart-off">关闭自启动</button>
+          </div>
+          <p class="hint">由桌面程序写入系统启动项；关闭后需手动启动程序。</p>
+        </div>
+        <div class="panel">
+          <h3 class="panel-title">目录与日志 <em>FOLDERS</em></h3>
+          <div class="kv-list" id="tools-paths"><div class="muted">加载中…</div></div>
+          <div class="panel-actions">
+            <button class="btn btn-sm" id="tools-open-data">打开数据目录</button>
+            <button class="btn btn-sm" id="tools-open-logs">打开日志目录</button>
+            <button class="btn btn-sm" id="tools-open-config">打开配置文件</button>
+            <button class="btn btn-sm" id="tools-copy-data">复制数据目录</button>
+          </div>
+          <p class="hint">数据目录可在「配置 → 桌面 / 网页管理」中更换（需要重启程序）。</p>
+        </div>
       </div>
     </section>
 

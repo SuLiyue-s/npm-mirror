@@ -2,7 +2,7 @@
 /* 日志：按天写文件 + 内存环形缓冲（供界面查看）+ 控制台着色输出 */
 const fs = require('node:fs');
 const path = require('node:path');
-const { ensureDir, rootPath, dateOnly, nowLocalIso } = require('./util');
+const { ensureDir, dataPath, dateOnly, nowLocalIso } = require('./util');
 
 const LEVELS = { debug: 10, info: 20, warn: 30, error: 40, silent: 99 };
 const COLORS = { debug: '\x1b[90m', info: '\x1b[36m', warn: '\x1b[33m', error: '\x1b[31m', reset: '\x1b[0m' };
@@ -11,7 +11,7 @@ const TAIL_MAX_BYTES = 2 * 1024 * 1024;
 
 class Logger {
   constructor(opts = {}) {
-    this.dir = opts.dir || rootPath('data', 'logs');
+    this.dir = opts.dir || dataPath('logs');
     this.level = opts.level || 'info';
     this.maxDays = opts.maxDays || 7;
     this.toConsole = opts.console !== false;
@@ -59,6 +59,12 @@ class Logger {
     try { fs.appendFileSync(this.file(), line + '\n'); } catch { /* 磁盘异常不阻塞服务 */ }
     if (this.toConsole) {
       process.stdout.write(`${COLORS[level] || ''}${line}${COLORS.reset}\n`);
+      // 桌面版运行控制台：console 缓冲已初始化时，把「输出到控制台」的日志同步进缓冲（source=server）
+      try {
+        const consoleMod = require('./console');
+        const buf = typeof consoleMod.peek === 'function' ? consoleMod.peek() : null;
+        if (buf) buf.push({ source: this.consoleSource || 'server', level, text: line });
+      } catch { /* 忽略 */ }
     }
   }
 
@@ -128,5 +134,7 @@ function get() {
   if (!instance) instance = new Logger();
   return instance;
 }
+/** 当前已初始化的 logger（未初始化时返回 null，不产生副作用） */
+function peek() { return instance; }
 
-module.exports = { Logger, init, get, LEVELS };
+module.exports = { Logger, init, get, peek, LEVELS };

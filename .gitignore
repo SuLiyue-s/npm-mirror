@@ -9,3 +9,10 @@ tmp/
 node_modules/
 Thumbs.db
 .DS_Store
+
+# 桌面版构建产物（单 exe 由 GitHub Releases 发布，不入库）
+dist/
+src-tauri/target/
+src-tauri/embed/node.exe
+# Tauri 构建生成（每次构建自动重建）
+src-tauri/gen/schemas/

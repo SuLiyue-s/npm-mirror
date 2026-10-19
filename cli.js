@@ -18,7 +18,7 @@ const { Store } = require('./src/store');
 const bundle = require('./src/bundle');
 const npmcache = require('./src/npmcache');
 
-const PID_FILE = util.rootPath('data', 'mirror.pid');
+const PID_FILE = util.dataPath('mirror.pid');
 const C = {
   reset: '\x1b[0m', bold: '\x1b[1m', dim: '\x1b[2m',
   red: '\x1b[31m', green: '\x1b[32m', yellow: '\x1b[33m', cyan: '\x1b[36m',
@@ -602,8 +602,8 @@ function backupNpmrc(file, project) {
   const text = readNpmrc(file);
   const kind = project ? 'project' : 'global';
   const base = `npmrc-backup-${kind}-${util.stamp()}`;
-  const bak = util.rootPath('data', `${base}.bak`);
-  const meta = util.rootPath('data', `${base}.json`);
+  const bak = util.dataPath(`${base}.bak`);
+  const meta = util.dataPath(`${base}.json`);
   util.ensureDir(path.dirname(bak));
   fs.writeFileSync(bak, text, 'utf8');
   util.writeJsonAtomic(meta, { backup: path.basename(bak), kind, target: file, existed: fs.existsSync(file), createdAt: util.nowIso() });
@@ -647,7 +647,7 @@ commands.unuse = function () {
   const file = npmrcPath(project);
   const kind = project ? 'project' : 'global';
   const kindName = project ? '项目级' : '用户级';
-  const dataDir = util.rootPath('data');
+  const dataDir = util.dataRoot();
   const entries = fs.existsSync(dataDir) ? fs.readdirSync(dataDir) : [];
   const backups = entries.filter((f) => /^npmrc-backup-.+\.bak$/.test(f)).sort();
   const candidates = [];

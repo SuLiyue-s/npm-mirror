@@ -5,9 +5,132 @@ const path = require('node:path');
 const net = require('node:net');
 const crypto = require('node:crypto');
 
-const ROOT = path.resolve(__dirname, '..');
+// ---------------- 程序目录 / 数据目录（桌面版支持） ----------------
+// 程序自身根目录：开发 / CLI 模式 = __dirname/.. ；桌面版解压后 = MIRROR_APP_ROOT（Rust 设置）或 __dirname/..
+// 注意：只有「程序文件」（public/、cli.js、node.exe 旁的东西）在程序目录；运行数据（config/storage/logs）在主数据目录。
+const APP_ROOT = (() => {
+  const env = String(process.env.MIRROR_APP_ROOT || '').trim();
+  if (env) {
+    try { if (path.isAbsolute(env)) return path.resolve(env); } catch { /* 忽略非法值，回退 __dirname/.. */ }
+  }
+  return path.resolve(__dirname, '..');
+})();
 
-function rootPath(...p) { return path.join(ROOT, ...p); }
+// 兼容旧导出：ROOT 仍然表示「程序根目录」
+const ROOT = APP_ROOT;
+
+/** 读取命令行参数值：支持 --name=value 与 --name value 两种写法；没出现该参数返回 undefined */
+function argvValue(name) {
+  const argv = process.argv.slice(2);
+  const prefix = `--${name}=`;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a.startsWith(prefix)) return a.slice(prefix.length);
+    if (a === `--${name}`) {
+      const next = argv[i + 1];
+      // --name 后面紧跟另一个开关时按「空值」处理（例如 --data-dir --desktop）
+      return next !== undefined && !next.startsWith('-') ? next : '';
+    }
+  }
+  return undefined;
+}
+
+function hasArgvFlag(name) { return process.argv.slice(2).includes(`--${name}`); }
+
+// 桌面模式：Rust 会设置 MIRROR_DESKTOP=1；开发/自测时直接 `node src/server.js --desktop` 也视为桌面模式。
+// 这里顺手把 env 补齐，保证桌面进程拉起的子进程（一键脚本）能继承到同一语义。
+const DESKTOP = process.env.MIRROR_DESKTOP === '1' || process.env.MIRROR_DESKTOP === 'true' || hasArgvFlag('desktop');
+if (DESKTOP && !process.env.MIRROR_DESKTOP) process.env.MIRROR_DESKTOP = '1';
+
+/**
+ * 主数据目录解析（必须在 require 阶段完成：config.js 加载期就要用 dataPath('config.json') 算 CONFIG_FILE）：
+ * 优先级 --data-dir 参数 > MIRROR_DATA_DIR 环境变量 > <程序目录>/data。
+ * 数据目录不由 config.json 决定（配置本身就在数据目录里，鸡生蛋）。
+ */
+function computeDataRoot() {
+  const fromArg = argvValue('data-dir');
+  const raw = String((fromArg !== undefined ? fromArg : process.env.MIRROR_DATA_DIR) || '').trim();
+  if (!raw || raw.includes('\0')) return path.join(APP_ROOT, 'data');
+  try { return path.resolve(raw); } catch { return path.join(APP_ROOT, 'data'); }
+}
+
+let dataRootCache = computeDataRoot();
+
+function appRoot() { return APP_ROOT; }
+function dataRoot() { return dataRootCache; }
+/** 设置主数据目录（仅内部/测试用）：必须是绝对路径、存在、且是目录，否则抛错 */
+function setDataRoot(dir) {
+  const raw = String(dir == null ? '' : dir).trim();
+  const bad = (msg) => { const e = new Error(msg); e.code = 'EBADDATADIR'; return e; };
+  if (!raw) throw bad('数据目录不能为空');
+  if (raw.includes('\0')) throw bad('数据目录不能包含空字节');
+  if (!path.isAbsolute(raw)) throw bad(`数据目录必须是绝对路径：${raw}`);
+  const abs = path.resolve(raw);
+  let st = null;
+  try { st = fs.statSync(abs); } catch { st = null; }
+  if (!st) throw bad(`数据目录不存在：${abs}`);
+  if (!st.isDirectory()) throw bad(`数据目录不是文件夹：${abs}`);
+  dataRootCache = abs;
+  return dataRootCache;
+}
+
+function isDesktop() { return DESKTOP; }
+
+function epathError(msg) { const e = new Error(msg); e.code = 'EPATH'; return e; }
+
+/** 校验一段相对路径：非空字符串、不含 NUL、不是绝对路径/盘符相对路径、不含 .. 段 */
+function checkRelSegment(part) {
+  if (typeof part !== 'string') throw epathError('路径必须是字符串');
+  const text = part.trim();
+  if (!text) throw epathError('路径不能为空');
+  if (text.includes('\0')) throw epathError('路径不能包含空字节');
+  const s = text.replace(/\\/g, '/');
+  if (path.isAbsolute(s) || /^[A-Za-z]:/.test(s) || s.startsWith('//')) {
+    throw epathError(`数据目录内只能使用相对路径：${text}`);
+  }
+  const segs = s.split('/').filter(seg => seg && seg !== '.');
+  if (segs.includes('..')) throw epathError('路径不能包含 .. 段');
+  return segs;
+}
+
+/**
+ * 数据目录内的相对路径安全解析（storage.dir 等统一走这里）：
+ *  - 兼容旧配置：以 `data/` 或 `data\` 开头时先去掉该前缀（旧默认值 data/storage 在数据根=<程序目录>/data
+ *    时解析为 <程序目录>/data/storage，与旧布局一致）；
+ *  - 解析结果必须落在数据目录内部（用 path.relative 校验，不靠字符串前缀）；
+ *  - 非法时抛 {code:'EPATH'}。
+ */
+function resolveWithinDataRoot(rel) {
+  if (typeof rel !== 'string') throw epathError('路径必须是字符串');
+  let s = rel.trim();
+  if (!s) throw epathError('路径不能为空');
+  if (s.includes('\0')) throw epathError('路径不能包含空字节');
+  s = s.replace(/\\/g, '/');
+  // 本接口只接受数据目录内的相对路径：绝对路径（含盘符相对 / UNC）一律拒绝
+  if (path.isAbsolute(s) || /^[A-Za-z]:/.test(s) || s.startsWith('//')) {
+    throw epathError(`数据目录内只能使用相对路径：${rel.trim()}`);
+  }
+  if (s === 'data' || s.startsWith('data/')) s = s.slice(s === 'data' ? 4 : 5);
+  if (!s) throw epathError('路径不能指向数据目录本身');
+  const abs = path.resolve(dataRootCache, s);
+  const relOut = path.relative(dataRootCache, abs);
+  if (!relOut) throw epathError('路径不能指向数据目录本身');
+  if (path.isAbsolute(relOut) || relOut.split(path.sep).includes('..')) {
+    throw epathError(`路径不能跳出数据目录：${rel}`);
+  }
+  return abs;
+}
+
+/** 拼数据目录内的绝对路径；对每段做基本校验（禁止绝对路径 / .. / 空字节），防止意外穿越 */
+function dataPath(...parts) {
+  if (!parts.length) return dataRootCache;
+  const segs = [];
+  for (const p of parts) segs.push(...checkRelSegment(p));
+  if (!segs.length) throw epathError('路径不能为空');
+  return path.join(dataRootCache, ...segs);
+}
+
+function rootPath(...p) { return path.join(APP_ROOT, ...p); }
 function ensureDir(dir) { fs.mkdirSync(dir, { recursive: true }); return dir; }
 
 function readJson(file, fallback) {
@@ -376,4 +499,6 @@ module.exports = {
   isSafePkgName, isSafeVersion,
   parsePkgSpec, parseVersion, compareVersions, satisfies, maxSatisfying,
   escapeRegExp, clamp, toPosix, mapLimit, createByteBudget, httpDate,
+  // 桌面版：程序目录 / 主数据目录 / 路径穿越防护
+  appRoot, dataRoot, setDataRoot, dataPath, resolveWithinDataRoot, isDesktop, argvValue, hasArgvFlag,
 };

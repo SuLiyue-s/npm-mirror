@@ -23,8 +23,13 @@ const npmcache = require('./npmcache');
 const registry = require('./registry');
 const Hu = require('./http-util');
 const { handleAdmin, API } = require('./api');
+const consoleMod = require('./console');
+const { DesktopHost } = require('./desktop');
+const desktopScripts = require('./desktop-scripts');
 
 const PUBLIC_DIR = util.rootPath('public');
+/** 桌面版：Rust（Tauri 外壳）拉起本进程，stdin/stdout 是行协议桥，网页从内部回环端口加载 */
+const DESKTOP = util.isDesktop();
 const VERSION = (() => { try { return require('../package.json').version; } catch { return '1.0.0'; } })();
 
 const MODE_TEXT = {
@@ -57,6 +62,9 @@ function listenErrorMessage(e, ip, port, label) {
 async function createServer({ cliOpts = {} } = {}) {
   if (Object.keys(cliOpts).length) applyCliOverrides(config.get(), cliOpts);
 
+  // 桌面版：先建运行控制台环形缓冲，再初始化 logger（logger 输出到控制台的行会同步进缓冲）
+  if (DESKTOP) consoleMod.init({ max: 3000 });
+
   const cfg0 = config.get();
   const log = loggerMod.init({ dir: config.logsDir(), level: cfg0.log.level, maxDays: cfg0.log.maxDays, console: true });
   const store = new Store({ dir: config.storageDir(), logger: log });
@@ -75,6 +83,12 @@ async function createServer({ cliOpts = {} } = {}) {
   let registryStartedAt = Date.now();   // 镜像源监听实例的创建时间（每次重置监听都会更新）
   let adminStartedAt = Date.now();      // 管理界面监听实例的创建时间（每次重启管理界面都会更新）
   let adminListenError = '';            // 管理界面监听失败原因（镜像源服务继续可用）
+
+  // 桌面版：内部管理监听（127.0.0.1:0 随机端口）承载 GUI 页面与管理 API，始终存在；
+  // adminServer 在桌面版只表示「网页版管理」监听（cfg.admin.enabled=true 时才绑定）。
+  let internalServer = null;
+  let internalIp = '127.0.0.1';
+  let internalPort = 0;
 
   const state = {
     startedAt: Date.now(),
@@ -145,7 +159,18 @@ async function createServer({ cliOpts = {} } = {}) {
     get registryStartedAt() { return registryStartedAt; },
     get adminStartedAt() { return adminStartedAt; },
     get registryUrl() { return Hu.registryUrl(config.get()); },
-    get adminUrl() { return Hu.adminUrl(config.get()); },
+    // 管理界面地址：非桌面 = admin.ip:admin.port（旧语义，保持不变）；桌面 = 网页版开启时用其地址，否则内部回环端口
+    get adminUrl() { return webAdminUrl(); },
+    desktop: DESKTOP,
+    desktopHost: null,                        // DesktopHost（仅桌面模式，ctx 建好后赋值）
+    scripts: DESKTOP ? desktopScripts : null, // 一键脚本（仅桌面模式暴露给 API）
+    get internalAdminIp() { return internalIp; },
+    get internalAdminPort() { return internalPort; },
+    webAdminEnabled,
+    webAdminUrl,
+    webAdminState,
+    rebindWebAdmin,
+    restartRegistry,
     clientIp: Hu.clientIp,
     probeRegistry,
     requestShutdown,
@@ -153,6 +178,18 @@ async function createServer({ cliOpts = {} } = {}) {
     requestRestartRegistry,
     requestRestartAdmin,
   };
+
+  // 桌面版宿主：行协议桥 + 托盘/外壳动作代理 + 运行控制台。非桌面模式完全不创建，保持旧行为。
+  if (DESKTOP) {
+    const host = new DesktopHost({
+      version: VERSION,
+      getCtx: () => ctx,
+      // Rust 关闭 stdin（正常退出/外壳崩溃）时优雅退出，避免变成孤儿进程
+      onBridgeClose: () => requestShutdown(),
+    });
+    ctx.desktopHost = host;
+    host.start();
+  }
 
   // ---------------- 请求分发 ----------------
   const STATIC_EXT = new Set(['.html', '.js', '.mjs', '.css', '.map', '.json', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.ico', '.woff', '.woff2', '.ttf']);
@@ -373,6 +410,112 @@ async function createServer({ cliOpts = {} } = {}) {
     return { ip: adminIp, port: adminPort };
   }
 
+  // ---------------- 桌面版：内部管理监听 / 网页版管理监听 ----------------
+
+  /** 内部管理监听：127.0.0.1:0（系统分配随机端口），承载桌面 GUI 页面与管理 API，必须成功 */
+  async function bindInternalListener() {
+    const srv = makeServer(true);
+    await new Promise((resolve, reject) => {
+      const onError = (e) => { srv.removeListener('listening', onListening); reject(e); };
+      const onListening = () => { srv.removeListener('error', onError); resolve(); };
+      srv.once('error', onError);
+      srv.once('listening', onListening);
+      srv.listen(0, '127.0.0.1');
+    });
+    internalServer = srv;
+    internalIp = '127.0.0.1';
+    internalPort = srv.address().port;
+    return { ip: internalIp, port: internalPort };
+  }
+
+  /** 网页版管理监听（桌面版可选）：按 cfg.admin.ip:cfg.admin.port 绑定 */
+  async function bindWebAdminListener({ retries = 0 } = {}) {
+    const cfg = config.get();
+    const srv = makeServer(true);
+    await listenServer(srv, cfg.admin.ip, cfg.admin.port, { retries });
+    adminServer = srv;
+    adminIp = cfg.admin.ip;
+    adminPort = cfg.admin.port;
+    adminStartedAt = Date.now();
+    adminListenError = '';
+    return { ip: adminIp, port: adminPort };
+  }
+
+  /** 是否「网页版管理」可用：桌面版看 cfg.admin.enabled 且监听成功；非桌面版固定开启（旧行为） */
+  function webAdminEnabled() {
+    if (!DESKTOP) return true;
+    return config.get().admin.enabled === true && !adminListenError && !!adminServer;
+  }
+
+  /** 内部回环管理地址（桌面 GUI 加载的地址） */
+  function internalAdminUrl() {
+    return Hu.httpUrl(internalIp || '127.0.0.1', internalPort || 0);
+  }
+
+  /** 管理界面地址：桌面版网页管理开启用其地址，否则内部回环地址；非桌面版沿用旧语义 */
+  function webAdminUrl() {
+    if (!DESKTOP) return Hu.adminUrl(config.get());
+    const cfg = config.get();
+    if (webAdminEnabled()) return Hu.httpUrl(cfg.admin.ip, cfg.admin.port);
+    return internalAdminUrl();
+  }
+
+  /** 桌面版协议里的地址统一带结尾斜杠（DESIGN 第 6 节示例：http://127.0.0.1:4874/） */
+  function withSlash(u) {
+    if (!u) return u;
+    const s = String(u);
+    return s.endsWith('/') ? s : `${s}/`;
+  }
+
+  /** /desktop/info 与 ready 消息用的网页版管理状态 */
+  function webAdminState() {
+    const cfg = config.get();
+    if (!DESKTOP) {
+      return { enabled: true, ip: cfg.admin.ip, port: cfg.admin.port, url: Hu.adminUrl(config.get()), listening: !!adminServer, listenError: adminListenError || '' };
+    }
+    const listening = !!adminServer;
+    // DESIGN 第 5 节示例：未开启网页版管理时 url 为 null（内部回环地址由 GUI 通过 internalAdminPort 自行拼）
+    const url = listening ? withSlash(Hu.httpUrl(cfg.admin.ip, cfg.admin.port)) : null;
+    return { enabled: cfg.admin.enabled === true, ip: cfg.admin.ip, port: cfg.admin.port, url, listening, listenError: adminListenError || '' };
+  }
+
+  function notifyWebAdminChanged(st) {
+    if (!DESKTOP) return;
+    try { if (ctx.desktopHost) ctx.desktopHost.webAdminChanged({ enabled: !!(st && st.enabled && st.listening), url: st && st.url, listenError: (st && st.listenError) || '' }); } catch { /* 忽略 */ }
+  }
+
+  /**
+   * 桌面版：网页版管理开关/地址变化后立即重建（关闭或开启）该监听，不需要重启程序。
+   * 返回 {enabled,url,listenError}；失败只记录 adminListenError，不影响内部监听与镜像源。
+   */
+  async function rebindWebAdmin({ retries = 1 } = {}) {
+    if (!DESKTOP) return restartAdmin();
+    if (stopping) return { enabled: false, url: internalAdminUrl(), listenError: '服务正在停止' };
+    const cfg = config.get();
+    const wantEnabled = cfg.admin.enabled === true;
+    log.info(wantEnabled ? `正在开启网页版管理：${cfg.admin.ip}:${cfg.admin.port}` : '正在关闭网页版管理监听');
+    const old = adminServer;
+    adminServer = null;
+    await closeServer(old);
+    adminIp = cfg.admin.ip;
+    adminPort = cfg.admin.port;
+    if (wantEnabled) {
+      try {
+        await bindWebAdminListener({ retries });
+        log.info(`网页版管理已开启：${webAdminUrl()}/`);
+      } catch (e) {
+        adminListenError = listenErrorMessage(e, cfg.admin.ip, cfg.admin.port, '网页版管理界面');
+        log.error(`网页版管理开启失败：${adminListenError}`);
+      }
+    } else {
+      adminListenError = '';
+      log.info('网页版管理已关闭');
+    }
+    const st = webAdminState();
+    notifyWebAdminChanged(st);
+    return { enabled: st.enabled && st.listening, url: st.url, listenError: st.listenError || '' };
+  }
+
   /**
    * 重启镜像源服务：只重建镜像源监听，管理界面监听不受影响（管理界面不会断线）。
    * 新地址监听失败时自动回滚到原监听地址，保证镜像源继续可用。
@@ -411,6 +554,11 @@ async function createServer({ cliOpts = {} } = {}) {
    * 新地址监听失败时自动回滚到原监听地址。
    */
   async function restartAdmin() {
+    // 桌面版：没有「重启管理界面」这一步，网页版管理监听按配置即时重绑（内部监听始终不动）
+    if (DESKTOP) {
+      const st = await rebindWebAdmin({ retries: 10 });
+      return { ok: !!st.enabled, ...st };
+    }
     if (stopping) return { ok: false, error: '服务正在停止' };
     const cfg = config.get();
     const want = { ip: cfg.admin.ip, port: cfg.admin.port };
@@ -453,9 +601,22 @@ async function createServer({ cliOpts = {} } = {}) {
     if (stopping) return;
     stopping = true;
     log.warn('服务正在停止…');
+    if (DESKTOP) {
+      // 先给外壳发 bye，并留一点点时间让 stdout 冲刷，再关闭监听退出
+      try { if (ctx.desktopHost) ctx.desktopHost.sendBye(0); } catch { /* 忽略 */ }
+      setTimeout(doShutdown, 60);
+      return;
+    }
+    doShutdown();
+  }
+
+  function doShutdown() {
+    try { if (ctx.scripts) ctx.scripts.cancelAll(); } catch { /* 忽略 */ }
+    try { if (ctx.desktopHost) ctx.desktopHost.stop(); } catch { /* 忽略 */ }
     closeResources();
-    let pending = 2;
+    let pending = DESKTOP ? 3 : 2;
     const done = () => { if (--pending <= 0) process.exit(0); };
+    try { if (internalServer) internalServer.close(done); else if (DESKTOP) done(); } catch { done(); }
     try { if (adminServer) adminServer.close(done); else done(); } catch { done(); }
     try { if (registryServer) registryServer.close(done); else done(); } catch { done(); }
     setTimeout(() => process.exit(0), 3000).unref();
@@ -463,6 +624,18 @@ async function createServer({ cliOpts = {} } = {}) {
 
   function requestRestart() {
     if (stopping) return;
+    if (DESKTOP) {
+      // 桌面版：进程由外壳管理，重启 = 请求 Rust 重启程序（Node 不再 spawn 新进程，避免双实例）
+      log.warn('桌面模式：请求外壳重启程序…');
+      try {
+        if (ctx.desktopHost) {
+          ctx.desktopHost.appRestart().catch((e) => log.error(`请求外壳重启失败：${(e && e.message) || e}；请手动重启程序`));
+        } else {
+          log.error('桌面桥不可用，无法重启程序，请手动重启程序');
+        }
+      } catch (e) { log.error(`请求外壳重启失败：${(e && e.message) || e}`); }
+      return;
+    }
     stopping = true;
     log.warn('服务正在重启…');
     closeResources();
@@ -486,6 +659,35 @@ async function createServer({ cliOpts = {} } = {}) {
 
   function banner() {
     const cfg = config.get();
+    if (DESKTOP) {
+      const wa = webAdminState();
+      const lines = [
+        '',
+        '  ┌────────────────────────────────────────────────────────────┐',
+        `  │  离月私人 npm 镜像源  v${VERSION}  已启动（桌面版）`,
+        '  └────────────────────────────────────────────────────────────┘',
+        `  内部管理端口 : 127.0.0.1:${internalPort}（桌面 GUI 加载 http://127.0.0.1:${internalPort}/）`,
+        `  网页版管理   : ${wa.enabled ? (wa.listening ? wa.url : `已开启，但监听失败：${wa.listenError}`) : '未开启（可在设置中开启，开启后可用浏览器访问）'}`,
+        `  npm 源地址   : ${ctx.registryUrl}/`,
+        `  镜像源监听   : ${registryIp}:${registryPort}`,
+        `  运行模式     : ${MODE_TEXT[cfg.mode] || cfg.mode}`,
+        `  数据目录     : ${util.dataRoot()}`,
+        `  程序目录     : ${util.appRoot()}`,
+        `  上游公共源   : ${cfg.upstream.registry}`,
+      ];
+      if (adminListenError) lines.push(`  ⚠ 网页版管理监听失败：${adminListenError}`);
+      if (cfg.server.ip === '0.0.0.0' || cfg.server.ip === '::') {
+        for (const u of Hu.lanUrls(cfg.server.port)) lines.push(`  局域网地址   : ${u}`);
+      }
+      lines.push('  提示：桌面版由外壳管理窗口与托盘；退出程序请使用托盘菜单或设置中的「退出」', '');
+      // 启动横幅也进运行控制台（DESIGN 4.6）：每行一条，方便 GUI 直接展示
+      try {
+        const buf = consoleMod.get();
+        for (const line of lines) if (line.trim()) buf.push({ source: 'server', level: 'info', text: line.replace(/^\s+/, '') });
+      } catch { /* 忽略 */ }
+      process.stdout.write(lines.join('\n') + '\n');
+      return;
+    }
     const lines = [
       '',
       '  ┌────────────────────────────────────────────────────────────┐',
@@ -499,7 +701,7 @@ async function createServer({ cliOpts = {} } = {}) {
     if (adminListenError) lines.push(`  ⚠ 管理界面监听失败：${adminListenError}`);
     lines.push(
       `  运行模式   : ${MODE_TEXT[cfg.mode] || cfg.mode}`,
-      `  数据目录   : ${util.rootPath('data')}`,
+      `  数据目录   : ${util.dataRoot()}`,
       `  上游公共源 : ${cfg.upstream.registry}`,
     );
     if (cfg.server.ip === '0.0.0.0' || cfg.server.ip === '::') {
@@ -518,6 +720,53 @@ async function createServer({ cliOpts = {} } = {}) {
   async function start() {
     const cfg = config.get();
     const openOnStart = cfg.server.openBrowserOnStart && !cliOpts['no-open'];
+
+    // ---------------- 桌面模式 ----------------
+    if (DESKTOP) {
+      // 内部管理监听必须成功：它承载 GUI 页面与管理 API，失败等于桌面界面无法加载，直接报错
+      try {
+        await bindInternalListener();
+      } catch (e) {
+        const err = new Error(`内部管理端口绑定失败（127.0.0.1:0）：${e.message || e.code}；请重启程序`);
+        err.code = e.code;
+        throw err;
+      }
+      try {
+        await bindRegistryListener({ retries: 20 });
+      } catch (e) {
+        const err = new Error(listenErrorMessage(e, cfg.server.ip, cfg.server.port, '镜像源服务'));
+        err.code = e.code;
+        throw err;
+      }
+      // 网页版管理监听：仅在配置显式开启时绑定；失败只记录错误，不影响内部监听与镜像源
+      if (cfg.admin.enabled === true) {
+        try {
+          await bindWebAdminListener({ retries: 0 });
+        } catch (e) {
+          adminListenError = listenErrorMessage(e, cfg.admin.ip, cfg.admin.port, '网页版管理界面');
+          log.error(`网页版管理启动失败（镜像源与桌面界面仍在运行）：${adminListenError}`);
+        }
+      } else {
+        adminListenError = '';
+      }
+      log.info(`私人 npm 镜像源 v${VERSION} 已启动（桌面版）：镜像源 ${ctx.registryUrl}/（模式：${cfg.mode}）；内部管理端口 127.0.0.1:${internalPort}`);
+      banner();
+      // 通知外壳：服务就绪。之后 Rust 才会创建/显示窗口并加载内部管理地址。
+      try {
+        if (ctx.desktopHost) {
+          const st = webAdminState();
+          ctx.desktopHost.sendReady({
+            internalAdminPort: internalPort,
+            dataDir: util.dataRoot(),
+            webAdmin: { enabled: st.enabled, url: st.listening ? st.url : null },
+          });
+        }
+      } catch (e) { log.error(`发送 ready 消息失败：${(e && e.message) || e}`); }
+      // 桌面模式不自动打开外部浏览器（GUI 就是界面本身）
+      return ctx;
+    }
+
+    // ---------------- 非桌面模式：保持旧行为完全不变 ----------------
     try {
       await bindRegistryListener({ retries: 20 });
     } catch (e) {
@@ -552,10 +801,13 @@ async function createServer({ cliOpts = {} } = {}) {
   }
 
   async function stop() {
+    try { if (ctx.scripts) ctx.scripts.cancelAll(); } catch { /* 忽略 */ }
     closeResources();
-    await Promise.all([closeServer(registryServer), closeServer(adminServer)]);
+    await Promise.all([closeServer(registryServer), closeServer(adminServer), closeServer(internalServer)]);
     registryServer = null;
     adminServer = null;
+    internalServer = null;
+    try { if (ctx.desktopHost) ctx.desktopHost.stop(); } catch { /* 忽略 */ }
   }
 
   process.on('SIGINT', () => { log.warn('收到 Ctrl+C，正在停止…'); requestShutdown(); });
@@ -568,7 +820,30 @@ async function createServer({ cliOpts = {} } = {}) {
     requestRestartRegistry, requestRestartAdmin, VERSION,
     get registryServer() { return registryServer; },
     get adminServer() { return adminServer; },
+    get internalServer() { return internalServer; },
+    get internalAdminPort() { return internalPort; },
+    get desktop() { return DESKTOP; },
+    webAdminState,
+    rebindWebAdmin,
   };
+}
+
+// ---------------- 直接启动入口 ----------------
+// 桌面版由 Rust 直接拉起 `node.exe <appRoot>/src/server.js --desktop --data-dir <目录>`；
+// CLI（cli.js）通过 require 复用本模块，不会触发这里（require.main !== module）。
+if (require.main === module) {
+  const cliOpts = {};
+  for (const name of ['ip', 'port', 'mode', 'registry']) {
+    const v = util.argvValue(name);
+    if (v !== undefined && v !== '') cliOpts[name] = v;
+  }
+  if (util.hasArgvFlag('no-open')) cliOpts['no-open'] = true;
+  createServer({ cliOpts })
+    .then((app) => app.start())
+    .catch((e) => {
+      process.stderr.write(`\n启动失败：${(e && e.message) || e}\n`);
+      process.exit(1);
+    });
 }
 
 module.exports = { createServer, VERSION, MODE_TEXT };

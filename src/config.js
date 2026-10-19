@@ -3,9 +3,10 @@
 const fs = require('node:fs');
 const net = require('node:net');
 const path = require('node:path');
-const { rootPath, ensureDir, writeJsonAtomic, randomToken } = require('./util');
+const { dataPath, resolveWithinDataRoot, ensureDir, writeJsonAtomic, randomToken } = require('./util');
 
-const CONFIG_FILE = rootPath('data', 'config.json');
+// 配置文件在「主数据目录」里：桌面版由 Rust 用 --data-dir / MIRROR_DATA_DIR 指定（util.js 在 require 阶段已解析）
+const CONFIG_FILE = dataPath('config.json');
 const MODES = ['cache', 'proxy', 'offline'];
 const LOG_LEVELS = ['debug', 'info', 'warn', 'error'];
 const OBJECT_SECTIONS = ['server', 'admin', 'upstream', 'security', 'storage', 'log', 'ui'];
@@ -15,7 +16,9 @@ function defaults() {
     server: { ip: '127.0.0.1', port: 4873, openBrowserOnStart: true },
     // 管理界面独立监听：ip 只允许 127.0.0.0/8 的本地回环 IPv4（只有本机能访问管理界面），
     // port 不能与 server.port 相同（两个监听不能共用同一个端口）。默认 4874，冲突时回退到 4873/server.port±1。
-    admin: { ip: '127.0.0.1', port: 4874 },
+    // enabled 只在桌面版生效：桌面版默认只有「内部回环端口」承载管理界面，勾选后才额外监听 ip:port（局域网/浏览器访问）。
+    // 非桌面模式（CLI / npm start）忽略 enabled，永远监听 admin.ip:admin.port，保持与旧版完全一致。
+    admin: { ip: '127.0.0.1', port: 4874, enabled: false },
     mode: 'cache',                 // cache=本地优先并回源缓存 | proxy=过期即回源 | offline=纯离线
     upstream: {
       registry: 'https://registry.npmmirror.com',
@@ -90,14 +93,32 @@ function safeAdminPort(value, serverPort) {
   return p;
 }
 
-/** 存储目录：允许项目内相对路径或绝对路径（迁移到大磁盘），但拒绝空字节与磁盘根目录 */
+/**
+ * 存储目录：允许数据目录内的相对路径或绝对路径（迁移到大磁盘），但拒绝空字节、磁盘根目录，
+ * 以及会跳出数据目录的相对路径（.. / 盘符相对路径等）。非法值回退默认 'data/storage'。
+ */
 function safeStorageDir(dir) {
-  const raw = String(dir || '').trim();
-  if (!raw || raw.includes('\0')) return 'data/storage';
-  const abs = path.isAbsolute(raw) ? path.resolve(raw) : path.resolve(rootPath(), raw);
-  if (abs === path.parse(abs).root) return 'data/storage';   // 拒绝 C:\ / D:\ 这类根目录
-  if (abs.length < 4) return 'data/storage';
-  return raw;
+  const raw = String(dir == null ? '' : dir).trim();
+  // 非法值统一回退默认并记警告（DESIGN 4.2：不能让服务起不来，但要让用户知道配置被修正了）
+  const bad = (why) => {
+    logWarn(`存储目录配置不合法（${raw || '空'}）：${why}，已回退默认 data/storage`);
+    return 'data/storage';
+  };
+  if (!raw) return bad('不能为空');
+  if (raw.includes('\0')) return bad('不能包含空字节');
+  if (raw.length > 1000) return bad('路径太长');
+  if (path.isAbsolute(raw)) {
+    const abs = path.resolve(raw);
+    if (abs === path.parse(abs).root) return bad('不能使用磁盘根目录');   // 拒绝 C:\ / D:\ 这类根目录
+    if (abs.length < 4) return bad('路径太短');
+    return abs;
+  }
+  try {
+    resolveWithinDataRoot(raw);   // 只做校验：相对路径必须落在数据目录内
+    return raw;
+  } catch (e) {
+    return bad((e && e.message) || '路径不合法');
+  }
 }
 
 /**
@@ -171,6 +192,8 @@ function sanitize(input) {
       // 管理界面监听：只允许 127.0.0.0/8 回环 IPv4；端口不能与镜像源端口相同
       ip: safeAdminIp(admin.ip),
       port: safeAdminPort(admin.port, serverPort),
+      // 仅桌面版生效的网页版管理开关：非布尔值一律按 false
+      enabled: admin.enabled === true,
     },
     mode: MODES.includes(String(src.mode)) ? String(src.mode) : 'cache',
     upstream: {
@@ -279,13 +302,43 @@ function rotateToken() {
   return cache.security.token;
 }
 
-function storageDir() {
-  const cfg = load();
-  return path.isAbsolute(cfg.storage.dir) ? cfg.storage.dir : rootPath(cfg.storage.dir);
+/** 配置层警告：优先写日志（logger 已初始化时），否则退回 stderr；桌面版 stdout 是桥通道，不能随便写 */
+function logWarn(msg) {
+  try {
+    const loggerMod = require('./logger');
+    const lg = typeof loggerMod.peek === 'function' ? loggerMod.peek() : null;
+    if (lg) { lg.warn(msg); return; }
+  } catch { /* 忽略 */ }
+  try { process.stderr.write(`[配置] ${msg}\n`); } catch { /* 忽略 */ }
 }
 
-function bundlesDir() { return rootPath('data', 'bundles'); }
-function logsDir() { return rootPath('data', 'logs'); }
+/**
+ * 实际生效的存储目录：
+ *  - 绝对路径：path.resolve 归一化后直接使用（允许迁移到其它磁盘）；
+ *  - 相对路径：相对「主数据目录」解析（兼容旧配置 data/storage，在数据目录 = <程序目录>/data 时路径不变）；
+ *  - 非法值：回退 <数据目录>/storage 并记警告，绝不让服务起不来。
+ */
+function storageDir() {
+  const cfg = load();
+  const raw = String(cfg.storage.dir == null ? '' : cfg.storage.dir).trim();
+  const fallback = dataPath('storage');
+  const bad = (why) => {
+    logWarn(`存储目录配置不合法（${raw || '空'}）：${why}，已回退默认 ${fallback}`);
+    return fallback;
+  };
+  if (!raw) return bad('不能为空');
+  if (raw.includes('\0')) return bad('不能包含空字节');
+  if (path.isAbsolute(raw)) {
+    const abs = path.resolve(raw);
+    if (abs === path.parse(abs).root) return bad('不能使用磁盘根目录');
+    if (abs.length < 4) return bad('路径太短');
+    return abs;
+  }
+  try { return resolveWithinDataRoot(raw); } catch (e) { return bad(e.message); }
+}
+
+function bundlesDir() { return dataPath('bundles'); }
+function logsDir() { return dataPath('logs'); }
 
 /**
  * 需要在重启后才生效的字段，按「需要重启谁」分类：

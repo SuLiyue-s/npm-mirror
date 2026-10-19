@@ -6,7 +6,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const os = require('node:os');
 const {
-  integrityToCachePath, ensureDir, readJson, writeJsonAtomic, rootPath, compareVersions,
+  integrityToCachePath, ensureDir, readJson, writeJsonAtomic, dataPath, compareVersions,
   isSafePkgName, isSafeVersion, mapLimit, createByteBudget,
 } = require('./util');
 
@@ -14,7 +14,7 @@ let scanState = null;                   // { cacheDir, registry, scannedAt, pack
 // 2: 扫描阶段会校验每个可导入 tarball 的 integrity，旧扫描结果需要重扫才能得到准确计数
 const SCAN_STATE_VERSION = 2;
 
-function stateFile() { return rootPath('data', 'npmcache-scan.json'); }
+function stateFile() { return dataPath('npmcache-scan.json'); }
 
 /** 用户主目录：环境变量缺失时回退 os.homedir()；都取不到返回 ''。
  *  绝不能让空字符串参与 path.join，否则会变成相对路径、误读「当前目录下的 .npmrc」。 */

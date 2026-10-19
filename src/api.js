@@ -6,6 +6,8 @@ const path = require('node:path');
 const os = require('node:os');
 const net = require('node:net');
 const authLib = require('./auth');
+const util = require('./util');
+const consoleBuf = require('./console');
 
 // 常量时间令牌比较（src/auth.js 的 tokenMatches）：不能用 === 明文比较，
 // 逐字节短路会泄露令牌前缀，也让响应时间可被观测。
@@ -21,13 +23,13 @@ const pull = require('./pull');
 const deps = require('./deps');
 const {
   nowIso, parsePkgSpec, satisfies, compareVersions, maxSatisfying,
-  rootPath, stamp, formatBytes, clamp, randomToken, mapLimit,
+  stamp, formatBytes, clamp, randomToken, mapLimit,
 } = require('./util');
 
 const API = '/__admin/api';
 
 function bundlesStat() {
-  const dir = rootPath('data', 'bundles');
+  const dir = util.dataPath('bundles');
   let count = 0, bytes = 0;
   try {
     for (const f of fs.readdirSync(dir)) {
@@ -367,7 +369,7 @@ const bundleUploads = new Map(); // uploadId -> { id, name, size, overwrite, dir
  *  每次 init 都顺手扫一遍（开销只是一次 readdir），超过 2×TTL 的删掉，避免长期占盘。 */
 function cleanupStaleBundleUploadDirs() {
   try {
-    const tmpDir = rootPath('data', 'tmp');
+    const tmpDir = util.dataPath('tmp');
     const now = Date.now();
     for (const name of fs.readdirSync(tmpDir)) {
       if (!name.startsWith('upload-')) continue;
@@ -1260,7 +1262,7 @@ async function handleAdmin(ctx) {  const { req, res, url, method, store, log } =
       return fail(res, 400, '文件内容不是 gzip 格式的 tarball', 'EBADFORMAT');
     }
     const overwrite = q.get('overwrite') === '1' || q.get('overwrite') === 'true';
-    const tmpDir = rootPath('data', 'tmp');
+    const tmpDir = util.dataPath('tmp');
     const file = bodyToTempFile(buf, tmpDir, filename);
     try {
       if (/\.json$/i.test(filename)) {
@@ -1537,7 +1539,7 @@ async function handleAdmin(ctx) {  const { req, res, url, method, store, log } =
     // chunkCount 上限由 maxBundleUploadMB 与最小分片 1MB 共同约束（最多 65536 片），远小于安全整数
     const chunkCount = Math.max(1, Math.ceil(size / chunkSize));
     const id = randomToken(16);
-    const dir = path.join(rootPath('data', 'tmp'), `upload-${id}`);
+    const dir = path.join(util.dataPath('tmp'), `upload-${id}`);
     fs.mkdirSync(dir, { recursive: true });
     bundleUploads.set(id, {
       id, name, size, overwrite: body.overwrite === true, dir, chunkSize, chunkCount,
@@ -1600,7 +1602,7 @@ async function handleAdmin(ctx) {  const { req, res, url, method, store, log } =
     up.assembling = true;
     const overwrite = body.overwrite === true || up.overwrite;
     const wantProgress = q.get('progress') === '1' || q.get('progress') === 'true' || body.progress === true;
-    const tempFile = tempFilePath(rootPath('data', 'tmp'), up.name);
+    const tempFile = tempFilePath(util.dataPath('tmp'), up.name);
     const cleanup = () => { try { fs.unlinkSync(tempFile); } catch { /* 忽略 */ } dropBundleUpload(up); };
     const assemble = async (update, isCanceled) => {
       update({ phase: 'assemble', bytes: 0, bytesTotal: up.size, current: up.name, message: `正在合并 ${up.chunkCount} 个上传分片…` });
@@ -1665,7 +1667,7 @@ async function handleAdmin(ctx) {  const { req, res, url, method, store, log } =
       if (body.progress === true) wantProgress = true;
       const name = path.basename(String(body.file || ''));
       if (!name) return fail(res, 400, '请提供 file 字段（离线包文件名）', 'EBADREQ');
-      file = path.join(rootPath('data', 'bundles'), name);
+      file = path.join(util.dataPath('bundles'), name);
       if (!fs.existsSync(file)) return fail(res, 404, `离线包不存在：${name}`, 'ENOENT');
     } else {
       // 原始体上传（网页里拖入/选择 bundle）：流式落盘，几个 GB 的整机备份也不会把内存撑爆。
@@ -1685,7 +1687,7 @@ async function handleAdmin(ctx) {  const { req, res, url, method, store, log } =
         const raw = path.basename(decodeURIComponent(String(req.headers['x-filename'] || '')));
         if (raw) filename = raw;
       } catch { /* 文件名解码失败就用默认名 */ }
-      temp = tempFilePath(rootPath('data', 'tmp'), filename);
+      temp = tempFilePath(util.dataPath('tmp'), filename);
       try {
         const { size } = await readBodyToFile(req, temp, { maxBytes, idleMs: 60000, totalMs: 1500000 });
         if (!size) {
@@ -1715,14 +1717,14 @@ async function handleAdmin(ctx) {  const { req, res, url, method, store, log } =
 
   if (rel === '/bundles/download' && method === 'GET') {
     const name = path.basename(String(q.get('file') || ''));
-    const file = path.join(rootPath('data', 'bundles'), name);
+    const file = path.join(util.dataPath('bundles'), name);
     if (!name || !fs.existsSync(file)) return fail(res, 404, `离线包不存在：${name}`, 'ENOENT');
     return streamFile(res, file, { download: true, contentType: 'application/gzip' });
   }
 
   if (rel === '/bundles' && method === 'DELETE') {
     const name = path.basename(String(q.get('file') || ''));
-    const file = path.join(rootPath('data', 'bundles'), name);
+    const file = path.join(util.dataPath('bundles'), name);
     if (!name || !fs.existsSync(file)) return fail(res, 404, `离线包不存在：${name}`, 'ENOENT');
     fs.unlinkSync(file);
     if (log) log.warn(`删除离线包 ${name}`);
@@ -1782,6 +1784,8 @@ async function handleAdmin(ctx) {  const { req, res, url, method, store, log } =
         if (!Number.isInteger(p) || p < 1 || p > 65535) return bad('管理界面监听端口 admin.port 必须是 1-65535 的整数');
         a.port = p;
       }
+      // admin.enabled：仅桌面版有意义的「网页版管理」开关；非桌面版保存但不生效（CLI 模式固定开启管理界面）
+      if (a.enabled !== undefined && typeof a.enabled !== 'boolean') return bad('admin.enabled 必须是布尔值');
     }
     // 管理界面监听端口不能与镜像源监听端口相同：合并后再校验（可能只改了其中一个配置）
     {
@@ -1847,8 +1851,18 @@ async function handleAdmin(ctx) {  const { req, res, url, method, store, log } =
         const dir = st.dir.trim();
         if (!dir) return bad('storage.dir 不能为空');
         if (dir.includes('\0')) return bad('storage.dir 不能包含空字节');
+        if (dir.length > 1000) return bad('storage.dir 路径过长');
+        /* 存储目录解析规则（与 config.storageDir() 一致）：
+         *   相对路径 = 相对「主数据目录」，不允许用 .. 跳出数据目录（桌面版支持切换主数据目录，必须限制在数据目录内）；
+         *   绝对路径 = 允许用户把包目录放到其他磁盘，但不能是磁盘根目录。 */
         let abs;
-        try { abs = path.resolve(dir); } catch { return bad('storage.dir 不是合法的路径'); }
+        try {
+          if (path.isAbsolute(dir)) abs = path.resolve(dir);
+          else abs = util.resolveWithinDataRoot(dir);
+        } catch (e) {
+          if (e && e.code === 'EPATH') return bad('存储目录不能使用 .. 跳出数据目录');
+          return bad(`storage.dir 不是合法的路径：${(e && e.message) || e}`);
+        }
         // 拒绝磁盘根（C:\ / D:\ / \\server\share\ 等）：包目录若落在根上，后续清理/迁移非常危险
         if (abs.toLowerCase() === path.parse(abs).root.toLowerCase()) {
           return bad('storage.dir 不能是磁盘根目录');
@@ -1870,9 +1884,63 @@ async function handleAdmin(ctx) {  const { req, res, url, method, store, log } =
     ctx.state.upstreamCheck = null;   // 上游可能变了，重新探测
     // 分项重启标记：registry=需重启镜像源服务 / admin=需重启管理界面 / program=需重启整个程序
     const restart = config.restartChanges(before, after);
+    /* 桌面版：网页版管理的开关/监听地址变化后立即重绑监听，不需要重启程序。
+     * 注意：浏览器从「网页版管理端口」发起关闭/改地址时，重绑会关闭承载本请求的监听；
+     * 必须先回包再关监听（DESIGN 4.5），否则客户端会收到 ECONNRESET。 */
+    let webAdmin = null;
+    let rebindLater = null;
+    if (ctx.desktop) {
+      const adminTouched = restart.admin || before.admin.enabled !== after.admin.enabled;
+      if (adminTouched && typeof ctx.rebindWebAdmin === 'function') {
+        const disabling = after.admin.enabled !== true;
+        let onWebAdminListener = false;
+        try {
+          onWebAdminListener = !!(req.socket && ctx.internalAdminPort && req.socket.localPort && req.socket.localPort !== ctx.internalAdminPort);
+        } catch { onWebAdminListener = false; }
+        if (disabling || onWebAdminListener) {
+          // 先回包（webAdmin 为预测值），响应写完后再真正关/重绑监听
+          webAdmin = {
+            enabled: !disabling,
+            url: null,
+            listenError: '',
+          };
+          restart.admin = false;   // 已即时生效，不必再提示「重启管理界面」
+          rebindLater = () => ctx.rebindWebAdmin({ retries: 1 });
+        } else {
+          try {
+            const st = await ctx.rebindWebAdmin({ retries: 1 });
+            webAdmin = { enabled: !!st.enabled, url: st.url || null, listenError: st.listenError || '' };
+            restart.admin = false;   // 已即时生效，不必再提示「重启管理界面」
+          } catch (e) {
+            webAdmin = { enabled: false, url: null, listenError: (e && e.message) || String(e) };
+            if (log) log.error(`网页版管理重绑失败：${(e && e.message) || e}`);
+          }
+        }
+      } else {
+        const st = typeof ctx.webAdminState === 'function' ? ctx.webAdminState() : null;
+        if (st) webAdmin = { enabled: !!st.enabled, url: st.url || null, listenError: st.listenError || '' };
+      }
+    }
     const restartRequired = restart.registry || restart.admin || restart.program;
     ctx.state.restartRequired = restartRequired;
-    return ok(res, { config: config.publicConfig(false), restartRequired, requiresRestart: restartRequired, restart });
+    const data = { config: config.publicConfig(false), restartRequired, requiresRestart: restartRequired, restart };
+    if (webAdmin) data.webAdmin = webAdmin;   // 仅桌面版附加：GUI 据此即时更新网页版管理状态
+    ok(res, data);
+    if (rebindLater) {
+      // 等响应完整写出（finish）后再重绑；兜底 800ms 防止客户端提前断开导致 finish 不触发
+      let armed = false;
+      const runRebind = () => {
+        Promise.resolve().then(rebindLater).catch((e) => { if (log) log.error(`网页版管理重绑失败：${(e && e.message) || e}`); });
+      };
+      const arm = () => {
+        if (armed) return;
+        armed = true;
+        setTimeout(runRebind, 120);
+      };
+      try { res.once('finish', arm); } catch { /* 忽略 */ }
+      setTimeout(arm, 800).unref?.();
+    }
+    return true;
   }
 
   /* 加速镜像源「测试连通性」：只读探测，不落盘、不改配置；地址规则与 PUT /config 的 accelerators 校验一致 */
@@ -2158,6 +2226,19 @@ async function handleAdmin(ctx) {  const { req, res, url, method, store, log } =
 
   // ---------------- 服务控制 ----------------
   if (rel === '/service/shutdown' && method === 'POST') {
+    /* 桌面版：退出程序 = 请求外壳退出（外壳负责结束 Node 子进程与窗口）。
+     * 桥不可用时退回本地优雅退出，保证按钮点了不会没反应。 */
+    if (ctx.desktop) {
+      if (log) log.warn('收到停止指令（桌面版）：请求外壳退出程序');
+      sendJson(res, 200, { ok: true, data: { stopping: true, quitting: true } });
+      setTimeout(() => {
+        try {
+          if (ctx.desktopHost) ctx.desktopHost.appQuit().catch(() => ctx.requestShutdown());
+          else ctx.requestShutdown();
+        } catch { ctx.requestShutdown(); }
+      }, 200);
+      return true;
+    }
     if (log) log.warn('收到停止指令，服务即将退出');
     sendJson(res, 200, { ok: true, data: { stopping: true } });
     setTimeout(() => ctx.requestShutdown(), 200);
@@ -2184,6 +2265,12 @@ async function handleAdmin(ctx) {  const { req, res, url, method, store, log } =
   /* 重启管理界面：只重建管理界面监听（admin.ip:admin.port），镜像源服务不受影响。
    * 页面会在监听重建期间短暂断连，恢复后自动刷新（这是唯一会触发管理界面刷新的重启操作）。 */
   if (rel === '/service/restart-admin' && method === 'POST') {
+    /* 桌面版：只重绑网页版管理监听并返回结果（不重启 Node，内部管理/GUI 页面完全不中断）。 */
+    if (ctx.desktop && typeof ctx.rebindWebAdmin === 'function') {
+      if (log) log.warn('桌面模式：按配置重绑网页版管理监听');
+      const st = await ctx.rebindWebAdmin({ retries: 1 });
+      return ok(res, { target: 'admin', enabled: !!st.enabled, url: st.url || null, listenError: st.listenError || '' });
+    }
     const config = require('./config');
     const c = config.get();
     const sameAsCurrent = String(c.admin.ip) === String(ctx.adminListenIp) && Number(c.admin.port) === Number(ctx.adminListenPort);
@@ -2211,6 +2298,204 @@ async function handleAdmin(ctx) {  const { req, res, url, method, store, log } =
     sendJson(res, 200, { ok: true, data: { restarting: true, target: 'process' } });
     setTimeout(() => ctx.requestRestart(), 200);
     return true;
+  }
+
+  // ---------------- 桌面版接口 ----------------
+  /* /desktop/info：桌面版返回外壳/目录/网页版管理/内部端口等完整信息；非桌面版也返回可用字段（desktop:false），
+   * 供前端统一判断「当前是不是桌面版」。 */
+  if (rel === '/desktop/info' && method === 'GET') {
+    const config = require('./config');
+    const cfgInfo = config.get();
+    const wa = typeof ctx.webAdminState === 'function'
+      ? ctx.webAdminState()
+      : { enabled: true, ip: ctx.adminListenIp, port: ctx.adminListenPort, url: ctx.adminUrl, listening: true, listenError: ctx.adminListenError || '' };
+    const baseInfo = {
+      desktop: !!ctx.desktop,
+      version: ctx.state.version,
+      node: process.version,
+      platform: process.platform,
+      pid: process.pid,
+      appRoot: util.appRoot(),
+      dataDir: util.dataRoot(),
+      dataDirDefault: path.join(util.appRoot(), 'data'),
+      cacheDir: ctx.npmcache.resolveCacheDir(ctx.npmcache.defaultCacheDir()),
+      webAdmin: { enabled: !!wa.enabled, ip: wa.ip, port: wa.port, url: wa.url || null, listening: !!wa.listening, listenError: wa.listenError || '' },
+      autostart: null,
+    };
+    if (!ctx.desktop) {
+      // 非桌面（CLI）：管理界面固定开启，没有独立内部端口/外壳 exe
+      return ok(res, {
+        ...baseInfo,
+        productName: (cfgInfo.ui && cfgInfo.ui.title) || '私人 npm 镜像源',
+        exePath: null,
+        exeDir: util.appRoot(),
+        internal: { ip: wa.ip, port: wa.port },
+      });
+    }
+    let appInfo = null;
+    try { appInfo = ctx.desktopHost ? await ctx.desktopHost.ensureAppInfo() : null; } catch { appInfo = null; }
+    const exeDir = (appInfo && appInfo.exeDir) || util.appRoot();
+    return ok(res, {
+      ...baseInfo,
+      productName: (ctx.desktopHost && ctx.desktopHost.productName) || '离月私人 npm 镜像源',
+      exePath: (appInfo && appInfo.exePath) || process.execPath,
+      exeDir,
+      // DESIGN §1.5/§13.7：桌面版默认主数据目录 = <exe 所在目录>\data（程序运行目录 runtime 仅是兜底）
+      dataDirDefault: path.join(exeDir, 'data'),
+      internal: { ip: ctx.internalAdminIp || '127.0.0.1', port: ctx.internalAdminPort || 0 },
+    });
+  }
+
+  /* /desktop/console：运行控制台（环形缓冲）。after=上次最后一条 seq（增量拉取），limit 默认 500 上限 1000。 */
+  if (rel === '/desktop/console' && method === 'GET') {
+    if (!ctx.desktop) return fail(res, 400, '运行控制台仅桌面版可用', 'EDESKTOP');
+    const data = consoleBuf.get().since(q.get('after'), q.get('limit'));
+    return ok(res, data);
+  }
+  if (rel === '/desktop/console' && method === 'DELETE') {
+    if (!ctx.desktop) return fail(res, 400, '运行控制台仅桌面版可用', 'EDESKTOP');
+    consoleBuf.get().clear();
+    return ok(res, { cleared: true });
+  }
+
+  /* /desktop/files：数据目录 / 日志目录 / 配置文件的位置与是否存在（「打开目录」类操作先查这个） */
+  if (rel === '/desktop/files' && method === 'GET') {
+    const config = require('./config');
+    const target = String(q.get('target') || 'data').trim();
+    let p;
+    if (target === 'data') p = util.dataRoot();
+    else if (target === 'logs') p = config.logsDir();
+    else if (target === 'config') p = config.CONFIG_FILE;
+    else return fail(res, 400, `未知的文件位置：${target}（可选 data / logs / config）`, 'EBADTARGET');
+    let exists = false;
+    try { exists = fs.existsSync(p); } catch { exists = false; }
+    return ok(res, { target, path: p, exists });
+  }
+
+  /* /desktop/scripts：一键脚本运行状态（running 列表 + last 最近一次结果） */
+  if (rel === '/desktop/scripts' && method === 'GET') {
+    if (!ctx.desktop || !ctx.scripts) return fail(res, 400, '一键脚本仅桌面版可用', 'EDESKTOP');
+    return ok(res, ctx.scripts.status());
+  }
+
+  /* /desktop/action：桌面动作统一入口（动作名白名单，参数校验在本层，桥只负责转发）。
+   * 桌面专属动作在非桌面模式返回 400 EDESKTOP；桥超时/不可用返回 504 EBRIDGE。 */
+  if (rel === '/desktop/action' && method === 'POST') {
+    const config = require('./config');
+    const body = await readJson(req).catch(() => ({}));
+    const action = String(body.action || '').trim();
+    const params = (body.params && typeof body.params === 'object' && !Array.isArray(body.params)) ? body.params : {};
+    const host = ctx.desktopHost;
+    const needDesktop = () => {
+      if (ctx.desktop && host) return false;
+      fail(res, 400, '该功能仅桌面版可用', 'EDESKTOP');
+      return true;
+    };
+    const actionFail = (e) => {
+      const code = (e && e.code) || 'EBRIDGE';
+      if (['EBADPARAM', 'EBADFILE', 'EBADSCRIPT', 'EBUSY', 'EPATH', 'EBADTARGET'].includes(code)) {
+        return fail(res, 400, (e && e.message) || String(e), code);
+      }
+      if (code === 'EBADBRIDGE' || code === 'EBRIDGE') {
+        return fail(res, 504, `桌面外壳无响应：${(e && e.message) || e}`, 'EBRIDGE');
+      }
+      return fail(res, 500, (e && e.message) || String(e), code);
+    };
+    try {
+      switch (action) {
+      case 'pickFolder': {
+        if (needDesktop()) return true;
+        const r = await host.pickFolder({ title: params.title, initialDir: params.initialDir });
+        return ok(res, r && r.path ? { path: String(r.path) } : { canceled: true });
+      }
+      case 'pickFile': {
+        if (needDesktop()) return true;
+        const r = await host.pickFile({ title: params.title });
+        return ok(res, r && r.path ? { path: String(r.path) } : { canceled: true });
+      }
+      case 'setDataDir': {
+        if (needDesktop()) return true;
+        const dir = String(params.dir || '').trim();
+        if (!dir) return fail(res, 400, '请提供新的主数据目录', 'EBADPARAM');
+        await host.setDataDir(dir);
+        return ok(res, { ok: true, restarting: true });
+      }
+      case 'autostart.get': {
+        if (needDesktop()) return true;
+        const r = await host.autostartGet();
+        return ok(res, { enabled: !!(r && r.enabled), exe: (r && r.exe) || null });
+      }
+      case 'autostart.set': {
+        if (needDesktop()) return true;
+        if (typeof params.enabled !== 'boolean') return fail(res, 400, '参数 enabled 必须是布尔值', 'EBADPARAM');
+        await host.autostartSet(params.enabled);
+        return ok(res, { enabled: params.enabled });
+      }
+      case 'openPath': {
+        if (needDesktop()) return true;
+        const target = String(params.target || '').trim();
+        let pathOrUrl = '';
+        if (target === 'data') pathOrUrl = util.dataRoot();
+        else if (target === 'logs') pathOrUrl = config.logsDir();
+        else if (target === 'config') pathOrUrl = config.CONFIG_FILE;
+        else if (target === 'exeDir') pathOrUrl = util.appRoot();
+        else if (target === 'exe') pathOrUrl = process.execPath;
+        else if (target === 'webAdmin') pathOrUrl = (typeof ctx.webAdminUrl === 'function' ? ctx.webAdminUrl() : ctx.adminUrl) || '';
+        else if (target === 'url') pathOrUrl = String(params.url || '').trim();
+        else return fail(res, 400, `未知的打开目标：${target}`, 'EBADTARGET');
+        if (!pathOrUrl) return fail(res, 400, '打开目标为空', 'EBADTARGET');
+        await host.openPath({ target, path: pathOrUrl });
+        return ok(res, { opened: true });
+      }
+      case 'app.restart': {
+        if (needDesktop()) return true;
+        await host.appRestart();
+        return ok(res, { restarting: true });
+      }
+      case 'app.quit': {
+        if (needDesktop()) return true;
+        await host.appQuit();
+        return ok(res, { quitting: true });
+      }
+      case 'window.show': {
+        if (needDesktop()) return true;
+        await host.windowShow();
+        return ok(res, { ok: true });
+      }
+      case 'window.hide': {
+        if (needDesktop()) return true;
+        await host.windowHide();
+        return ok(res, { ok: true });
+      }
+      case 'script.run': {
+        if (!ctx.desktop || !ctx.scripts) return fail(res, 400, '一键脚本仅桌面版可用', 'EDESKTOP');
+        const r = ctx.scripts.run(String(params.name || ''), { file: params.file });
+        return ok(res, r);
+      }
+      case 'script.cancel': {
+        if (!ctx.desktop || !ctx.scripts) return fail(res, 400, '一键脚本仅桌面版可用', 'EDESKTOP');
+        const canceled = ctx.scripts.cancel(String(params.taskId || ''));
+        return ok(res, { canceled });
+      }
+      case 'service.restartRegistry': {
+        if (!ctx.desktop) { needDesktop(); return true; }
+        if (typeof ctx.restartRegistry === 'function') await ctx.restartRegistry();
+        else await ctx.requestRestartRegistry();
+        // 桌面版协议里地址带结尾斜杠（DESIGN 第 6 节示例）
+        const regUrl = String(ctx.registryUrl || '');
+        return ok(res, { ok: true, url: regUrl && !regUrl.endsWith('/') ? `${regUrl}/` : regUrl });
+      }
+      case 'service.restartWebAdmin': {
+        if (!ctx.desktop) { needDesktop(); return true; }
+        const st = await ctx.rebindWebAdmin({ retries: 1 });
+        return ok(res, { enabled: !!st.enabled, url: st.url || null, listenError: st.listenError || '' });
+      }
+      default:
+        return fail(res, 400, `未知的桌面操作：${action || '（空）'}`, 'EBADACTION');
+      }
+    } catch (e) {
+      return actionFail(e);
+    }
   }
 
   return fail(res, 404, `未知的管理接口：${method} ${pathname}`, 'ENOTFOUND');

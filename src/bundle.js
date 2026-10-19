@@ -5,7 +5,7 @@ const fsp = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const {
-  ensureDir, readJson, rootPath, stamp, safePkgDir, pkgBaseName, sha1hex, integrityOf, nowIso, compareVersions,
+  ensureDir, readJson, dataPath, stamp, safePkgDir, pkgBaseName, sha1hex, integrityOf, nowIso, compareVersions,
   isSafePkgName, isSafeVersion, mapLimit, clamp, createByteBudget,
 } = require('./util');
 const tar = require('./tar');
@@ -146,8 +146,8 @@ async function collectAddedVersionPins(store, { from, to, concurrency = 8, isCan
 }
 
 
-function bundleDir() { return rootPath('data', 'bundles'); }
-function tmpRoot() { return rootPath('data', 'tmp'); }
+function bundleDir() { return dataPath('bundles'); }
+function tmpRoot() { return dataPath('tmp'); }
 
 function safeFileName(s) {
   return String(s || '').replace(/[\\/:*?"<>|]+/g, '_').replace(/\s+/g, '-').slice(0, 80);

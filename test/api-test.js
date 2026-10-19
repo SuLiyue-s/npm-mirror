@@ -733,7 +733,7 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
     // 期望值要跟随 pid 文件：正常单实例时 pid.port === 本次端口（退出码 10）；
     // 若测试机同时跑着另一端口的实例（pid 文件记的是它），prestart 应报 11。
     let pidRec = null;
-    try { pidRec = JSON.parse(fs.readFileSync(path.join(ROOT, 'data', 'mirror.pid'), 'utf8')); } catch { pidRec = null; }
+    try { pidRec = JSON.parse(fs.readFileSync(path.join(util.dataRoot(), 'mirror.pid'), 'utf8')); } catch { pidRec = null; }
     const pidPort = pidRec ? Number(pidRec.port) || 0 : 0;
     const expectSame = pidPort && pidPort !== REG_PORT ? 11 : 10;
     const same = runCli(['prestart', '--port', String(REG_PORT), '--json', '--no-open']);
@@ -1075,10 +1075,10 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
     // 用「原始体」上传：这正是网页里拖入文件走的路径，服务端应流式落盘（几个 GB 也不进内存）
     const ex = await api('/__admin/api/bundles/export', { method: 'POST', body: { scope: 'private' }, timeoutMs: 180000 });
     rawUploadBundle = ((ex.json || {}).data || {}).file;
-    const src = path.join(__dirname, '..', 'data', 'bundles', rawUploadBundle);
+    const src = path.join(util.dataRoot(), 'bundles', rawUploadBundle);
     const buf = fs.readFileSync(src);
     // data\tmp 里可能本来就有其他临时文件，先快照，只判断本次上传有没有新增残留
-    const tmpDir = path.join(__dirname, '..', 'data', 'tmp');
+    const tmpDir = path.join(util.dataRoot(), 'tmp');
     const tmpBefore = new Set(fs.existsSync(tmpDir) ? fs.readdirSync(tmpDir) : []);
     const up = await rawReq(`/__admin/api/bundles/import?overwrite=1&token=${encodeURIComponent(TOKEN)}`, {
       method: 'POST', body: buf, timeoutMs: 180000,
@@ -1427,7 +1427,7 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
         }
 
         // C) 原始体上传 + ?progress=1：边收边落盘，收完立刻回 taskId（前端上传进度条 → 任务进度）
-        const tmpDir3 = path.join(__dirname, '..', 'data', 'tmp');
+        const tmpDir3 = path.join(util.dataRoot(), 'tmp');
         const tmpBefore3 = new Set(fs.existsSync(tmpDir3) ? fs.readdirSync(tmpDir3) : []);
         const upBuf = fs.readFileSync(path.join(bundleMod3.bundleDir(), madeBundles3[0]));
         const up = await api('/__admin/api/bundles/import?progress=1&overwrite=1', {
@@ -1864,7 +1864,7 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
       await stAdd.close();
     } finally {
       for (const f of exportedAdd) {
-        try { fs.unlinkSync(path.join(util.rootPath('data', 'bundles'), f)); } catch { /* 忽略 */ }
+        try { fs.unlinkSync(path.join(util.dataPath('bundles'), f)); } catch { /* 忽略 */ }
       }
       try { fs.rmSync(workAdd, { recursive: true, force: true }); } catch { /* 忽略 */ }
     }
@@ -1953,7 +1953,7 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
       await stBy.close();
     } finally {
       for (const f of exportedBy) {
-        try { fs.unlinkSync(path.join(util.rootPath('data', 'bundles'), f)); } catch { /* 忽略 */ }
+        try { fs.unlinkSync(path.join(util.dataPath('bundles'), f)); } catch { /* 忽略 */ }
       }
       try { fs.rmSync(workBy, { recursive: true, force: true }); } catch { /* 忽略 */ }
     }
@@ -2116,7 +2116,7 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
       await stImp.close();
     } finally {
       for (const f of exportedVer) {
-        try { fs.unlinkSync(path.join(util.rootPath('data', 'bundles'), f)); } catch { /* 忽略 */ }
+        try { fs.unlinkSync(path.join(util.dataPath('bundles'), f)); } catch { /* 忽略 */ }
       }
       try { fs.rmSync(workVer, { recursive: true, force: true }); } catch { /* 忽略 */ }
     }
@@ -2201,7 +2201,7 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
       await stV2.close();
     } finally {
       for (const f of exportedVer2) {
-        try { fs.unlinkSync(path.join(util.rootPath('data', 'bundles'), f)); } catch { /* 忽略 */ }
+        try { fs.unlinkSync(path.join(util.dataPath('bundles'), f)); } catch { /* 忽略 */ }
       }
       try { fs.rmSync(workVer2, { recursive: true, force: true }); } catch { /* 忽略 */ }
     }
@@ -2764,7 +2764,7 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
         `abort=${ab.status} complete=${abComp.status} ${abComp.text.slice(0, 120)}`);
 
       // 上传结束后 data\tmp 不留分片目录/合并临时文件
-      const tmpDirNew = path.join(__dirname, '..', 'data', 'tmp');
+      const tmpDirNew = path.join(util.dataRoot(), 'tmp');
       const leftNew = fs.existsSync(tmpDirNew) ? fs.readdirSync(tmpDirNew).filter((n) => /selftest-chunk|^upload-/.test(n)) : [];
       check('分片上传结束后 data\\tmp 无残留分片/合并文件', leftNew.length === 0, `left=${leftNew.join(',')}`);
 
@@ -2840,7 +2840,7 @@ function rawReq(pathname, { method = 'GET', headers = {}, body, timeoutMs = 1500
   // ---------------------------------------------------------------- 过期上传目录清理
   section('六之六之二、进程重启后遗留的分片上传目录会被清理（审计修复）');
   {
-    const tmpRoot = path.join(__dirname, '..', 'data', 'tmp');
+    const tmpRoot = path.join(util.dataRoot(), 'tmp');
     const staleDir = path.join(tmpRoot, 'upload-stale-' + Date.now());
     let made = false;
     try {
