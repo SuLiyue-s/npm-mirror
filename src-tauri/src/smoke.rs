@@ -242,6 +242,8 @@ fn build_report(app: &AppHandle, elapsed: Duration) -> Value {
     "restricted": state.restricted(),
     // 托盘不可用也会被视为受限（即使 MIRROR_DESKTOP_HOME 可写，例如沙箱/受限 token）
     "homeFallback": state.home_fallback,
+    // 完整性标签自检：token 完整性级别 / 文件完整性级别 / 是否提权 / 是否弹过修复提示
+    "integrity": state.integrity.to_json(),
     "webview2Version": winutil::webview2_version(),
     "logPath": state.log_path.as_ref().map(|path| path.to_string_lossy().to_string()),
     "uptimeSecs": elapsed.as_secs_f64(),

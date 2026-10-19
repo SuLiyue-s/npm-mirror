@@ -382,6 +382,8 @@ fn dispatch(app: &AppHandle, method: &str, params: &Value) -> Result<Value, Brid
         "labels": tray::labels_snapshot(),
       },
       "webview2Version": winutil::webview2_version(),
+      // 完整性标签自检：token/file 级别、是否提权、修复提示状态（排错用）
+      "integrity": state.integrity.to_json(),
       "logPath": state.log_path.as_ref().map(|path| path.to_string_lossy().to_string()),
       "autostart": autostart::is_enabled(),
     })),

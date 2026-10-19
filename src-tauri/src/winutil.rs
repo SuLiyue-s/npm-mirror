@@ -11,8 +11,8 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
   EnumWindows, GetWindowTextLengthW, GetWindowThreadProcessId, MessageBoxW, SetForegroundWindow,
-  ShowWindow, MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MESSAGEBOX_STYLE, SW_RESTORE, SW_SHOW,
-  SW_SHOWNORMAL,
+  ShowWindow, IDYES, MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND, MB_YESNO,
+  MESSAGEBOX_STYLE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL,
 };
 
 /// 创建进程时隐藏控制台窗口的标志（CREATE_NO_WINDOW）
@@ -38,6 +38,25 @@ pub fn message_box(text: impl AsRef<str>, title: impl AsRef<str>, error: bool) {
       "消息框已返回：title={title_text:?} result={} owner={:?}",
       result.0, owner
     ));
+  }
+}
+
+/// 是/否询问框（用于低完整性标签修复提示）。返回 true=用户选择「是」。
+pub fn message_box_yes_no(text: impl AsRef<str>, title: impl AsRef<str>) -> bool {
+  let text = HSTRING::from(text.as_ref());
+  let title_text = title.as_ref().to_string();
+  let title = HSTRING::from(title_text.as_str());
+  let style = MESSAGEBOX_STYLE(MB_YESNO.0 | MB_ICONWARNING.0 | MB_SETFOREGROUND.0);
+  unsafe {
+    let owner = current_process_main_window();
+    let result = MessageBoxW(owner, &text, &title, style);
+    crate::logging::info(format!(
+      "询问框已返回：title={title_text:?} result={} yes={} owner={:?}",
+      result.0,
+      result == IDYES,
+      owner
+    ));
+    result == IDYES
   }
 }
 

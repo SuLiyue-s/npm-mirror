@@ -36,6 +36,32 @@
 - `test/run-all.js` 一键自检（约 40~60 秒，`--destructive` 含破坏性用例），已移除 `--full` 完整回归参数；与 6 个 `test/ui-e2e-*.js` 默认地址改为管理界面端口并分别探测两个监听
 - 破坏性用例（重启镜像源服务 / 重启管理界面 / 清空日志）默认跳过，加 `--destructive` 才执行
 
+## [0.0.5] - 2026-10-19
+
+**桌面版低完整性标签检测与一键修复版（发布到 GitHub Releases）**：用户反馈「双击 exe 后没有窗口/托盘、启动异常」的根因是 exe 文件继承了 Windows「低完整性（Low）」标签，被系统强制降级运行。v0.0.5 在 Rust 外壳启动流程中自动检测该标签，检测到即弹框提示并支持一键修复（UAC 提权 `icacls /setintegritylevel Medium` 重置后自动重启程序），同时新增手动修复与诊断脚本。
+
+> 本版本**发布到 GitHub Releases**：[v0.0.5 发布页](https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.5)（附件 `npm-mirror-desktop-0.0.5.exe` 与 `SHA256SUMS.txt`）。
+
+### 新增
+
+- **低完整性（Low）标签自动检测**：启动时检测 exe 文件完整性标签与当前进程令牌完整性（检测结果同时写入测试报告 `integrity` 对象：`token` / `tokenRid` / `file` / `elevated` / `repairPrompted` / `repairLaunched` / `exePath`），并在桌面日志记录；非测试模式下检测到 Low 标签会弹出可操作说明框，而不是让程序静默降级运行。
+- **一键修复**：说明框选「是」→ 请求一次 UAC 提权 → 自动执行 `icacls "<exe 完整路径>" /setintegritylevel Medium` 把 exe 标签重置为 Medium → **自动重启程序**；选「否」则继续受限运行（窗口内警示条、无托盘、关闭窗口=退出程序）。新增命令 `--repair-integrity`（检查并修复完整性标签后退出）与 `--skip-integrity-prompt`（跳过启动时的低完整性询问框，供自动化 / 明确接受受限运行的用户使用）。
+- `启动桌面版.cmd` 启动前自动检查 exe 低完整性标签，带标签时请求一次 UAC 修复后再启动（支持 `MIRROR_LAUNCH_DRYRUN=1` 只打印将执行的命令）；`修复-桌面版启动限制.cmd` 提供检查 / 一键修复（`check` 退出码 0=正常、2=带 Low 标签；`repair` 内部提权后实际修复）；`诊断-桌面环境.cmd` / `tools\diagnose-desktop.ps1` 输出只读诊断（进程与文件完整性、权限、WebView2、托盘能力）到 `tmp\desktop-diagnose.txt`。
+
+### 变更
+
+- `tools\build-desktop.ps1` 构建完成后用 `icacls` 检查产物完整性标签：产物带 `Low Mandatory` 时打印黄色提示（继承 Low 标签、修复方式、每次重新编译都需重新修复），避免误判为构建失败。
+- 托盘 / 窗口 / 关闭行为不变（4/6 项菜单、托盘不可用时关窗即退），仅在其之前增加完整性标签检查与修复引导。
+
+### 文档
+
+- README / 使用说明：新增「低完整性（Low）标签」原理说明与「启动必读」、新增使用说明 13.15「低完整性标签自动检测与一键修复」、常见问题补充「双击 exe 后弹框提示低完整性」条目；构建章节补充 Low 标签提示与修复脚本；版本与下载链接更新为 0.0.5（历史 v0.0.3 / v0.0.4 为本地构建未发布）。
+
+### 测试
+
+- `test/desktop-e2e.ps1` 适配 0.0.5：只读断言测试报告 `integrity` 对象字段齐全、`integrity.file` 与 `icacls` 读到的 dist exe 标签一致、smoke 模式检测到 Low 不弹框、`--help` 含 `--repair-integrity` 与 `--skip-integrity-prompt`、非 smoke 启动加 `--skip-integrity-prompt` 不被询问框阻塞；**不执行真实 UAC / 提权/修复**（真实一键修复留人工验收项 M29）。
+- **v0.0.5 实测（2026-10-19 18:07:49 对 `dist\npm-mirror-desktop-0.0.5.exe`，96,829,440 B，SHA256 `727b994ad2ff81a482114b13cfb3e035c0f92a2b7cf610635f9f54e0deff644d`）：194 项 = 183 通过 / 5 失败（全窗口类环境限制）/ 6 跳过，退出码 3，非窗口类失败 0**；`--help` 三参数（阶段 0b 4/4）、只读 `--repair-integrity` 未提权退出码 3 + 「管理员权限」原因且不改产物（阶段 0c 6/6）、非 smoke + `--skip-integrity-prompt` 不被询问框阻塞（阶段 0d 6/6）、`integrity` 对象与 `icacls` 交叉一致=Low、smoke 不弹框（`promptSuppressed=true`）全部通过；图标一致性、托盘 4/6 项、配置目录回退 10/10、数据目录自动发现 9/9 无回归。历史 v0.0.4：166 项 = 155/5/6，exit 3；0.0.3：153/143/5/5；0.0.2：143/133/5/5。
+
 ## [0.0.4] - 2026-10-19
 
 **桌面版托盘可见性修复版（本地构建，未发布到 GitHub Releases）**：修复托盘图标完全不显示的问题——托盘改为程序自绘 Win32 注册并检测注册结果，注册失败时重试、在窗口内给出可见提示并让「关闭窗口」直接退出程序；同时把 exe / 窗口 / 托盘图标统一换成网页版图标 `public/favicon.ico`。
@@ -199,6 +225,7 @@
 - `test/ui-e2e-*.js`：浏览器端端到端脚本（需要本机 Chrome 调试端口，可选）
 - 破坏性用例（重启服务、清空日志）默认跳过，加 `--destructive` 才执行
 
+[0.0.5]: https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.5
 [0.0.2]: https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.2
 [0.0.1]: https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.1
 [1.0.0]: https://github.com/SuLiyue-s/npm-mirror/releases/tag/v1.0.0

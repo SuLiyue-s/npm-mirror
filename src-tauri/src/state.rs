@@ -9,6 +9,7 @@ use std::time::Instant;
 
 use serde_json::Value;
 
+use crate::integrity::IntegrityStatus;
 use crate::paths::DesktopPrefs;
 
 /// 加锁辅助：互斥体中毒时取回内部数据，避免一次 panic 让整个桌面壳不可用。
@@ -22,6 +23,10 @@ pub struct StartupArgs {
   pub data_dir: Option<PathBuf>,
   /// --autostart 开机自启启动：窗口默认隐藏
   pub autostart: bool,
+  /// --repair-integrity：提权修复实例入口（移除 exe 的低完整性标签后重启）
+  pub repair_integrity: bool,
+  /// --skip-integrity-prompt：测试/自动化用，跳过低完整性标签修复询问框
+  pub skip_integrity_prompt: bool,
   /// 冒烟测试：状态报告输出文件（测试专用，正式环境为空）
   pub smoke_report: Option<PathBuf>,
   /// 冒烟测试：命令文件，每行一个命令（show/hide/quit/restart-registry...）
@@ -111,6 +116,8 @@ pub struct AppState {
   pub prefs: Mutex<DesktopPrefs>,
   /// 桌面日志路径
   pub log_path: Option<PathBuf>,
+  /// 启动时的完整性标签检测结果（低完整性/提权/修复提示状态）
+  pub integrity: IntegrityStatus,
   pub started_at: Instant,
 }
 
@@ -126,6 +133,7 @@ impl AppState {
     app_root: PathBuf,
     args: StartupArgs,
     log_path: Option<PathBuf>,
+    integrity: IntegrityStatus,
   ) -> Self {
     Self {
       home_dir,
@@ -155,6 +163,7 @@ impl AppState {
       smoke_commands: Mutex::new(Vec::new()),
       prefs: Mutex::new(DesktopPrefs::default()),
       log_path,
+      integrity,
       started_at: Instant::now(),
     }
   }

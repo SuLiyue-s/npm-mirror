@@ -9,6 +9,7 @@ mod bridge;
 mod config_watch;
 mod dialog;
 mod embed;
+mod integrity;
 mod logging;
 mod node_proc;
 mod paths;
@@ -84,9 +85,23 @@ fn take_startup_failure() -> Option<StartupError> {
 
 fn main() {
   let args = parse_args();
+  // --repair-integrity：提权修复实例入口（由主程序通过 UAC 启动）。
+  // 用管理员令牌执行 icacls /setintegritylevel Medium 去掉 exe 的 Low 标签，然后以普通权限重启程序。
+  if args.repair_integrity {
+    let code = integrity::run_repair_mode(&args);
+    std::process::exit(code);
+  }
   let smoke_mode = smoke::enabled();
+  // 启动自检：程序文件是否带低完整性（Low）标签（从受限环境（浏览器下载/聊天窗口/沙盒）启动常见）。
+  // 检测到且可交互时弹「是/否」询问框，选择「是」会以 UAC 提权启动 --repair-integrity 修复实例后退出本进程。
+  let integrity_status = integrity::startup_check(&args, smoke_mode);
+  integrity::set_status(integrity_status.clone());
+  if integrity_status.repair_launched {
+    eprintln!("已启动提权修复实例（--repair-integrity），当前实例退出");
+    return;
+  }
   let error_report_path = args.smoke_report.clone();
-  let result = run(args);
+  let result = run(args, integrity_status);
   // setup 闭包里的失败信息优先（包含窗口/WebView2 失败细节）
   let setup_failure = take_startup_failure();
   if let Err(err) = result {
@@ -181,7 +196,10 @@ fn handle_startup_failure(app: &AppHandle, error: &StartupError) {
   std::process::exit(1);
 }
 
-fn run(args: state::StartupArgs) -> Result<(), StartupError> {
+fn run(
+  args: state::StartupArgs,
+  integrity_status: integrity::IntegrityStatus,
+) -> Result<(), StartupError> {
   // 单实例：已有实例在运行时，尝试唤醒它的窗口后退出
   if let single_instance::InstanceCheck::AlreadyRunning = single_instance::acquire() {
     let activated = single_instance::activate_existing();
@@ -217,6 +235,41 @@ fn run(args: state::StartupArgs) -> Result<(), StartupError> {
   ));
   for warning in &home_resolution.warnings {
     logging::warn(warning);
+  }
+  // 完整性标签自检结果（WebView2/托盘/脚本执行等异常的首要排查项）
+  logging::info(format!(
+    "完整性标签检测：{}",
+    integrity_status.summary()
+  ));
+  logging::info(format!(
+    "完整性标签详情：{}",
+    serde_json::to_string(&integrity_status.to_json()).unwrap_or_else(|_| "{}".to_string())
+  ));
+  if integrity_status.low_detected {
+    logging::warn(
+      "程序文件带低完整性（Low）标签：从受限环境启动时 WebView2/托盘/界面可能异常。可右键以管理员身份运行「修复-桌面版启动限制.cmd」修复。",
+    );
+  }
+  if integrity_status.prompt_suppressed {
+    let reason = if args.autostart {
+      "开机自启模式"
+    } else if smoke::enabled() {
+      "smoke 测试模式"
+    } else if args.skip_integrity_prompt {
+      "--skip-integrity-prompt"
+    } else {
+      "当前环境不可交互"
+    };
+    logging::info(format!("低完整性标签修复询问框已跳过（原因：{reason}）"));
+  }
+  if let Some(result) = &integrity_status.repair_result {
+    logging::info(format!("完整性标签修复结果：{result}"));
+  }
+  if let Some(error) = &integrity_status.repair_error {
+    logging::warn(format!("完整性标签修复失败：{error}"));
+  }
+  if integrity_status.repair_launched {
+    logging::info("已通过 UAC 启动提权修复实例（--repair-integrity）");
   }
   if home_resolution.fallback {
     logging::warn(format!(
@@ -265,6 +318,7 @@ fn run(args: state::StartupArgs) -> Result<(), StartupError> {
     "dataDirSource": resolution.source.as_str(),
     "dataDirDefault": data_dir_default.display().to_string(),
     "webview2Version": webview2_version,
+    "integrity": integrity_status.to_json(),
     "exePath": paths::exe_path().display().to_string(),
     "exeDir": paths::exe_dir().display().to_string(),
     "logPath": logging::log_path().map(|path| path.display().to_string()),
@@ -284,6 +338,7 @@ fn run(args: state::StartupArgs) -> Result<(), StartupError> {
     app_root,
     args,
     log_path,
+    integrity_status,
   );
   *state::lock(&app_state.prefs) = paths::read_desktop_prefs(&home);
 
@@ -485,6 +540,10 @@ fn build_failure_report(
         serde_json::json!(state.restricted()),
       );
       object.insert(
+        "integrity".to_string(),
+        state.integrity.to_json(),
+      );
+      object.insert(
         "tray".to_string(),
         serde_json::json!({
           "created": state.tray_created(),
@@ -530,6 +589,8 @@ fn parse_args() -> state::StartupArgs {
       "--smoke-report" => args.smoke_report = next_path("--smoke-report"),
       "--smoke-cmd" => args.smoke_cmd = next_path("--smoke-cmd"),
       "--autostart" => args.autostart = true,
+      "--repair-integrity" => args.repair_integrity = true,
+      "--skip-integrity-prompt" => args.skip_integrity_prompt = true,
       "-h" | "--help" => {
         print_help();
         std::process::exit(0);
@@ -549,4 +610,8 @@ fn print_help() {
   println!("  --data-dir <目录>     指定主数据目录（绝对路径）");
   println!("  --autostart           开机自启启动：不自动显示主窗口");
   println!("  -h, --help            显示本帮助");
+  println!();
+  println!("排错参数：");
+  println!("  --repair-integrity    提权修复实例：移除程序文件的低完整性（Low）标签后自动重启（由程序内提示调用，勿手动使用）");
+  println!("  --skip-integrity-prompt  跳过低完整性标签修复询问框（自动化测试用）");
 }

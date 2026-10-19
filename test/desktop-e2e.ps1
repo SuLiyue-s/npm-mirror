@@ -8,6 +8,14 @@
   可以自动化的部分：
 
     · 产物：exe 存在、大小、版本信息、SHA256SUMS.txt 校验、dist 已被 .gitignore 忽略
+    · 阶段 0b（v0.0.5）：exe --help 可执行（退出码 0），输出含 --repair-integrity /
+      --skip-integrity-prompt / --data-dir
+    · 阶段 0c（v0.0.5）：--repair-integrity 修复入口的**只读**验证——把 exe 复制到临时
+      目录后以 smoke 模式执行（不弹框），未提权时应退出码 3 并给出「管理员权限」原因、
+      不改动副本；已提权时执行修复并退出码 0。**不请求真实 UAC、不改 dist 产物**
+    · 阶段 0d（v0.0.5）：非 smoke 启动 + --skip-integrity-prompt 时不被低完整性询问框
+      阻塞——进程应走到「窗口失败说明框」或自行退出（本脚本用 WM_CLOSE 关掉说明框，
+      不点「是」、不触发真实 UAC），最终退出码 1，失败报告 integrity.promptSuppressed=true
     · 图标（v0.0.4）：exe/窗口/托盘统一使用网页版图标——src-tauri\icons\icon.ico 与
       public\favicon.ico SHA256 相同；window-256.rgba=262144 B、tray-32.rgba=4096 B
     · 阶段 1（默认配置，admin.enabled=false）
@@ -18,6 +26,11 @@
           重启镜像源服务 / 退出程序），没有「打开管理界面」「重启管理界面」
         - 托盘可用性（v0.0.4）：报告含 tray.available（布尔）；注册失败时 tray.error
           含「拒绝访问 / os error 5」；restricted = home_fallback || !tray_available
+        - 完整性标签（v0.0.5）：报告 integrity 对象字段齐全（token/tokenRid/tokenSid/
+          file/lowDetected/elevated/repairPrompted/repairLaunched/promptSuppressed/
+          repairResult/repairError/error/exePath）；integrity.file 与 icacls 读到的
+          dist exe 标签一致；smoke 模式不弹框（repairPrompted/repairLaunched=false，
+          Low 时 promptSuppressed=true）；exe 为 Low 时进程令牌完整性也应为 Low
         - 关闭窗口行为（v0.0.4，阶段 1c-3，用 window:close 模拟 CloseRequested）：
           托盘可用 → 窗口隐藏、进程与服务继续；托盘不可用 → 程序直接退出
           （退出码 0、双端口释放、无 Node 残留；沙箱预期走此分支）
@@ -61,8 +74,8 @@
   因此只断言菜单动作被执行（命令回执）并记 SKIP 说明。
 
   不能自动化的部分（托盘左键单击的鼠标事件、窗口视觉风格、原生目录选择器对话框、
-  控制台页按钮交互、工具页 import/cache 小样本等）在 tmp\audit-desktop.md 里标注为
-  人工确认或代码审查证据。
+  控制台页按钮交互、工具页 import/cache 小样本、**真实低完整性标签一键修复（UAC 交互，
+  脚本只做只读验证）**等）在 tmp\audit-desktop.md 里标注为人工确认或代码审查证据。
 
   安全纪律：
     · 只使用临时数据目录（默认 tmp\e2e-data）和测试端口（默认 14873/14874）；
@@ -1057,6 +1070,174 @@ if ((Test-Path $winRgbaPath) -and (Test-Path $trayRgbaPath)) {
 }
 
 # ---------------------------------------------------------------------------
+# 阶段 0b：v0.0.5 命令行选项（完整性标签检测 / 一键修复）
+# 说明：exe 是 Windows GUI 子系统程序，从控制台直接执行时默认拿不到 stdout；
+# 这里用 ProcessStartInfo 重定向标准输出/错误（管道句柄对 GUI 程序同样有效）读取 --help。
+# ---------------------------------------------------------------------------
+Section '阶段 0b：命令行选项（--help 含完整性相关参数，v0.0.5）'
+$helpText = ''
+$helpExit = $null
+try {
+  $psiHelp = New-Object System.Diagnostics.ProcessStartInfo
+  $psiHelp.FileName = $script:ExePath
+  $psiHelp.Arguments = '--help'
+  $psiHelp.UseShellExecute = $false
+  $psiHelp.RedirectStandardOutput = $true
+  $psiHelp.RedirectStandardError = $true
+  $psiHelp.CreateNoWindow = $true
+  $psiHelp.WorkingDirectory = (Split-Path -Parent $script:ExePath)
+  $helpProc = [System.Diagnostics.Process]::Start($psiHelp)
+  $helpStdout = $helpProc.StandardOutput.ReadToEnd()
+  $helpStderr = $helpProc.StandardError.ReadToEnd()
+  if (-not $helpProc.WaitForExit(15000)) {
+    try { $helpProc.Kill() } catch { }
+    throw '--help 超时未退出（15s）'
+  }
+  $helpExit = $helpProc.ExitCode
+  $helpText = $helpStdout + $helpStderr
+} catch {
+  $helpText = '读取 --help 失败：' + $_.Exception.Message
+}
+$helpOneLine = ($helpText -replace '\r?\n', ' ')
+Assert-True 'exe --help 可执行且退出码为 0' ($helpExit -eq 0) ('实际退出码：' + $helpExit + '；输出：' + $helpOneLine)
+Assert-True '--help 输出包含 --repair-integrity（v0.0.5 一键修复入口）' ($helpText -match '--repair-integrity') ('实际输出：' + $helpOneLine)
+Assert-True '--help 输出包含 --skip-integrity-prompt（v0.0.5 跳过启动询问框）' ($helpText -match '--skip-integrity-prompt') ('实际输出：' + $helpOneLine)
+Assert-True '--help 输出包含 --data-dir（回归：原有启动参数不丢失）' ($helpText -match '--data-dir') ('实际输出：' + $helpOneLine)
+
+# ---------------------------------------------------------------------------
+# 阶段 0c：v0.0.5 --repair-integrity 修复入口（只读验证，不请求 UAC、不改 dist 产物）
+# 复制 exe 到临时目录后调用，即使当前会话意外具备管理员权限，也只会改到副本。
+# smoke 模式下修复入口不弹框：未提权 => 退出码 3 + repairError；已提权 => 执行修复 + 退出码 0。
+# ---------------------------------------------------------------------------
+Section '阶段 0c：--repair-integrity 修复入口（安全只读验证，不请求 UAC）'
+$repairDir = Join-Path $script:Root 'tmp\e2e-repair'
+$repairExe = Join-Path $repairDir 'repair-copy.exe'
+$repairReport = Join-Path $repairDir 'repair-report.json'
+try {
+  if (Test-Path $repairDir) { Remove-Item $repairDir -Recurse -Force -ErrorAction SilentlyContinue }
+  New-Item -ItemType Directory -Path $repairDir -Force | Out-Null
+  Copy-Item -Path $script:ExePath -Destination $repairExe -Force
+  $repairExit = $null
+  $oldSmoke = $env:MIRROR_DESKTOP_SMOKE
+  $env:MIRROR_DESKTOP_SMOKE = '1'
+  try {
+    $psiRepair = New-Object System.Diagnostics.ProcessStartInfo
+    $psiRepair.FileName = $repairExe
+    $psiRepair.Arguments = '--repair-integrity --smoke-report "' + $repairReport + '"'
+    $psiRepair.UseShellExecute = $false
+    $psiRepair.CreateNoWindow = $true
+    $psiRepair.WorkingDirectory = $repairDir
+    $repairProc = [System.Diagnostics.Process]::Start($psiRepair)
+    if (-not $repairProc.WaitForExit(60000)) {
+      try { $repairProc.Kill() } catch { }
+      throw '--repair-integrity 超时未退出（60s）'
+    }
+    $repairExit = $repairProc.ExitCode
+  } finally {
+    if ($null -eq $oldSmoke) { Remove-Item Env:MIRROR_DESKTOP_SMOKE -ErrorAction SilentlyContinue } else { $env:MIRROR_DESKTOP_SMOKE = $oldSmoke }
+  }
+  $repairRep = $null
+  if (Test-Path $repairReport) {
+    try { $repairRep = Get-Content $repairReport -Raw -Encoding UTF8 | ConvertFrom-Json } catch { }
+  }
+  Assert-True '--repair-integrity 在 smoke 模式可执行并退出（未请求 UAC 交互）' (($repairExit -eq 0) -or ($repairExit -eq 3)) ('实际退出码：' + $repairExit + '（0=已提权并修复，3=未提权，均为预期）')
+  if ($null -ne $repairRep) {
+    Assert-True '修复入口报告标记 repairMode=true' ((Get-Prop $repairRep 'repairMode') -eq $true)
+    $repairInteg = Get-Prop $repairRep 'integrity'
+    Assert-True '修复入口报告包含 integrity 对象' ($null -ne $repairInteg)
+    if ($null -ne $repairInteg) {
+      $repairErrText = [string](Get-Prop $repairInteg 'repairError')
+      $repairResultText = [string](Get-Prop $repairInteg 'repairResult')
+      $repairElevated = Get-Prop $repairInteg 'elevated'
+      if ($repairExit -eq 3) {
+        Assert-True '未提权时修复入口报告给出原因（含「管理员权限」）' ($repairErrText -match '管理员|权限|elevat') ('实际：' + $repairErrText)
+        Assert-True '未提权时修复入口未修改 exe（repairResult 为空）' ($repairResultText.Length -eq 0) ('实际：' + $repairResultText)
+      } elseif ($repairExit -eq 0) {
+        Assert-True '已提权时修复入口报告修复结果（repairResult 非空）' ($repairResultText.Length -gt 0) ('实际：' + $repairResultText)
+      }
+      Assert-True '修复入口报告 elevated 与退出码语义一致' ((($repairElevated -eq $true) -and ($repairExit -eq 0)) -or (($repairElevated -ne $true) -and ($repairExit -eq 3))) ('elevated=' + $repairElevated + '，exitCode=' + $repairExit)
+    }
+  } else {
+    Assert-True '修复入口报告已生成（--smoke-report）' $false ('未找到 ' + $repairReport)
+  }
+} finally {
+  Remove-Item $repairDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# ---------------------------------------------------------------------------
+# 阶段 0d：v0.0.5 非 smoke 启动 + --skip-integrity-prompt（不被完整性询问框阻塞）
+# ---------------------------------------------------------------------------
+# 沙箱里非 smoke 启动会走「窗口失败 → 弹说明框 → 退出码 1」路径；带 --skip-integrity-prompt
+# 时应直接到窗口失败说明框（不会先被低完整性询问框卡住）。本脚本不点「是」（不触发真实 UAC），
+# 只用 WM_CLOSE 关掉窗口失败说明框，断言进程最终退出码为 1。
+Section '阶段 0d：非 smoke 启动 --skip-integrity-prompt（不被完整性询问框阻塞，v0.0.5）'
+$nonSmokeDir = Join-Path $script:Root 'tmp\e2e-nonsmoke'
+$nonSmokeReport = Join-Path $nonSmokeDir 'failure-report.json'
+$p0d = $null
+try {
+  if (Test-Path $nonSmokeDir) { Remove-Item $nonSmokeDir -Recurse -Force -ErrorAction SilentlyContinue }
+  New-Item -ItemType Directory -Path $nonSmokeDir -Force | Out-Null
+  $oldSmoke0d = $env:MIRROR_DESKTOP_SMOKE
+  $oldHome0d = $env:MIRROR_DESKTOP_HOME
+  try {
+    Remove-Item Env:MIRROR_DESKTOP_SMOKE -ErrorAction SilentlyContinue
+    $env:MIRROR_DESKTOP_HOME = $script:DesktopHome
+    $psi0d = New-Object System.Diagnostics.ProcessStartInfo
+    $psi0d.FileName = $script:ExePath
+    $psi0d.Arguments = '--skip-integrity-prompt --data-dir "' + $nonSmokeDir + '" --smoke-report "' + $nonSmokeReport + '"'
+    $psi0d.UseShellExecute = $false
+    $psi0d.WorkingDirectory = Split-Path -Parent $script:ExePath
+    $p0d = [System.Diagnostics.Process]::Start($psi0d)
+  } finally {
+    if ($null -eq $oldSmoke0d) { Remove-Item Env:MIRROR_DESKTOP_SMOKE -ErrorAction SilentlyContinue } else { $env:MIRROR_DESKTOP_SMOKE = $oldSmoke0d }
+    if ($null -eq $oldHome0d) { Remove-Item Env:MIRROR_DESKTOP_HOME -ErrorAction SilentlyContinue } else { $env:MIRROR_DESKTOP_HOME = $oldHome0d }
+  }
+  # 等待出现「窗口失败说明框」（非 smoke 模式）或进程自行退出（真实桌面会话窗口正常时可能不弹框）。
+  $dialogHwnd0d = $null
+  $sw0d = [System.Diagnostics.Stopwatch]::StartNew()
+  while ($sw0d.Elapsed.TotalSeconds -lt 45) {
+    Start-Sleep -Milliseconds 300
+    if ($p0d.HasExited) { break }
+    $wins0d = @(Get-AppWindows -RootPid $p0d.Id)
+    if ($wins0d.Count -gt 0) { $dialogHwnd0d = $wins0d[0]; break }
+  }
+  $sw0d.Stop()
+  $reachedDialog0d = ($null -ne $dialogHwnd0d) -or $p0d.HasExited
+  Assert-True '非 smoke + --skip-integrity-prompt：未被低完整性询问框阻塞（出现窗口失败说明框或已自行退出）' $reachedDialog0d ('45 秒内既未出现说明框也未退出；进程可能被询问框阻塞')
+  if ($null -eq $dialogHwnd0d) {
+    Assert-Skip '关闭窗口失败说明框' ('未检测到说明框窗口（真实桌面会话窗口可能正常；或进程已自行退出）')
+  } else {
+    [DesktopE2E.Win32]::CloseWindow($dialogHwnd0d)
+    Assert-True '已关闭窗口失败说明框（模拟用户点关闭）' $true
+  }
+  $exited0d = $p0d.WaitForExit(60000)
+  if (-not $exited0d) {
+    try { $p0d.Kill() } catch { }
+  }
+  Assert-True '非 smoke 失败路径最终退出（未因对话框残留挂起）' $exited0d
+  if ($exited0d) {
+    Assert-True '非 smoke 受限启动退出码为 1（窗口/WebView2 环境受限）' ($p0d.ExitCode -eq 1) ('实际退出码：' + $p0d.ExitCode)
+  }
+  # 失败报告（若写出）应包含 integrity 且 promptSuppressed=true、未弹修复询问框/未启动 UAC 修复实例
+  if (Test-Path $nonSmokeReport) {
+    $nsRep = $null
+    try { $nsRep = Get-Content $nonSmokeReport -Raw -Encoding UTF8 | ConvertFrom-Json } catch { }
+    $nsInteg = Get-Prop $nsRep 'integrity'
+    if ($null -ne $nsInteg) {
+      Assert-True '非 smoke 失败报告 integrity.promptSuppressed=true（--skip-integrity-prompt 生效）' ((Get-Prop $nsInteg 'promptSuppressed') -eq $true) ('实际：' + (Get-Prop $nsInteg 'promptSuppressed'))
+      Assert-True '非 smoke 失败报告未启动 UAC 修复实例（repairLaunched=false）' ((Get-Prop $nsInteg 'repairLaunched') -ne $true) ('实际：' + (Get-Prop $nsInteg 'repairLaunched'))
+    } else {
+      Assert-Skip '非 smoke 失败报告的 integrity 字段' '失败报告未包含 integrity 对象'
+    }
+  } else {
+    Assert-Skip '非 smoke 失败报告文件' ('未生成失败报告：' + $nonSmokeReport)
+  }
+} finally {
+  if ($null -ne $p0d -and -not $p0d.HasExited) { try { $p0d.Kill() } catch { } }
+  Remove-Item $nonSmokeDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# ---------------------------------------------------------------------------
 # 阶段 1：默认配置（admin.enabled=false）
 # ---------------------------------------------------------------------------
 Section '阶段 1：首次启动（默认 admin.enabled=false，关闭窗口=隐藏）'
@@ -1120,6 +1301,64 @@ if ($rep1Ready) {
   $restr1 = Get-Prop $rep1 'restricted'
   $expectRestr1 = ($homeFallback1 -or ($trayAvail1 -ne $true))
   Assert-True '受限标记 restricted 与「home 回退 / 托盘不可用」一致（本会话预期 true）' ($restr1 -eq $expectRestr1) ('tray.available=' + $trayAvail1 + '，home.fallback=' + $homeFallback1 + '，restricted=' + $restr1)
+
+  # v0.0.5：完整性标签自检（低完整性 Low 标签自动检测）。
+  # smoke 报告 integrity 对象字段：token/tokenRid/tokenSid/file/fileRaw/lowDetected/elevated/
+  # repairPrompted/repairLaunched/promptSuppressed/repairResult/repairError/error/exePath。
+  # 与 icacls 读到的 dist exe 标签交叉核对；本段只读，不执行任何 UAC / 提权 / 修复动作。
+  $integ1 = Get-Prop $rep1 'integrity'
+  Assert-True '报告包含完整性自检对象 integrity（v0.0.5）' ($null -ne $integ1)
+  if ($null -ne $integ1) {
+    $integExe1 = [string](Get-Prop $integ1 'exePath')
+    Assert-True 'integrity.exePath 指向被测 exe' ((Normalize-Path $integExe1) -eq (Normalize-Path $script:ExePath)) ('实际：' + $integExe1 + '；期望：' + $script:ExePath)
+    $integFile1 = [string](Get-Prop $integ1 'file')
+    Assert-True 'integrity.file 为已知完整性级别（Low/Medium/High/System/Unknown）' ($integFile1 -match '^(Low|Medium|High|System|Unknown)$') ('实际：' + $integFile1)
+    $integToken1 = [string](Get-Prop $integ1 'token')
+    Assert-True 'integrity.token 非空（当前进程令牌完整性）' ($integToken1.Length -gt 0) ('实际：' + $integToken1)
+    $integTokenRidProp = $integ1.PSObject.Properties['tokenRid']
+    Assert-True 'integrity 对象包含 tokenRid 字段（未知时为 null）' ($null -ne $integTokenRidProp)
+    $integElevProp = $integ1.PSObject.Properties['elevated']
+    Assert-True 'integrity.elevated 为布尔值' (($null -ne $integElevProp) -and ($integElevProp.Value -is [bool])) ('实际：' + (Get-Prop $integ1 'elevated'))
+    $integPrompted1 = Get-Prop $integ1 'repairPrompted'
+    Assert-True 'smoke 模式不弹出低完整性修复询问框（repairPrompted=false）' ($integPrompted1 -eq $false) ('实际：' + $integPrompted1)
+    $integLaunched1 = Get-Prop $integ1 'repairLaunched'
+    Assert-True 'smoke 模式不启动 UAC 修复实例（repairLaunched=false）' ($integLaunched1 -eq $false) ('实际：' + $integLaunched1)
+    $integLow1 = Get-Prop $integ1 'lowDetected'
+    Assert-True 'integrity.lowDetected 与 integrity.file 判定一致' ($integLow1 -eq ($integFile1 -eq 'Low')) ('file=' + $integFile1 + '，lowDetected=' + $integLow1)
+    $integErr1 = [string](Get-Prop $integ1 'error')
+    if ($integFile1 -eq 'Unknown') {
+      Assert-True 'integrity.file 为 Unknown 时给出读取失败原因（integrity.error 非空）' ($integErr1.Length -gt 0) ('实际：' + $integErr1)
+    }
+    # 交叉核对：用 icacls 读取被测 exe 的完整性标签（中文/英文输出都兼容）
+    $icaclsLabel1 = ''
+    $icaclsRaw1 = ''
+    try {
+      $icaclsOut1 = @(& icacls $script:ExePath 2>&1)
+      $icaclsText1 = ($icaclsOut1 | Out-String)
+      $labelLine1 = @($icaclsOut1 | Where-Object { [string]$_ -match 'Mandatory Label|强制标签' }) | Select-Object -First 1
+      if ($labelLine1) {
+        $labelText1 = [string]$labelLine1
+        $icaclsRaw1 = $labelText1.Trim()
+        if ($labelText1 -match 'Low|低强制|低完整性') { $icaclsLabel1 = 'Low' }
+        elseif ($labelText1 -match 'Medium|中强制|中完整性|中等完整性') { $icaclsLabel1 = 'Medium' }
+        elseif ($labelText1 -match 'High|高强制|高完整性') { $icaclsLabel1 = 'High' }
+        elseif ($labelText1 -match 'System|系统强制') { $icaclsLabel1 = 'System' }
+      }
+      if (-not $icaclsLabel1) { $icaclsRaw1 = (($icaclsText1 -replace '\r?\n', ' ').Trim()) }
+    } catch {
+      $icaclsRaw1 = 'icacls 执行失败：' + $_.Exception.Message
+    }
+    if ($icaclsLabel1) {
+      Assert-True 'integrity.file 与 icacls 读取到的 exe 完整性标签一致' ($integFile1 -eq $icaclsLabel1) ('报告=' + $integFile1 + '，icacls=' + $icaclsLabel1 + '（原始：' + $icaclsRaw1 + '）')
+    } else {
+      Assert-Skip 'integrity.file 与 icacls 交叉核对' ('icacls 输出中未找到完整性标签行：' + $icaclsRaw1)
+    }
+    if ($integFile1 -eq 'Low') {
+      Assert-True 'exe 带 Low 标签时进程令牌完整性也为 Low（min(令牌, 文件) 规则）' ($integToken1 -eq 'Low') ('token=' + $integToken1 + '，file=' + $integFile1)
+      $integSuppressed1 = Get-Prop $integ1 'promptSuppressed'
+      Assert-True '检测到 Low 且 smoke 不弹框时给出抑制标记（promptSuppressed=true）' ($integSuppressed1 -eq $true) ('实际：' + $integSuppressed1)
+    }
+  }
 
   # 阶段 1f：直接编辑 config.json 的 admin.enabled（模拟用户/其它工具改配置），
   # 验证 Rust 壳的 1 秒配置轮询能把「打开管理界面 / 重启管理界面」菜单项加/减
