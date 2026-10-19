@@ -167,8 +167,14 @@ if ($DebugBuild -or $NoSign) {
   if (-not (Test-Path -LiteralPath $signScript)) {
     Fail '缺少 tools/sign-desktop.ps1，无法签名（可用 -NoSign 跳过签名）。'
   }
-  & powershell -NoProfile -ExecutionPolicy Bypass -File $signScript -Exe $distExe
-  if ($LASTEXITCODE -ne 0) { Fail '数字签名失败（可用 -NoSign 跳过签名）。' }
+  $signed = $false
+  for ($attempt = 1; $attempt -le 3; $attempt++) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $signScript -Exe $distExe
+    if ($LASTEXITCODE -eq 0) { $signed = $true; break }
+    Write-Host ('数字签名第 ' + $attempt + ' 次尝试失败（退出码 ' + $LASTEXITCODE + '），2 秒后重试…') -ForegroundColor Yellow
+    Start-Sleep -Seconds 2
+  }
+  if (-not $signed) { Fail '数字签名失败（可用 -NoSign 跳过签名）。' }
 }
 
 # 版本信息校验：发布者（CompanyName）与版本号必须正确写入 exe 资源。

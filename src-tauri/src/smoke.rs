@@ -201,6 +201,22 @@ fn execute_command(app: &AppHandle, command: &str) -> (bool, String) {
       }
       Err(err) => (false, err),
     },
+    // v0.0.9：读取 WebView2 默认右键菜单策略与执行状态（只读，供冒烟断言）
+    "window:context-menu-state" => {
+      let (disabled, error) = window::context_menu_settings();
+      let disabled_text = match disabled {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "null",
+      };
+      (
+        true,
+        format!(
+          "defaultContextMenusPolicy=disabled defaultContextMenusDisabled={disabled_text} webviewSettingsError={}",
+          error.unwrap_or_else(|| "null".to_string())
+        ),
+      )
+    },
     other => (false, format!("未知冒烟命令：{other}")),
   }
 }
@@ -291,6 +307,7 @@ fn build_report(app: &AppHandle, elapsed: Duration) -> Value {
     },
     "smokeCommandHelp": [
       "show", "hide", "quit", "window:close", "window:state", "window:minimize", "window:maximize-toggle",
+   "window:context-menu-state",
       "restart-node", "restart-registry", "restart-webadmin",
       "show-webadmin", "autostart-on", "autostart-off", "reload-config", "renderer-info",
       "menu:tray-open", "menu:tray-hide", "menu:tray-restart-window-admin",

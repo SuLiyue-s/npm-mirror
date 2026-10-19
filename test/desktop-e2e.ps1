@@ -48,6 +48,11 @@
           并周期性激活已有实例，确认已有实例健康后唤醒并退出（报告 alreadyRunning=true、
           waitedMs），原服务与原桌面进程不受影响
         - 数据目录内写出 config.json / logs
+        - 窗口内浏览器默认右键菜单已屏蔽（v0.0.9）：报告 window.defaultContextMenusPolicy
+          固定为 "disabled"；窗口创建成功（window.failureKind 为空）时
+          window.defaultContextMenusDisabled=true 且 window.webviewSettingsError=null；
+          受限会话窗口创建失败（failureKind 非空，如 "webview"）时
+          defaultContextMenusDisabled 允许 null/false（环境限制，不判失败）
     · 阶段 1e：config.json 里写入非法 storage.dir 时服务仍能启动并回退默认 storage
     · 阶段 1g：程序配置目录回退——%LOCALAPPDATA% 不可写、未设 MIRROR_DESKTOP_HOME 时
       自动回退到 <exe目录>\LiYueNpmMirror（v0.0.2 修复；0.0.1 会报「创建桌面配置目录 …
@@ -1799,6 +1804,54 @@ if ($rep1Ready) {
   }
   Assert-True '测试报告 window.frameless = true（无边框窗口，v0.0.8）' (($null -ne $framelessProp) -and ($framelessProp.Value -eq $true)) ('实际：' + $(if ($null -ne $framelessProp) { $framelessProp.Value } else { '字段缺失' }))
   Assert-True '测试报告包含 window.maximized 布尔字段（v0.0.8）' (($null -ne $maximizedProp) -and ($maximizedProp.Value -is [bool])) ('实际：' + $(if ($null -ne $maximizedProp) { $maximizedProp.Value } else { '字段缺失' }))
+
+  # v0.0.9：屏蔽窗口内 WebView2 浏览器默认右键菜单（用户截图：窗口内右键出现返回/刷新/另存为/打印/更多工具）。
+  # 报告字段语义（与 rust-tauri 约定）：defaultContextMenusPolicy 固定 "disabled"；
+  # defaultContextMenusDisabled = bool|null（null=WebView2 未创建/无法确认；true=已关闭并读回校验；false=调用失败）；
+  # webviewSettingsError = string|null。受限会话窗口创建失败（window.failureKind 非空）时取值按环境限制处理。
+  $ctxPolicyProp = $null
+  $ctxDisabledProp = $null
+  $ctxErrorProp = $null
+  $winFailureKind = ''
+  if ($null -ne $diagWin) {
+    $ctxPolicyProp = $diagWin.PSObject.Properties['defaultContextMenusPolicy']
+    $ctxDisabledProp = $diagWin.PSObject.Properties['defaultContextMenusDisabled']
+    $ctxErrorProp = $diagWin.PSObject.Properties['webviewSettingsError']
+    $winFailureKindProp = $diagWin.PSObject.Properties['failureKind']
+    if ($null -ne $winFailureKindProp -and $null -ne $winFailureKindProp.Value) { $winFailureKind = [string]$winFailureKindProp.Value }
+  }
+  $ctxDisabledText = '字段缺失'
+  if ($null -ne $ctxDisabledProp) {
+    if ($null -eq $ctxDisabledProp.Value) { $ctxDisabledText = 'null' } else { $ctxDisabledText = [string]$ctxDisabledProp.Value }
+  }
+  # 1) 策略字段必然存在且固定为 disabled（契约）
+  Assert-True '测试报告 window.defaultContextMenusPolicy = "disabled"（v0.0.9 契约）' (($null -ne $ctxPolicyProp) -and ([string]$ctxPolicyProp.Value -eq 'disabled')) ('实际：' + $(if ($null -ne $ctxPolicyProp) { [string]$ctxPolicyProp.Value } else { '字段缺失' }))
+  # 2) disabled 字段必须存在；窗口创建成功时必须是 true，窗口创建失败（受限会话）时允许 null/false 且不判失败。
+  Assert-True '测试报告包含 window.defaultContextMenusDisabled 字段（v0.0.9）' ($null -ne $ctxDisabledProp) ('实际：' + $(if ($null -ne $ctxDisabledProp) { '字段存在' } else { '字段缺失' }))
+  if ($winFailureKind.Length -eq 0) {
+    Assert-True '窗口创建成功 → window.defaultContextMenusDisabled = true（右键菜单已屏蔽并读回，v0.0.9）' ($ctxDisabledProp.Value -eq $true) ('实际：' + $ctxDisabledText) 'window'
+  } else {
+    Assert-True ('窗口创建失败（failureKind=' + $winFailureKind + '）时 defaultContextMenusDisabled 为 null/false（WebView2 未创建的预期环境限制，v0.0.9）') (($null -eq $ctxDisabledProp.Value) -or ($ctxDisabledProp.Value -eq $false)) ('实际：' + $ctxDisabledText)
+  }
+  # 3) webviewSettingsError 必须存在且为 null 或字符串；窗口创建成功时应为 null。
+  $ctxErrorText = ''
+  if ($null -ne $ctxErrorProp -and $null -ne $ctxErrorProp.Value) { $ctxErrorText = [string]$ctxErrorProp.Value }
+  Assert-True '测试报告包含 window.webviewSettingsError 字段（v0.0.9，null 或字符串）' ($null -ne $ctxErrorProp) ('实际：' + $(if ($null -ne $ctxErrorProp) { '字段存在' } else { '字段缺失' }))
+  if ($winFailureKind.Length -eq 0) {
+    Assert-True '窗口创建成功 → window.webviewSettingsError = null（WebView2 设置无错误，v0.0.9）' ($ctxErrorText.Length -eq 0) ('实际：' + $(if ($ctxErrorText.Length -eq 0) { 'null' } else { $ctxErrorText })) 'window'
+  }
+  # 若构建提供 window:context-menu-state 冒烟命令（只读回执），再验证一次命令通道；未提供则显式跳过。
+  $ctxCmdHelp = @(Get-Prop $script:LastSmokeReport 'smokeCommandHelp')
+  if (@($ctxCmdHelp) -contains 'window:context-menu-state') {
+    $ctxCmdReport = Send-SmokeCommand 'window:context-menu-state' 30
+    $ctxCmdHits = @()
+    if ($null -ne $ctxCmdReport) {
+      $ctxCmdHits = @(@(Get-Prop $ctxCmdReport 'commands') | Where-Object { (Get-Prop $_ 'command') -eq 'window:context-menu-state' })
+    }
+    Assert-True '冒烟命令 window:context-menu-state 可执行（只读状态回执 ok，v0.0.9）' ($ctxCmdHits.Count -gt 0 -and (Get-Prop $ctxCmdHits[0] 'ok') -eq $true) ('回执：' + ($ctxCmdHits | ConvertTo-Json -Compress))
+  } else {
+    Assert-Skip '冒烟命令 window:context-menu-state' '当前构建未提供该命令（v0.0.9 允许仅通过报告字段断言；提供后自动启用）'
+  }
 }
 
 Assert-True '默认配置下网页版管理端口不监听（admin.enabled=false）' (-not (Test-Port $AdminPort)) ('端口 ' + $AdminPort)

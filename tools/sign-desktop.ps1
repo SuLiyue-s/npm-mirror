@@ -71,6 +71,29 @@ function Fail([string]$Text) {
   exit 1
 }
 
+function Ensure-SecurityModule {
+  # 受限/沙箱上下文里 Microsoft.PowerShell.Security 的自动加载可能瞬时失败，
+  # 表现为 Get-AuthenticodeSignature 报「模块无法加载」；这里显式导入并重试。
+  if (Get-Command Get-AuthenticodeSignature -ErrorAction SilentlyContinue) { return }
+  for ($i = 1; $i -le 5; $i++) {
+    try {
+      Import-Module Microsoft.PowerShell.Security -ErrorAction Stop
+      break
+    } catch {
+      Start-Sleep -Milliseconds (200 * $i)
+    }
+  }
+  if (-not (Get-Command Get-AuthenticodeSignature -ErrorAction SilentlyContinue)) {
+    $manifest = Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1'
+    if (Test-Path -LiteralPath $manifest) {
+      try { Import-Module $manifest -ErrorAction Stop } catch { }
+    }
+  }
+  if (-not (Get-Command Get-AuthenticodeSignature -ErrorAction SilentlyContinue)) {
+    Fail '无法加载 Microsoft.PowerShell.Security 模块（Get-AuthenticodeSignature 不可用），请重试或检查 PowerShell 安装。'
+  }
+}
+Ensure-SecurityModule
 function Get-CertMaker {
   $type = 'SuliyueCodeSignCertMaker' -as [type]
   if (-not $type) {

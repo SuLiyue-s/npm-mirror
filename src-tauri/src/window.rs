@@ -1,6 +1,7 @@
 // 主窗口管理：隐藏创建、Node ready 后导航、关闭=隐藏、标题与位置记忆
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use tauri::image::Image;
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent};
@@ -74,6 +75,159 @@ pub fn failure_snapshot() -> serde_json::Value {
     .ok()
     .and_then(|guard| guard.clone())
     .unwrap_or_else(|| serde_json::json!({}))
+}
+
+// ===== WebView2 默认右键菜单屏蔽（v0.0.9）=====
+// 用户反馈窗口内右键会弹出 WebView2 浏览器默认菜单（返回/刷新/另存为/打印/更多工具）。
+// 通过 ICoreWebView2Controller::CoreWebView2() → Settings() → SetAreDefaultContextMenusEnabled(false)
+// 关闭，并读回校验；结果写入冒烟报告 window.defaultContextMenusPolicy / defaultContextMenusDisabled /
+// webviewSettingsError。disabled 语义（v0.0.9 契约）：null=WebView2 未创建或回调未执行，无法确认；
+// true=已 Set 并读回校验为 false；false=真正调用过 Set/读回但失败（此时 error 有可读原因）。
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+struct ContextMenuSettings {
+  disabled: Option<bool>,
+  error: Option<String>,
+}
+
+#[cfg(windows)]
+static CONTEXT_MENU_SETTINGS: Mutex<Option<ContextMenuSettings>> = Mutex::new(None);
+
+#[cfg(windows)]
+fn store_context_menu_settings(disabled: Option<bool>, error: Option<String>) {
+  if let Ok(mut guard) = CONTEXT_MENU_SETTINGS.lock() {
+    *guard = Some(ContextMenuSettings { disabled, error });
+  }
+}
+
+/// 读取默认右键菜单屏蔽状态：(已确认关闭=Some(true)/失败=Some(false)/无法确认=None, 失败原因)
+pub fn context_menu_settings() -> (Option<bool>, Option<String>) {
+  #[cfg(windows)]
+  {
+    if let Ok(guard) = CONTEXT_MENU_SETTINGS.lock() {
+      if let Some(state) = guard.as_ref() {
+        return (state.disabled, state.error.clone());
+      }
+    }
+  }
+  (None, None)
+}
+
+#[cfg(windows)]
+fn disable_default_context_menus_once(
+  platform_webview: tauri::webview::PlatformWebview,
+) -> Result<(), String> {
+  // WebView2 接口均为 COM 调用，必须在 unsafe 中执行；任何一步失败都返回可读中文原因，不 panic。
+  let controller = platform_webview.controller();
+  unsafe {
+    let core = controller
+      .CoreWebView2()
+      .map_err(|err| format!("获取 CoreWebView2 失败：{err}"))?;
+    let settings = core
+      .Settings()
+      .map_err(|err| format!("获取 WebView2 Settings 失败：{err}"))?;
+    settings
+      .SetAreDefaultContextMenusEnabled(false)
+      .map_err(|err| format!("设置 AreDefaultContextMenusEnabled=false 失败：{err}"))?;
+    let mut enabled = windows::core::BOOL::from(true);
+    settings
+      .AreDefaultContextMenusEnabled(&mut enabled)
+      .map_err(|err| format!("读回 AreDefaultContextMenusEnabled 失败：{err}"))?;
+    if enabled.as_bool() {
+      return Err("读回 AreDefaultContextMenusEnabled 仍为 true（设置未生效）".to_string());
+    }
+  }
+  Ok(())
+}
+
+/// 请求禁用 WebView2 默认右键菜单：with_webview 的回调在事件循环线程异步执行，
+/// 因此放在后台线程里调用并在有限次数内轮询/重试，避免主线程被阻塞或过早判定失败。
+#[cfg(windows)]
+fn configure_webview_context_menus(app: &AppHandle) {
+  let app = app.clone();
+  std::thread::spawn(move || {
+    const MAX_ATTEMPTS: u32 = 20;
+    for attempt in 1..=MAX_ATTEMPTS {
+      if app.state::<AppState>().allow_exit.load(Ordering::SeqCst) {
+        return;
+      }
+      let Some(window) = window_of(&app) else {
+        store_context_menu_settings(
+          None,
+          Some("禁用默认右键菜单失败：主窗口对象不存在".to_string()),
+        );
+        return;
+      };
+      // 若窗口校验已失败（WebView2 运行时不工作），无需继续重试；把环境原因写入报告
+      if let Some(failure) = startup_failure() {
+        if failure.kind == "webview" {
+          store_context_menu_settings(
+            None,
+            Some(format!(
+              "WebView2 不可用，无法读取/设置默认右键菜单开关：{}",
+              failure.reason
+            )),
+          );
+          logging::warn(
+            "WebView2 不可用，跳过默认右键菜单开关设置（受限环境无法读取 Settings，真实桌面可见效果需人工验证）",
+          );
+          return;
+        }
+      }
+      let attempt_for_log = attempt;
+      if let Err(err) = window.with_webview(move |platform_webview| {
+        match disable_default_context_menus_once(platform_webview) {
+          Ok(()) => {
+            store_context_menu_settings(Some(true), None);
+            logging::info(
+              "WebView2 默认右键菜单已禁用：读回 AreDefaultContextMenusEnabled=false",
+            );
+          }
+          Err(err) => {
+            store_context_menu_settings(Some(false), Some(err.clone()));
+            logging::warn(format!(
+              "禁用 WebView2 默认右键菜单失败（第 {attempt_for_log} 次尝试）：{err}"
+            ));
+          }
+        }
+      }) {
+        store_context_menu_settings(
+          None,
+          Some(format!("调用 with_webview 失败：{err}")),
+        );
+      }
+      // 等待异步回调落地：成功立即结束；失败等 2 秒后重试（WebView2 可能尚未完成初始化）
+      for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(100));
+        if let Ok(guard) = CONTEXT_MENU_SETTINGS.lock() {
+          if let Some(state) = guard.as_ref() {
+            if state.disabled == Some(true) {
+              return;
+            }
+          }
+        }
+      }
+      // 回调未落地：记录可诊断原因（smoke 报告据此区分「已禁用」与「环境不支持」）
+      if attempt == 1 {
+        let has_error = CONTEXT_MENU_SETTINGS
+          .lock()
+          .ok()
+          .and_then(|guard| guard.as_ref().map(|state| state.error.is_some()))
+          .unwrap_or(false);
+        if !has_error {
+          store_context_menu_settings(
+            None,
+            Some(
+              "with_webview 回调未执行（WebView2 初始化未完成或环境受限），无法读取 Settings"
+                .to_string(),
+            ),
+          );
+          logging::warn("禁用 WebView2 默认右键菜单：with_webview 回调未执行，继续重试");
+        }
+      }
+    }
+    logging::warn("禁用 WebView2 默认右键菜单多次尝试后仍未成功，已记录失败原因供诊断");
+  });
 }
 
 fn window_failure(kind: &'static str, reason: &str, detail: impl Into<String>) -> WindowFailure {
@@ -158,6 +312,11 @@ pub fn diagnostics(app: &AppHandle) -> serde_json::Value {
       Some((style & (WS_CAPTION.0 as isize)) != 0)
     }
   });
+  // v0.0.9：浏览器默认右键菜单静态策略（代码始终走禁用路径）与执行状态
+  // defaultContextMenusPolicy 固定 "disabled"；defaultContextMenusDisabled 为 bool|null：
+  //   true=已 Set 并读回校验；false=真正调用 Set/读回但失败；null=WebView2 未创建/回调未执行，无法确认
+  const DEFAULT_CONTEXT_MENUS_POLICY: &str = "disabled";
+  let (default_context_menus_disabled, webview_settings_error) = context_menu_settings();
   serde_json::json!({
     "label": WINDOW_LABEL,
     "created": created,
@@ -172,6 +331,10 @@ pub fn diagnostics(app: &AppHandle) -> serde_json::Value {
     "decorated": decorated,
     "maximized": maximized,
     "styleHasCaption": style_has_caption,
+    // v0.0.9：浏览器默认右键菜单策略与执行状态（null=受限环境无法确认；真实桌面应出现 true）
+    "defaultContextMenusPolicy": DEFAULT_CONTEXT_MENUS_POLICY,
+    "defaultContextMenusDisabled": default_context_menus_disabled,
+    "webviewSettingsError": webview_settings_error,
     // 启动阶段窗口/WebView2 校验失败原因（正常启动为 null）
     "failureKind": startup_failure.as_ref().map(|failure| failure.kind),
     "failureReason": startup_failure.as_ref().map(|failure| failure.reason.clone()),
@@ -248,6 +411,9 @@ pub fn create(app: &AppHandle) -> Result<WebviewWindow, WindowFailure> {
       return Err(window_failure("window", "创建主窗口失败", err.to_string()));
     }
   };
+  // v0.0.9：窗口对象创建后立即请求禁用 WebView2 默认右键菜单（异步回调，失败只 warn 不阻塞启动）
+  #[cfg(windows)]
+  configure_webview_context_menus(app);
   // 关键校验：窗口对象创建成功不代表 WebView2 可用。受限环境（沙箱/预览面板/受限 token）
   // 下 build() 可能返回 Ok，但窗口句柄/is_visible/url 均返回 runtime error，导致窗口永远不可见。
   let created_hwnd = match webview_window.hwnd() {

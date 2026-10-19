@@ -1,6 +1,6 @@
 [package]
 name = "npm-mirror-desktop"
-version = "0.0.8"
+version = "0.0.9"
 edition = "2021"
 description = "离月私人 npm 镜像源 · 桌面版"
 authors = ["苏离月 (SuLiyue)"]
@@ -31,6 +31,11 @@ windows = { version = "0.61", features = [
   "Win32_System_Registry",
   "Win32_System_Threading",
 ] }
+
+# Windows 专属：直接操作 WebView2 Settings（禁用浏览器默认右键菜单）。
+# tauri 在 Windows 上已依赖同一版本（Cargo.lock 中 webview2-com 0.38.2），离线可解析，不新增第三方 crate。
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.38"
 
 [profile.release]
 opt-level = "s"

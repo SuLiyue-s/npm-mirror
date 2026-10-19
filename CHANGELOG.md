@@ -36,6 +36,26 @@
 - `test/run-all.js` 一键自检（约 40~60 秒，`--destructive` 含破坏性用例），已移除 `--full` 完整回归参数；与 6 个 `test/ui-e2e-*.js` 默认地址改为管理界面端口并分别探测两个监听
 - 破坏性用例（重启镜像源服务 / 重启管理界面 / 清空日志）默认跳过，加 `--destructive` 才执行
 
+## [0.0.9] - 2026-10-19
+
+**桌面版屏蔽窗口内浏览器默认右键菜单（本地构建交付，暂未发布 GitHub）**：窗口 WebView2 的 `AreDefaultContextMenusEnabled` 设为 `false` 并读回确认，窗口内右键不再弹出浏览器默认菜单（返回 / 刷新 / 另存为 / 打印 / 更多工具）；网页版在普通浏览器标签页使用不受影响。
+
+> 本版本按用户要求**只在本机构建交付**，产物保留在 `dist\npm-mirror-desktop-0.0.9.exe`，**不推送 GitHub、不创建 Release、不建 tag**（是否发布待用户确认）；GitHub 最近发布版仍为 [v0.0.5](https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.5)。
+
+### 变更
+
+- **屏蔽窗口内浏览器默认右键菜单（v0.0.9）**：创建窗口后通过 WebView2 `Settings.SetAreDefaultContextMenusEnabled(false)` 关闭默认右键菜单；冒烟报告新增 `window.defaultContextMenusPolicy`（固定 `"disabled"`）、`window.defaultContextMenusDisabled`（`true` = 已确认关闭；WebView2 不可用的受限会话为 `null`，不伪报 `false`）与 `window.webviewSettingsError`（成功为 `null`，失败为可读中文错误）；失败不影响窗口启动。窗口内右键不再出现「返回 / 刷新 / 另存为 / 打印 / 更多工具」等浏览器菜单。
+- 网页版（普通浏览器标签页）不受影响，浏览器自身右键菜单照常工作；桌面窗口内需要复制文本时用 **Ctrl+C** 快捷键。
+
+### 文档
+
+- README / 使用说明：补充「v0.0.9 起窗口内右键不再弹出浏览器默认菜单」说明、常见问题（输入框右键同样不弹浏览器菜单，复制用 Ctrl+C）与 13.19 小节；版本更新为 0.0.9（本地构建交付，GitHub 最近发布版仍为 v0.0.5）。
+
+### 测试
+
+- `test/desktop-e2e.ps1` 适配 0.0.9：阶段 1 新增断言 smoke 报告 `window.defaultContextMenusPolicy === "disabled"`、`window.defaultContextMenusDisabled` 为布尔/`null` 并按 `window.failureKind` 区分语义（`failureKind="webview"` 的受限会话接受 `null`/`false`，不记失败）、`window.webviewSettingsError` 字段存在（`null` 或可读字符串）、`failures` 中不出现 `defaultContextMenusDisabled`，并断言 `window:context-menu-state` 命令回执 `ok`；保留 v0.0.8 及更早全部阶段与退出码口径，不调用 `window.close`。
+- **v0.0.9 实测（2026-10-19 22:47:11 对 `dist\npm-mirror-desktop-0.0.9.exe`，96,881,480 B，SHA256 `c4193980002562f34849295aa4d8efe9543acf25f471d2e717fa2514cd649880`，签名者 `CN=suliyue`）：319 项 = 305 通过 / 8 失败（全窗口类环境限制）/ 6 跳过，exit 3，非窗口类失败 0**；v0.0.9 新增断言全部通过（`policy=disabled`、`disabled` 字段与受限会话 `null` 语义、`webviewSettingsError` 可读错误、`window:context-menu-state ok=True`）；单测 path 24/24、bridge 11/11、cancel 13/13（exit 0）；Lead 独立冒烟 62/62 PASS。
+
 ## [0.0.8] - 2026-10-19
 
 **桌面版无边框窗口与自签数字签名版（本地构建交付，暂未发布 GitHub）**：窗口去掉系统标题栏，改用与界面同风格的**自绘标题栏**（拖动 / 双击最大化 / 最小化 / 最大化还原 / 关闭、四边四角缩放）；构建出的 exe 带**自签代码签名**（`CN=suliyue`），并随产物附带可导入的证书 `dist\codesign-suliyue.cer`。
