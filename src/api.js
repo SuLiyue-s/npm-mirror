@@ -2414,6 +2414,8 @@ async function handleAdmin(ctx) {  const { req, res, url, method, store, log } =
       }
       return fail(res, 500, (e && e.message) || String(e), code);
     };
+    // v0.0.8 无边框窗口：边缘缩放方向白名单（契约统一 camelCase，与 Rust ResizeDirection 对齐）
+    const RESIZE_DIRECTIONS = ['north', 'south', 'east', 'west', 'northEast', 'northWest', 'southEast', 'southWest'];
     try {
       switch (action) {
       case 'pickFolder': {
@@ -2478,6 +2480,43 @@ async function handleAdmin(ctx) {  const { req, res, url, method, store, log } =
       case 'window.hide': {
         if (needDesktop()) return true;
         await host.windowHide();
+        return ok(res, { ok: true });
+      }
+      /* v0.0.8 无边框窗口：GUI 自绘标题栏 / 边缘缩放的窗口控制（DESIGN 14.2；Rust 外壳实现同名桥方法） */
+      case 'window.minimize': {
+        if (needDesktop()) return true;
+        await host.windowMinimize();
+        return ok(res, { ok: true });
+      }
+      case 'window.toggleMaximize': {
+        if (needDesktop()) return true;
+        const r = await host.windowToggleMaximize();
+        // 返回外壳的实际最大化状态；外壳未给出时按 false（契约：透传 {maximized}，缺省 false）
+        return ok(res, { maximized: !!(r && r.maximized === true) });
+      }
+      case 'window.state': {
+        if (needDesktop()) return true;
+        const r = await host.windowState();
+        // 契约：{maximized:bool, visible:bool}；外壳缺字段时 maximized=false、visible=true
+        return ok(res, { maximized: !!(r && r.maximized === true), visible: !(r && r.visible === false) });
+      }
+      case 'window.close': {
+        if (needDesktop()) return true;
+        await host.windowClose();
+        return ok(res, { ok: true });
+      }
+      case 'window.startDrag': {
+        if (needDesktop()) return true;
+        await host.windowStartDrag();
+        return ok(res, { ok: true });
+      }
+      case 'window.startResize': {
+        if (needDesktop()) return true;
+        const direction = String(params.direction || '').trim();
+        if (!RESIZE_DIRECTIONS.includes(direction)) {
+          return fail(res, 400, `window.startResize 的 direction 必须是 north/south/east/west/northEast/northWest/southEast/southWest 之一（收到：${direction || '空'}）`, 'EBADPARAM');
+        }
+        await host.windowStartResize(direction);
         return ok(res, { ok: true });
       }
       case 'script.run': {

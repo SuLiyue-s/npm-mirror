@@ -4,6 +4,8 @@ use std::sync::Mutex;
 
 use tauri::image::Image;
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent};
+use tauri_runtime::ResizeDirection;
+use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, GWL_STYLE, WS_CAPTION};
 
 use crate::logging;
 use crate::node_proc;
@@ -134,6 +136,28 @@ pub fn diagnostics(app: &AppHandle) -> serde_json::Value {
     None => (None, Some("窗口对象不存在".to_string())),
   };
   let startup_failure = startup_failure();
+  // v0.0.8 无边框窗口：decorations=false 由 create() 固定设置；
+  // frameless 优先读回真实 decorations 状态，读不到时按配置常量（无边框）回退。
+  let decorated = window
+    .as_ref()
+    .and_then(|webview_window| webview_window.is_decorated().ok());
+  let frameless = match decorated {
+    Some(value) => !value,
+    None => true,
+  };
+  // 报告字段要求为 bool；读不到最大化状态时按「未最大化」回退（受限环境下窗口 API 不可用）
+  let maximized = window
+    .as_ref()
+    .and_then(|webview_window| webview_window.is_maximized().ok())
+    .unwrap_or(false);
+  // 读 Win32 原生样式中的 WS_CAPTION，供 e2e 断言「确实没有原生标题栏」
+  let style_has_caption = window.as_ref().and_then(|webview_window| {
+    let hwnd = webview_window.hwnd().ok()?;
+    unsafe {
+      let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+      Some((style & (WS_CAPTION.0 as isize)) != 0)
+    }
+  });
   serde_json::json!({
     "label": WINDOW_LABEL,
     "created": created,
@@ -143,6 +167,11 @@ pub fn diagnostics(app: &AppHandle) -> serde_json::Value {
     "url": url,
     "urlError": url_error,
     "lastAction": last_action(),
+    // v0.0.8：无边框/最大化/原生标题栏样式（供冒烟与 e2e 断言）
+    "frameless": frameless,
+    "decorated": decorated,
+    "maximized": maximized,
+    "styleHasCaption": style_has_caption,
     // 启动阶段窗口/WebView2 校验失败原因（正常启动为 null）
     "failureKind": startup_failure.as_ref().map(|failure| failure.kind),
     "failureReason": startup_failure.as_ref().map(|failure| failure.reason.clone()),
@@ -168,6 +197,8 @@ pub fn create(app: &AppHandle) -> Result<WebviewWindow, WindowFailure> {
     .inner_size(width, height)
     .min_inner_size(1024.0, 700.0)
     .visible(false)
+    // v0.0.8：去掉原生标题栏/边框，由网页内自绘标题栏通过桥命令控制最小化/最大化/关闭/拖动/缩放。
+    .decorations(false)
     .resizable(true);
   // WebView2 用户数据目录放到桌面配置目录下：避免写入 %LOCALAPPDATA% 默认位置带来的
   // 权限问题（受限账户/沙箱/便携场景），也便于测试时用 MIRROR_DESKTOP_HOME 完全隔离。
@@ -495,4 +526,90 @@ pub fn save_prefs(app: &AppHandle) {
   if let Err(err) = paths::write_desktop_prefs(&state.home_dir, &prefs) {
     crate::logging::warn(format!("保存窗口位置失败：{err}"));
   }
+}
+
+// ============================================================================
+// v0.0.8 无边框窗口控制（由网页自绘标题栏经桌面桥调用，见 DESIGN §14.2）
+// ============================================================================
+
+fn require_window(app: &AppHandle) -> Result<WebviewWindow, String> {
+  window_of(app).ok_or_else(|| "主窗口不存在".to_string())
+}
+
+/// 最小化窗口（自绘标题栏「最小化」按钮）。
+pub fn minimize(app: &AppHandle) -> Result<(), String> {
+  let webview_window = require_window(app)?;
+  webview_window
+    .minimize()
+    .map_err(|err| format!("最小化窗口失败：{err}"))?;
+  record_action("最小化窗口".to_string());
+  Ok(())
+}
+
+/// 切换最大化/还原，返回切换后的最大化状态（自绘标题栏「最大化」按钮）。
+pub fn toggle_maximize(app: &AppHandle) -> Result<bool, String> {
+  let webview_window = require_window(app)?;
+  let before = webview_window
+    .is_maximized()
+    .map_err(|err| format!("读取最大化状态失败：{err}"))?;
+  if before {
+    webview_window
+      .unmaximize()
+      .map_err(|err| format!("还原窗口失败：{err}"))?;
+  } else {
+    webview_window
+      .maximize()
+      .map_err(|err| format!("最大化窗口失败：{err}"))?;
+  }
+  // 读回真实状态；极端环境下读不到时按期望值回退
+  let after = webview_window.is_maximized().unwrap_or(!before);
+  record_action(format!("切换最大化：{before} -> {after}"));
+  Ok(after)
+}
+
+/// 当前窗口状态：是否最大化、是否可见（网页初始化时同步按钮图标）。
+pub fn window_state(app: &AppHandle) -> Result<(bool, bool), String> {
+  let webview_window = require_window(app)?;
+  let maximized = webview_window
+    .is_maximized()
+    .map_err(|err| format!("读取最大化状态失败：{err}"))?;
+  let visible = webview_window
+    .is_visible()
+    .map_err(|err| format!("读取窗口可见状态失败：{err}"))?;
+  Ok((maximized, visible))
+}
+
+/// 请求关闭窗口：走与原生标题栏关闭按钮相同的 CloseRequested 语义
+/// （托盘可用=隐藏到托盘；托盘不可用=优雅退出程序）。
+pub fn close(app: &AppHandle) -> Result<(), String> {
+  let webview_window = require_window(app)?;
+  record_action("请求关闭窗口（走 CloseRequested 语义）".to_string());
+  webview_window
+    .close()
+    .map_err(|err| format!("关闭窗口失败：{err}"))
+}
+
+/// 开始拖动窗口（自绘标题栏空白处按住左键时调用）。
+pub fn start_dragging(app: &AppHandle) -> Result<(), String> {
+  let webview_window = require_window(app)?;
+  webview_window
+    .start_dragging()
+    .map_err(|err| format!("开始拖动窗口失败：{err}"))?;
+  record_action("开始拖动窗口".to_string());
+  Ok(())
+}
+
+/// 开始缩放窗口（自绘窗口边缘 8 个热区按住时调用）。
+pub fn start_resize_dragging(app: &AppHandle, direction: ResizeDirection) -> Result<(), String> {
+  let webview_window = require_window(app)?;
+  // WebviewWindow 本身只暴露 start_dragging；resize 需要底层 tauri::Window。
+  // 注意 Manager::get_window 在 tauri 2.11 被 `unstable` feature 门控，这里通过 Webview::window() 拿到底层窗口，
+  // 避免为单个 API 打开 unstable feature。
+  let webview: &tauri::Webview = webview_window.as_ref();
+  let window = webview.window();
+  window
+    .start_resize_dragging(direction)
+    .map_err(|err| format!("开始缩放窗口失败：{err}"))?;
+  record_action(format!("开始缩放窗口：{direction:?}"));
+  Ok(())
 }

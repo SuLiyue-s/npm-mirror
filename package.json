@@ -1,6 +1,6 @@
 {
   "name": "npm-private-mirror-offline",
-  "version": "0.0.7",
+  "version": "0.0.8",
   "private": true,
   "description": "零依赖、可离线迁移的私人 npm 镜像源：本地缓存 + 私有包仓库 + 中文可视化管理界面",
   "keywords": [
@@ -34,6 +34,7 @@
     "test:path": "node test/desktop-path-test.js",
     "ver": "node tools/version.js",
     "build:desktop": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/build-desktop.ps1",
+    "sign:desktop": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/sign-desktop.ps1",
     "release:desktop": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/release.ps1"
   },
   "engines": {

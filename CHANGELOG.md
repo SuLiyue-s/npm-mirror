@@ -36,6 +36,34 @@
 - `test/run-all.js` 一键自检（约 40~60 秒，`--destructive` 含破坏性用例），已移除 `--full` 完整回归参数；与 6 个 `test/ui-e2e-*.js` 默认地址改为管理界面端口并分别探测两个监听
 - 破坏性用例（重启镜像源服务 / 重启管理界面 / 清空日志）默认跳过，加 `--destructive` 才执行
 
+## [0.0.8] - 2026-10-19
+
+**桌面版无边框窗口与自签数字签名版（本地构建交付，暂未发布 GitHub）**：窗口去掉系统标题栏，改用与界面同风格的**自绘标题栏**（拖动 / 双击最大化 / 最小化 / 最大化还原 / 关闭、四边四角缩放）；构建出的 exe 带**自签代码签名**（`CN=suliyue`），并随产物附带可导入的证书 `dist\codesign-suliyue.cer`。
+
+> 本版本按用户要求**只在本机构建交付**，产物保留在 `dist\npm-mirror-desktop-0.0.8.exe`，**不推送 GitHub、暂不创建 Release**（是否发布待用户确认）；GitHub 最近发布版仍为 [v0.0.5](https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.5)。
+
+### 新增
+
+- **无边框窗口 + 自绘标题栏（v0.0.8）**：窗口改用 `decorations(false)`，顶部增加与界面风格一致的标题栏（图标 + 「离月私人 npm 镜像源」+「桌面版」标签 + 最小化 / 最大化还原 / 关闭按钮）；支持**拖动标题栏移动窗口、双击标题栏最大化 / 还原、窗口四边四角拖动缩放**；窗口位置 / 大小 / 最大化状态继续写入 `desktop.json` 并在下次启动恢复；网页版页面不显示该标题栏。
+- 桌面动作 API 新增窗口控制动作（仅内部管理监听 + 令牌会话可调用）：`window.minimize`、`window.toggleMaximize`、`window.state`、`window.startDrag`、`window.startResize`（`direction` 取八方向）、`window.close`；非桌面环境返回 400 `EBADESKTOP`，未知动作 400 `EBADACTION`，非法参数 400 `EBADPARAM`。
+- **exe 自签代码签名（v0.0.8）**：新增 `tools\sign-desktop.ps1`（PS5.1 兼容，默认对 `dist` 最新非 debug 产物签名，参数 `-Exe` / `-PfxPath` / `-CerPath` / `-PasswordFile` / `-Subject` / `-ForceNewCert` / `-GenerateCertOnly` / `-AllowResign`）；自签证书 `CN=suliyue`（RSA 2048 / SHA256 / EKU Code Signing，5 年），私钥与证书放 `.signing\`（**已 gitignore，绝不入库、不随 dist 分发**）；签名后自动复制公钥证书为 `dist\codesign-suliyue.cer`，新增根目录 `安装签名证书.cmd`（`certutil -user` 导入当前用户受信任根 / 受信任发布者，仅本机生效、不需要管理员权限）。
+- `tools\build-desktop.ps1` 新增 `-NoSign` 参数（默认构建后自动签名；debug 构建与 `-NoSign` 跳过签名）。
+
+### 变更
+
+- 构建顺序调整为：复制 exe → **签名** → 校验版本信息 → **最后**生成 `SHA256SUMS.txt`（清单中的哈希 = 签名后交付文件的哈希；签名会使 exe 增大约 10KB，大小校验以「>20MB」为准）。
+- 窗口的「关闭」按钮 / 标题栏关闭按钮仍然走「关闭窗口」语义（托盘可用时隐藏、不可用时退出程序），与 v0.0.7 行为一致。
+- 网页版 / 命令行模式不显示自绘标题栏，原有页面布局不被 `body.has-titlebar` 影响。
+
+### 文档
+
+- README / 使用说明：新增「自绘标题栏（无边框窗口）」与「数字签名（自签）」小节（界面与鼠标操作、验证方法、导入证书、边界：自签无公开信誉，未导入证书时 SmartScreen / UAC 仍显示未知发布者，需正式 CA 才能彻底消除）；补充四个根目录双击脚本用途（启动桌面版 / 修复-桌面版启动限制 / 安装签名证书 / 诊断-桌面环境）；版本更新为 0.0.8（本地构建交付，GitHub 下载链接仍指向 v0.0.5）。
+
+### 测试
+
+- `test/desktop-e2e.ps1` 适配 0.0.8：阶段 0 断言 exe 签名者 `Subject` 含 `CN=suliyue`、`dist\codesign-suliyue.cer` 与签名者指纹一致、`SHA256SUMS.txt` 与签名后 exe 哈希一致（**不要求 `Status=Valid`**，未导入证书时 `UnknownError` / `NotTrusted` 属正常）；阶段 0f 静态检查 `public\index.html` 的标题栏元素（`#titlebar`、`#tb-min`、`#tb-max`、`#tb-close`、`.titlebar-actions`、`#win-resize`）与 `src-tauri\src\window.rs` 的 `decorations(false)`；阶段 1 断言 smoke 报告 `window.frameless=true`、`window.maximized` 为布尔，并经由令牌会话调用 `window.state` / `window.toggleMaximize` / `window.startResize`（非法 `direction` → 400 `EBADPARAM`，成功最大化后还原；**不调用 `window.close`** 避免退出）；保留 v0.0.4–v0.0.7 全部阶段与退出码口径。
+- **v0.0.8 实测（2026-10-19 21:59:07 对 `dist\npm-mirror-desktop-0.0.8.exe`，96,875,336 B，SHA256 `5b05bcd9a95ae82065dbfc10326a1343accd07d10c2bce721326be1ad7459b27`，签名者 `CN=suliyue`）：314 项 = 300 通过 / 8 失败（窗口类环境限制）/ 6 跳过，退出码 3，非窗口类失败 0**；8 个失败均为窗口可见性 / 窗口 URL / 菜单关闭窗口后隐藏 / 新增窗口动作断言（受限会话 WebView2 不可用，非产品缺陷）。v0.0.8 新增断言全部通过：签名者 `CN=suliyue` + `codesign-suliyue.cer` 指纹一致 + `SHA256SUMS.txt` 与签名后哈希一致（阶段 0）、标题栏静态检查 8/8（阶段 0f）、`window.frameless`/`maximized`、窗口动作 API 200/400（阶段 1）。单测：path 24/24、bridge 11/11、cancel 13/13（exit 0）。历史 v0.0.7：297 项 = 285/6/6；0.0.6：207/196/5/6；0.0.5：194/183/5/6。
+
 ## [0.0.7] - 2026-10-19
 
 **桌面版安全与交互修复版（本地构建交付，暂未发布 GitHub）**：内部管理端口增加「每次启动随机令牌」门禁；单实例在「旧实例退出中启动新实例」时等待并接管；托盘新增「重启窗口的管理界面」并把菜单调整为默认 5 项 / 网页版管理开启后 7 项（实时切换）；低完整性修复后的重启改为由提权 cmd 助手完成（icacls 改标签 → 约 2 秒 → explorer 以普通权限拉起）。

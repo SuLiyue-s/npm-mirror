@@ -16,3 +16,6 @@ src-tauri/target/
 src-tauri/embed/node.exe
 # Tauri 构建生成（每次构建自动重建）
 src-tauri/gen/schemas/
+
+# 自签代码签名材料（PFX 含私钥，禁止入库；证书与签名流程见 tools/sign-desktop.ps1）
+.signing/

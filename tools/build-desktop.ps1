@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
   构建「离月私人 npm 镜像源」桌面版单 exe（Tauri）。
@@ -9,7 +9,9 @@
     2. 把本机 node.exe 复制到 src-tauri/embed/node.exe（构建时内嵌）；
     3. 校验桌面图标（缺失时调用 tools/compose-desktop-icon.ps1 合成）；
     4. 使用仓库内离线 cargo 缓存（tmp/cargo-home）执行 cargo build --release；
-    5. 复制产物到 dist/npm-mirror-desktop-<version>.exe，并生成 SHA256SUMS.txt。
+    5. 复制产物到 dist/npm-mirror-desktop-<version>.exe；
+    6. 用项目自签证书做数字签名并导出 dist/codesign-suliyue.cer（-NoSign 可跳过）；
+    7. 校验版本信息并生成 SHA256SUMS.txt（哈希为签名后的文件）。
 
 .PARAMETER NodeExe
   指定用于内嵌的 node.exe 路径；默认取 PATH 中的 node。
@@ -23,6 +25,9 @@
 .PARAMETER NoOffline
   不使用仓库内 cargo 缓存，走本机默认 CARGO_HOME（需要网络）。
 
+.PARAMETER NoSign
+  跳过数字签名（默认使用 tools/sign-desktop.ps1 的自签证书签名；debug 构建总是跳过）。
+
 .EXAMPLE
   powershell -NoProfile -ExecutionPolicy Bypass -File tools/build-desktop.ps1
 
@@ -34,7 +39,8 @@ param(
   [string]$NodeExe = '',
   [switch]$ForceIcon,
   [switch]$DebugBuild,
-  [switch]$NoOffline
+  [switch]$NoOffline,
+  [switch]$NoSign
 )
 
 $ErrorActionPreference = 'Stop'
@@ -150,6 +156,20 @@ $distExe = Join-Path $distDir $exeName
 Copy-Item -LiteralPath $builtExe -Destination $distExe -Force
 $sizeMB = [math]::Round((Get-Item -LiteralPath $distExe).Length / 1MB, 2)
 if ($sizeMB -lt 20) { Fail ('产物仅 ' + $sizeMB + ' MB，明显小于预期（应内嵌 node.exe 约 90MB），构建异常。') }
+
+# 数字签名（自签证书）：必须在计算 SHA256 之前完成，校验文件哈希才是最终交付文件的哈希。
+if ($DebugBuild -or $NoSign) {
+  Step '数字签名'
+  Write-Host '已跳过数字签名（-NoSign / debug 构建）。' -ForegroundColor Yellow
+} else {
+  Step '数字签名（自签证书）'
+  $signScript = Join-Path $Root 'tools\sign-desktop.ps1'
+  if (-not (Test-Path -LiteralPath $signScript)) {
+    Fail '缺少 tools/sign-desktop.ps1，无法签名（可用 -NoSign 跳过签名）。'
+  }
+  & powershell -NoProfile -ExecutionPolicy Bypass -File $signScript -Exe $distExe
+  if ($LASTEXITCODE -ne 0) { Fail '数字签名失败（可用 -NoSign 跳过签名）。' }
+}
 
 # 版本信息校验：发布者（CompanyName）与版本号必须正确写入 exe 资源。
 # tauri-build 的 CompanyName 来源 = tauri.conf.json 的 bundle.publisher（未设置时回退取 identifier 第 2 段），

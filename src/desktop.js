@@ -208,6 +208,14 @@ class DesktopHost {
   appQuit() { return this.request('app.quit', {}); }
   windowShow() { return this.request('window.show', {}); }
   windowHide() { return this.request('window.hide', {}); }
+
+  /* v0.0.8 无边框窗口：GUI 自绘标题栏 / 边缘缩放的窗口控制（Rust 外壳实现同名桥方法，DESIGN 14.2） */
+  windowMinimize() { return this.request('window.minimize', {}); }
+  windowToggleMaximize() { return this.request('window.toggleMaximize', {}); }
+  windowState() { return this.request('window.state', {}); }
+  windowClose() { return this.request('window.close', {}); }
+  windowStartDrag() { return this.request('window.startDrag', {}); }
+  windowStartResize(direction) { return this.request('window.startResize', { direction: String(direction || '') }); }
 }
 
 module.exports = { DesktopHost, PRODUCT_NAME, PICK_TIMEOUT_MS, DEFAULT_TIMEOUT_MS, normalizeDir };

@@ -184,6 +184,23 @@ fn execute_command(app: &AppHandle, command: &str) -> (bool, String) {
       window::handle_close_request(app, "smoke:window:close");
       (true, "已触发窗口关闭处理（托盘可用则隐藏，否则退出程序）".to_string())
     }
+    // v0.0.8 无边框窗口控制（只读/可逆命令，不新增会退出的 close 命令）
+    "window:state" => match window::window_state(app) {
+      Ok((maximized, visible)) => (true, format!("maximized={maximized} visible={visible}")),
+      Err(err) => (false, err),
+    },
+    "window:minimize" => match window::minimize(app) {
+      Ok(()) => (true, "已最小化窗口".to_string()),
+      Err(err) => (false, err),
+    },
+    "window:maximize-toggle" => match window::toggle_maximize(app) {
+      Ok(first) => {
+        // 第二次再切换一次还原，避免影响后续用例
+        let restored = window::toggle_maximize(app).unwrap_or(!first);
+        (true, format!("第一次切换后 maximized={first}，第二次还原后 maximized={restored}"))
+      }
+      Err(err) => (false, err),
+    },
     other => (false, format!("未知冒烟命令：{other}")),
   }
 }
@@ -273,7 +290,8 @@ fn build_report(app: &AppHandle, elapsed: Duration) -> Value {
       "labels": tray_labels,
     },
     "smokeCommandHelp": [
-      "show", "hide", "quit", "window:close", "restart-node", "restart-registry", "restart-webadmin",
+      "show", "hide", "quit", "window:close", "window:state", "window:minimize", "window:maximize-toggle",
+      "restart-node", "restart-registry", "restart-webadmin",
       "show-webadmin", "autostart-on", "autostart-off", "reload-config", "renderer-info",
       "menu:tray-open", "menu:tray-hide", "menu:tray-restart-window-admin",
       "menu:tray-open-webadmin", "menu:tray-restart-webadmin", "menu:tray-restart-registry"

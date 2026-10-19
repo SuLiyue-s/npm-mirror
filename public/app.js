@@ -4802,6 +4802,7 @@
       adaptDesktopUi();
       updateDesktopCfgGroup();
       paintDesktopWarn();
+      initTitlebar();
       if (state.page === 'tools') paintTools();
       return state.desktop;
     }, function (e) {
@@ -4810,6 +4811,7 @@
       adaptDesktopUi();
       updateDesktopCfgGroup();
       paintDesktopWarn();
+      initTitlebar();
       if (state.page === 'tools') paintTools();
       return state.desktop;
     }).catch(function () {});
@@ -4834,6 +4836,83 @@
       if (procB) procB.textContent = '重启程序';
       if (procI) procI.textContent = '重启整个 Node 进程，镜像源与管理界面短暂不可用';
     }
+  }
+
+  /* ---------- 无边框窗口自绘标题栏（v0.0.8） ----------
+   * 仅 /desktop/info 返回 desktop:true 时显示并绑定事件；网页版完全隐藏、不绑定任何事件、
+   * 不新增请求。窗口动作走 /desktop/action，失败只静默（拖拽/缩放属高频交互，不打断主流程）。 */
+  function setTitlebarMaxIcon(max) {
+    var b = $('#tb-max');
+    if (!b) return;
+    b.textContent = max ? '❐' : '▢';
+    setTip(b, max ? '还原窗口' : '最大化');
+    b.setAttribute('aria-label', max ? '还原窗口' : '最大化');
+  }
+
+  /* 最大化 / 还原：以桌面桥返回的 maximized 为准更新图标，失败保持原状 */
+  function toggleTitlebarMax() {
+    desktopAction('window.toggleMaximize', {}, 20000).then(function (d) {
+      if (d && typeof d.maximized === 'boolean') setTitlebarMaxIcon(d.maximized);
+    }, function () {}).catch(function () {});
+  }
+
+  /* 初始化时同步一次窗口状态（恢复上次最大化时图标要正确） */
+  function refreshTitlebarState() {
+    desktopAction('window.state', {}, 20000).then(function (d) {
+      if (d && typeof d.maximized === 'boolean') setTitlebarMaxIcon(d.maximized);
+    }, function () {}).catch(function () {});
+  }
+
+  /* 窗口动作：失败静默，不影响页面 */
+  function windowAction(action, params) {
+    desktopAction(action, params, 20000).then(function () {}, function () {}).catch(function () {});
+  }
+
+  function initTitlebar() {
+    var bar = $('#titlebar');
+    var rz = $('#win-resize');
+    if (!bar) return;
+    var desk = isDesktop();
+    bar.hidden = !desk;
+    if (rz) rz.hidden = !desk;
+    document.body.classList.toggle('has-titlebar', desk);
+    document.body.classList.toggle('is-desktop', desk);
+    if (!desk) return;                     /* 网页版：不绑定标题栏/缩放事件 */
+    if (bar.dataset.tbInit === '1') { refreshTitlebarState(); return; }
+    bar.dataset.tbInit = '1';
+
+    /* 标题栏拖动：按钮区域不参与拖动（按钮点击各自处理） */
+    bar.addEventListener('mousedown', function (ev) {
+      if (ev.button !== 0) return;
+      var t = ev.target;
+      if (t && t.closest && t.closest('.titlebar-actions')) return;
+      ev.preventDefault();
+      windowAction('window.startDrag');
+    });
+    /* 双击标题栏：最大化 / 还原（排除按钮区域） */
+    bar.addEventListener('dblclick', function (ev) {
+      var t = ev.target;
+      if (t && t.closest && t.closest('.titlebar-actions')) return;
+      ev.preventDefault();
+      toggleTitlebarMax();
+    });
+
+    on('tb-min', 'click', function () { windowAction('window.minimize'); });
+    on('tb-max', 'click', function () { toggleTitlebarMax(); });
+    on('tb-close', 'click', function () { windowAction('window.close'); });
+
+    /* 边缘缩放：8 个热区，方向由 data-dir 提供 */
+    if (rz) {
+      rz.addEventListener('mousedown', function (ev) {
+        if (ev.button !== 0) return;
+        var t = ev.target;
+        var z = t && t.closest ? t.closest('[data-dir]') : null;
+        if (!z) return;
+        ev.preventDefault();
+        windowAction('window.startResize', { direction: z.getAttribute('data-dir') });
+      });
+    }
+    refreshTitlebarState();
   }
 
   /* 托盘图标状态文本：外壳 v0.0.4+ 透传 tray 字段；旧外壳 / 非桌面模式字段缺失（available=null）→ 未知 */

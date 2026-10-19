@@ -165,6 +165,57 @@ code,kbd,pre{font-family:var(--mono)}
 .topbar-right{display:flex;align-items:center;gap:12px}
 .clock{font-family:var(--mono);font-size:13px;color:var(--cy);letter-spacing:.1em;text-shadow:0 0 10px var(--cy-glow)}
 
+/* ---------- 3.1 自绘标题栏 / 边缘缩放（无边框窗口，仅桌面版显示） ----------
+ * 仅当 /desktop/info 返回 desktop:true 时由 app.js 去掉 hidden 并给 body 加 has-titlebar；
+ * 网页版浏览器直接访问管理界面时整块隐藏，布局与原来完全一致（无顶部留白）。
+ * 颜色全部复用变量与现有配色（青绿 hover、关闭红），不引入新色值/外链字体。 */
+.titlebar{
+  height:40px;display:flex;align-items:center;justify-content:space-between;gap:12px;
+  padding:0 10px 0 14px;
+  background:var(--bg-1);border-bottom:1px solid var(--line);
+  position:fixed;top:0;left:0;right:0;z-index:60;user-select:none;
+}
+.titlebar-brand{display:flex;align-items:center;gap:10px;min-width:0}
+.titlebar-title{
+  font-family:var(--disp);font-weight:600;font-size:13.5px;letter-spacing:.14em;color:var(--txt-hi);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.titlebar-tag{
+  font-family:var(--mono);font-size:9.5px;letter-spacing:.16em;color:var(--txt-dim);
+  border:1px solid var(--line);border-radius:var(--r);padding:1px 6px;white-space:nowrap;
+}
+.titlebar-actions{display:flex;align-items:center;gap:4px;flex:none}
+.titlebar-btn{
+  position:relative;z-index:62;width:44px;height:28px;
+  display:flex;align-items:center;justify-content:center;
+  font-family:var(--mono);font-size:13px;color:var(--txt-dim);
+  background:transparent;border:1px solid transparent;border-radius:3px;cursor:pointer;
+  transition:background .14s,color .14s,border-color .14s;
+}
+.titlebar-btn:hover{
+  color:var(--txt-hi);
+  background:rgba(46,230,196,.10);
+  border-color:rgba(46,230,196,.35);
+}
+.titlebar-btn:active{background:rgba(46,230,196,.16)}
+#tb-close:hover{color:#fff;background:rgba(255,95,86,.85);border-color:rgba(255,95,86,.9)}
+/* 标题栏占位：顶栏与主布局整体下移 40px，shell 高度同步扣减，避免底部被裁 */
+body.has-titlebar .topbar{margin-top:40px}
+body.has-titlebar .shell{height:calc(100vh - var(--topbar-h) - 40px)}
+
+/* 边缘缩放热区：只占窗口最外 5px（角 10px），透明且只在最外圈接管鼠标；
+ * 层级低于标题栏按钮（.titlebar-btn z-index:62）、高于内容，不遮挡页面交互。 */
+#win-resize{position:fixed;inset:0;z-index:61;pointer-events:none}
+#win-resize .win-resize-zone{position:fixed;background:transparent;pointer-events:auto}
+#win-resize [data-dir="north"]{top:0;left:10px;right:10px;height:5px;cursor:n-resize}
+#win-resize [data-dir="south"]{bottom:0;left:10px;right:10px;height:5px;cursor:s-resize}
+#win-resize [data-dir="west"]{left:0;top:10px;bottom:10px;width:5px;cursor:w-resize}
+#win-resize [data-dir="east"]{right:0;top:10px;bottom:10px;width:5px;cursor:e-resize}
+#win-resize [data-dir="northWest"]{top:0;left:0;width:10px;height:10px;cursor:nw-resize}
+#win-resize [data-dir="northEast"]{top:0;right:0;width:10px;height:10px;cursor:ne-resize}
+#win-resize [data-dir="southWest"]{bottom:0;left:0;width:10px;height:10px;cursor:sw-resize}
+#win-resize [data-dir="southEast"]{bottom:0;right:0;width:10px;height:10px;cursor:se-resize}
+
 /* 状态灯 */
 .lamp{
   width:7px;height:7px;border-radius:50%;display:inline-block;flex:none;

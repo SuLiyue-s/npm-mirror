@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager};
+use tauri_runtime::ResizeDirection;
 
 use crate::state::AppState;
 use crate::{autostart, dialog, logging, node_proc, paths, tray, window, winutil};
@@ -426,10 +427,73 @@ fn dispatch(app: &AppHandle, method: &str, params: &Value) -> Result<Value, Brid
       window::hide(app);
       Ok(json!({ "ok": true }))
     }
+    // v0.0.8 无边框窗口控制（DESIGN §14.2）：由网页自绘标题栏触发
+    "window.minimize" => {
+      window::minimize(app).map_err(|err| BridgeError::new("EWINDOW", err))?;
+      Ok(json!({ "ok": true }))
+    }
+    "window.toggleMaximize" => {
+      let maximized =
+        window::toggle_maximize(app).map_err(|err| BridgeError::new("EWINDOW", err))?;
+      Ok(json!({ "maximized": maximized }))
+    }
+    "window.state" => {
+      let (maximized, visible) =
+        window::window_state(app).map_err(|err| BridgeError::new("EWINDOW", err))?;
+      Ok(json!({ "maximized": maximized, "visible": visible }))
+    }
+    "window.close" => {
+      // 走现有 CloseRequested 语义：托盘可用=隐藏，托盘不可用=优雅退出
+      window::close(app).map_err(|err| BridgeError::new("EWINDOW", err))?;
+      Ok(json!({ "ok": true }))
+    }
+    "window.startDrag" => {
+      window::start_dragging(app).map_err(|err| BridgeError::new("EWINDOW", err))?;
+      Ok(json!({ "ok": true }))
+    }
+    "window.startResize" => {
+      let raw = params
+        .get("direction")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+      if raw.is_empty() {
+        return Err(BridgeError::new(
+          "EBADPARAM",
+          "缺少 direction 参数（窗口缩放方向）",
+        ));
+      }
+      let direction = parse_resize_direction(raw).ok_or_else(|| {
+        BridgeError::new(
+          "EBADPARAM",
+          format!(
+            "未知的窗口缩放方向：{raw}（可选 north/south/east/west/northEast/northWest/southEast/southWest）"
+          ),
+        )
+      })?;
+      window::start_resize_dragging(app, direction)
+        .map_err(|err| BridgeError::new("EWINDOW", err))?;
+      Ok(json!({ "ok": true }))
+    }
     other => Err(BridgeError::new(
       "EMETHOD",
       format!("桌面桥不支持的方法：{other}"),
     )),
+  }
+}
+
+/// 自绘标题栏边缘缩放热区方向 → tauri_runtime::ResizeDirection
+fn parse_resize_direction(raw: &str) -> Option<ResizeDirection> {
+  match raw {
+    "north" => Some(ResizeDirection::North),
+    "south" => Some(ResizeDirection::South),
+    "east" => Some(ResizeDirection::East),
+    "west" => Some(ResizeDirection::West),
+    "northEast" => Some(ResizeDirection::NorthEast),
+    "northWest" => Some(ResizeDirection::NorthWest),
+    "southEast" => Some(ResizeDirection::SouthEast),
+    "southWest" => Some(ResizeDirection::SouthWest),
+    _ => None,
   }
 }
 

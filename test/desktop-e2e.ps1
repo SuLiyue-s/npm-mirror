@@ -450,6 +450,24 @@ function Test-InternalTokenGate {
   return ($r200.Status -eq 200)
 }
 
+# v0.0.8：用报告里的 internalAdminUrl 完成「令牌 → 302 → 会话 Cookie」登录，
+# 返回 @{ Ok; Base; Token; Jar } 供后续内部管理 API（如窗口动作）复用。
+function Open-InternalSession {
+  param($Report, [string]$Label = '')
+  $node = Get-Prop $Report 'node'
+  $reportUrl = [string](Get-Prop $node 'internalAdminUrl')
+  if (-not ($reportUrl -match '^http://127\.0\.0\.1:(\d+)/\?__mirror_token=([^&\s]+)$')) {
+    return [pscustomobject]@{ Ok = $false; Base = ''; Token = ''; Jar = ''; Label = $Label }
+  }
+  $port = [int]$Matches[1]
+  $token = [string]$Matches[2]
+  $base = 'http://127.0.0.1:' + $port
+  $jar = Join-Path $script:DesktopHome ('internal-session-' + $script:LaunchCount + '-' + ([guid]::NewGuid().ToString('N').Substring(0, 8)) + '.txt')
+  $login = Invoke-CurlRaw $reportUrl 'GET' $null 20 -Follow -CookieJar $jar
+  $ok = ($login.Status -eq 200)
+  return [pscustomobject]@{ Ok = $ok; Base = $base; Token = $token; Jar = $jar; Label = $Label }
+}
+
 function Test-Port {
   param([int]$Port, [int]$TimeoutMs = 500)
   $client = New-Object System.Net.Sockets.TcpClient
@@ -1187,6 +1205,34 @@ if (Test-Path $sumFile) {
   Assert-Skip 'dist\SHA256SUMS.txt 校验' '被测 exe 不在 dist 下（自定义 -ExePath），跳过校验文件检查'
 }
 
+# v0.0.8：exe 自签数字签名（sign-desktop.ps1 在写 SHA256SUMS 之前签名）。
+# 注意：不要求 Status=Valid（未导入自签证书的机器上为 UnknownError / NotTrusted 属正常），
+# 但必须能读到签名者证书（Subject 含 CN=suliyue），且交付的 codesign-suliyue.cer 与之指纹一致。
+try {
+  $sig = Get-AuthenticodeSignature $script:ExePath
+  $sigCert = $sig.SignerCertificate
+  Assert-True 'exe 带数字签名（SignerCertificate 存在，v0.0.8）' ($null -ne $sigCert) ('Status=' + $sig.Status)
+  if ($null -ne $sigCert) {
+    Assert-True 'exe 签名者 Subject 含 CN=suliyue（v0.0.8 自签证书）' ([string]$sigCert.Subject -match 'CN=suliyue') ('Subject=' + $sigCert.Subject)
+    $sigThumb = ([string]$sigCert.Thumbprint).ToUpperInvariant()
+    $cerPath = Join-Path (Split-Path -Parent $script:ExePath) 'codesign-suliyue.cer'
+    if (Test-Path $cerPath) {
+      try {
+        $cer = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($cerPath)
+        $cerThumb = ([string]$cer.Thumbprint).ToUpperInvariant()
+        Assert-True 'dist\codesign-suliyue.cer 存在且指纹与 exe 签名者一致（v0.0.8）' ($cerThumb -eq $sigThumb) ('证书指纹=' + $cerThumb + '，签名者指纹=' + $sigThumb)
+      } catch {
+        Assert-True 'dist\codesign-suliyue.cer 可被读取（v0.0.8）' $false ('读取证书失败：' + $_.Exception.Message)
+      }
+    } else {
+      Assert-True 'dist\codesign-suliyue.cer 存在（构建/签名脚本应复制公钥证书）' $false ('未找到：' + $cerPath)
+    }
+    Info ('数字签名状态：' + $sig.Status + '（未导入自签证书时 UnknownError / NotTrusted 属正常）')
+  }
+} catch {
+  Assert-Skip 'exe 数字签名验证（v0.0.8）' ('无法读取签名信息：' + $_.Exception.Message)
+}
+
 $gitCmd = Get-Command git -ErrorAction SilentlyContinue
 if ($gitCmd -and $exeInDist) {
   Push-Location $script:Root
@@ -1465,6 +1511,33 @@ try {
 }
 
 # ---------------------------------------------------------------------------
+# 阶段 0f：v0.0.8 无边框窗口 / 自绘标题栏的静态检查
+# 说明：GUI 的标题栏元素与 Rust 的 decorations(false) 无法在受限会话里用鼠标验证，
+# 这里做源码级断言（元素 id 齐全、窗口去边框），真实外观与交互由人工项 M38/M39 覆盖。
+# ---------------------------------------------------------------------------
+Section '阶段 0f：无边框窗口 / 自绘标题栏静态检查（v0.0.8）'
+$indexHtmlPath = Join-Path $script:Root 'public\index.html'
+if (Test-Path $indexHtmlPath) {
+  $indexHtml = [System.IO.File]::ReadAllText($indexHtmlPath, (New-Object System.Text.UTF8Encoding($false)))
+  Assert-True 'index.html 含自绘标题栏容器 #titlebar（v0.0.8）' ($indexHtml -match 'id="titlebar"') '未找到 id="titlebar"'
+  Assert-True 'index.html 含最小化按钮 #tb-min（v0.0.8）' ($indexHtml -match 'id="tb-min"') '未找到 id="tb-min"'
+  Assert-True 'index.html 含最大化/还原按钮 #tb-max（v0.0.8）' ($indexHtml -match 'id="tb-max"') '未找到 id="tb-max"'
+  Assert-True 'index.html 含关闭按钮 #tb-close（v0.0.8）' ($indexHtml -match 'id="tb-close"') '未找到 id="tb-close"'
+  Assert-True 'index.html 含标题栏按钮容器 .titlebar-actions（v0.0.8）' ($indexHtml -match 'titlebar-actions') '未找到 titlebar-actions'
+  Assert-True 'index.html 含无边框窗口边缘缩放热区 #win-resize（v0.0.8）' ($indexHtml -match 'id="win-resize"') '未找到 id="win-resize"'
+  Assert-True '标题栏默认隐藏（hidden 属性，仅桌面模式显示，v0.0.8）' ($indexHtml -match 'id="titlebar"[^>]*hidden') '标题栏没有初始 hidden 属性'
+} else {
+  Assert-Skip '自绘标题栏静态检查（v0.0.8）' ('未找到 public\index.html：' + $indexHtmlPath)
+}
+$windowRsPath = Join-Path $script:Root 'src-tauri\src\window.rs'
+if (Test-Path $windowRsPath) {
+  $windowRs = [System.IO.File]::ReadAllText($windowRsPath, (New-Object System.Text.UTF8Encoding($false)))
+  Assert-True 'Rust 窗口构建使用无边框模式 decorations(false)（v0.0.8）' ($windowRs -match 'decorations\s*\(\s*false\s*\)') '未找到 decorations(false)'
+} else {
+  Assert-Skip '无边框窗口静态检查（v0.0.8）' ('未找到 src-tauri\src\window.rs：' + $windowRsPath)
+}
+
+# ---------------------------------------------------------------------------
 # 阶段 1：默认配置（admin.enabled=false）
 # ---------------------------------------------------------------------------
 Section '阶段 1：首次启动（默认 admin.enabled=false，关闭窗口=隐藏）'
@@ -1602,6 +1675,49 @@ if ($rep1Ready) {
   $gate1Ok = Test-InternalTokenGate $rep1 '阶段 1'
   Assert-True '内部管理端口令牌门禁已验证（无令牌 403 / 正确令牌 302→200 / 令牌不泄露）' ($gate1Ok -eq $true)
 
+  # v0.0.8：自绘标题栏依赖的窗口动作 API（经内部管理监听 + 令牌会话调用）。
+  # 说明：沙箱内窗口可能不可见（WebView2 受限），因此状态类断言只要求接口返回结构正确；
+  # toggleMaximize 成功后会还原；非法 direction 必须返回 400 EBADPARAM；不调用 window.close（会退出程序）。
+  $sess1 = Open-InternalSession $rep1 '阶段 1'
+  if ($sess1.Ok) {
+    $stateResp = Invoke-CurlRaw ($sess1.Base + '/__admin/api/desktop/action') 'POST' @{ action = 'window.state'; params = @{} } 20 -CookieJar $sess1.Jar
+    Assert-True '令牌会话调用 window.state 返回 200（v0.0.8）' ($stateResp.Status -eq 200) ('状态=' + $stateResp.Status + '，响应=' + $stateResp.Content) 'window'
+    if ($stateResp.Status -eq 200) {
+      try {
+        $stateJson = $stateResp.Content | ConvertFrom-Json
+        $stateData = Get-Data $stateJson
+        Assert-True 'window.state 返回 maximized 布尔字段（v0.0.8）' ((Get-Prop $stateData 'maximized') -is [bool]) ('实际：' + (Get-Prop $stateData 'maximized'))
+        Assert-True 'window.state 返回 visible 布尔字段（v0.0.8）' ((Get-Prop $stateData 'visible') -is [bool]) ('实际：' + (Get-Prop $stateData 'visible'))
+      } catch {
+        Assert-True 'window.state 响应可解析为 JSON（v0.0.8）' $false ('解析失败：' + $_.Exception.Message)
+      }
+    }
+
+    $toggleResp = Invoke-CurlRaw ($sess1.Base + '/__admin/api/desktop/action') 'POST' @{ action = 'window.toggleMaximize'; params = @{} } 20 -CookieJar $sess1.Jar
+    Assert-True '令牌会话调用 window.toggleMaximize 返回 200（v0.0.8）' ($toggleResp.Status -eq 200) ('状态=' + $toggleResp.Status + '，响应=' + $toggleResp.Content) 'window'
+    if ($toggleResp.Status -eq 200) {
+      try {
+        $toggleJson = $toggleResp.Content | ConvertFrom-Json
+        $toggleData = Get-Data $toggleJson
+        $maxAfterToggle = Get-Prop $toggleData 'maximized'
+        Assert-True 'window.toggleMaximize 返回 maximized 布尔字段（v0.0.8）' ($maxAfterToggle -is [bool]) ('实际：' + $maxAfterToggle)
+        if ($maxAfterToggle -eq $true) {
+          # 还原窗口，避免影响后续阶段（失败不计失败项，仅提示）
+          $restoreResp = Invoke-CurlRaw ($sess1.Base + '/__admin/api/desktop/action') 'POST' @{ action = 'window.toggleMaximize'; params = @{} } 20 -CookieJar $sess1.Jar
+          Info ('window.toggleMaximize 已还原：状态=' + $restoreResp.Status)
+        }
+      } catch {
+        Assert-True 'window.toggleMaximize 响应可解析为 JSON（v0.0.8）' $false ('解析失败：' + $_.Exception.Message)
+      }
+    }
+
+    $resizeBadResp = Invoke-CurlRaw ($sess1.Base + '/__admin/api/desktop/action') 'POST' @{ action = 'window.startResize'; params = @{ direction = 'bogusDirection' } } 20 -CookieJar $sess1.Jar
+    Assert-True 'window.startResize 非法 direction 返回 400（v0.0.8）' ($resizeBadResp.Status -eq 400) ('状态=' + $resizeBadResp.Status + '，响应=' + $resizeBadResp.Content)
+    Assert-True 'window.startResize 非法 direction 返回错误码 EBADPARAM（v0.0.8）' ($resizeBadResp.Content -match 'EBADPARAM') ('响应=' + $resizeBadResp.Content)
+  } else {
+    Assert-Skip '窗口动作 API（window.state / toggleMaximize / startResize，v0.0.8）' ('内部令牌会话未能建立：' + $sess1.Label)
+  }
+
   # 阶段 1f：直接编辑 config.json 的 admin.enabled（模拟用户/其它工具改配置），
   # 验证 Rust 壳的 1 秒配置轮询能把「打开管理界面 / 重启管理界面」菜单项加/减
   # （带兜底轮询，阈值放宽到 ≤2s；走桥事件的正常开关路径在阶段 2e 按 ≤1s 断言）。
@@ -1673,6 +1789,16 @@ if ($rep1Ready) {
   } else {
     Assert-True '窗口正常时报告仍包含启动诊断字段 window.failureReason' ($null -ne $diagFailProp)
   }
+
+  # v0.0.8：无边框窗口与窗口最大化状态在测试报告中可见（沙箱内窗口不可见时仍应给出字段）。
+  $framelessProp = $null
+  $maximizedProp = $null
+  if ($null -ne $diagWin) {
+    $framelessProp = $diagWin.PSObject.Properties['frameless']
+    $maximizedProp = $diagWin.PSObject.Properties['maximized']
+  }
+  Assert-True '测试报告 window.frameless = true（无边框窗口，v0.0.8）' (($null -ne $framelessProp) -and ($framelessProp.Value -eq $true)) ('实际：' + $(if ($null -ne $framelessProp) { $framelessProp.Value } else { '字段缺失' }))
+  Assert-True '测试报告包含 window.maximized 布尔字段（v0.0.8）' (($null -ne $maximizedProp) -and ($maximizedProp.Value -is [bool])) ('实际：' + $(if ($null -ne $maximizedProp) { $maximizedProp.Value } else { '字段缺失' }))
 }
 
 Assert-True '默认配置下网页版管理端口不监听（admin.enabled=false）' (-not (Test-Port $AdminPort)) ('端口 ' + $AdminPort)

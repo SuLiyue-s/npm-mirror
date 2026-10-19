@@ -16,6 +16,20 @@
 <div class="fx-scan" aria-hidden="true"></div>
 <div class="fx-grain" aria-hidden="true"></div>
 
+<!-- ══════════════ 自绘标题栏（仅桌面版显示：无边框窗口的拖动/最小化/最大化/关闭） ══════════════ -->
+<header class="titlebar" id="titlebar" hidden>
+  <div class="titlebar-brand">
+    <span class="brand-mark">◧</span>
+    <span class="titlebar-title" id="titlebar-title">离月私人 npm 镜像源</span>
+    <span class="titlebar-tag">桌面版</span>
+  </div>
+  <div class="titlebar-actions">
+    <button type="button" class="titlebar-btn" id="tb-min" data-tip="最小化" aria-label="最小化">─</button>
+    <button type="button" class="titlebar-btn" id="tb-max" data-tip="最大化" aria-label="最大化">▢</button>
+    <button type="button" class="titlebar-btn" id="tb-close" data-tip="关闭窗口（程序在托盘继续运行）" aria-label="关闭窗口">✕</button>
+  </div>
+</header>
+
 <!-- ══════════════ 顶栏 ══════════════ -->
 <header class="topbar">
   <div class="brand">
@@ -683,6 +697,19 @@
 <div class="toasts" id="toasts"></div>
 <div id="modal-root"></div>
 <div id="drawer-root"></div>
+
+<!-- 无边框窗口边缘缩放热区（仅桌面版显示：边 5px、角 10px，透明不遮挡内容） -->
+<div id="win-resize" hidden aria-hidden="true">
+  <div class="win-resize-zone" data-dir="north"></div>
+  <div class="win-resize-zone" data-dir="south"></div>
+  <div class="win-resize-zone" data-dir="west"></div>
+  <div class="win-resize-zone" data-dir="east"></div>
+  <div class="win-resize-zone" data-dir="northWest"></div>
+  <div class="win-resize-zone" data-dir="northEast"></div>
+  <div class="win-resize-zone" data-dir="southWest"></div>
+  <div class="win-resize-zone" data-dir="southEast"></div>
+</div>
+
 <script src="app.js" defer></script>
 </body>
 </html>
