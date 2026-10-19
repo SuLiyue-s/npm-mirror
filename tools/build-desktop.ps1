@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
   构建「离月私人 npm 镜像源」桌面版单 exe（Tauri）。
@@ -163,6 +163,17 @@ if (Test-Path -LiteralPath $sumFile) {
 
 $cost = [math]::Round(((Get-Date) - $startAll).TotalMinutes, 1)
 Write-Host ''
+# 完整性标签检查：若当前开发/沙箱环境把项目目录标记为低完整性，dist 产物会继承 Low 标签，
+# 双击运行时会被系统降级（无法写用户配置目录、托盘图标不显示）。
+try {
+  $labelOut = (& icacls.exe $distExe 2>$null | Out-String)
+  if ($labelOut -match 'Low Mandatory') {
+    Write-Host ''
+    Write-Host '[注意] 产物继承了「低完整性(Low)」标签：直接双击会被系统降级运行（无法写用户配置目录、托盘图标不显示）。' -ForegroundColor Yellow
+    Write-Host '       修复：双击 启动桌面版.cmd（会自动请求一次 UAC），或运行 修复-桌面版启动限制.cmd。' -ForegroundColor Yellow
+    Write-Host '       每次重新编译后都需要重新修复一次。' -ForegroundColor Yellow
+  }
+} catch { }
 Write-Host '[构建成功]' -ForegroundColor Green
 Write-Host ('  产物   ：' + $distExe)
 Write-Host ('  大小   ：' + $sizeMB + ' MB')
