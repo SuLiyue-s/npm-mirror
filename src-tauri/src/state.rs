@@ -207,6 +207,24 @@ impl AppState {
     }
   }
 
+  /// 当前内部管理地址（端口 + 含令牌的完整 URL），供托盘重启后校验/冒烟报告读取。
+  pub fn internal_admin_snapshot(&self) -> Option<(u16, String)> {
+    lock(&self.node).as_ref().and_then(|node| {
+      match (node.internal_port, node.url.clone()) {
+        (Some(port), Some(url)) => Some((port, url)),
+        _ => None,
+      }
+    })
+  }
+
+  /// 托盘「重启窗口的管理界面」成功后更新内部管理端口/URL，使 smoke 报告与 app.info 读到最新值。
+  pub fn update_internal_admin(&self, port: u16, url: String) {
+    if let Some(node) = lock(&self.node).as_mut() {
+      node.internal_port = Some(port);
+      node.url = Some(url);
+    }
+  }
+
   pub fn update_web_admin(&self, enabled: bool, url: Option<String>) {
     let mut guard = lock(&self.web_admin);
     guard.enabled = enabled;

@@ -202,16 +202,49 @@ fn run(
   args: state::StartupArgs,
   integrity_status: integrity::IntegrityStatus,
 ) -> Result<(), StartupError> {
-  // 单实例：已有实例在运行时，尝试唤醒它的窗口后退出
+  // 单实例「等待-接管」：重启时旧实例正在退出，若立即退出会导致新旧都退、窗口/托盘丢失；
+  // 旧实例健康时则唤醒其窗口后退出。等待期间每 250ms 重试互斥体，最长 15 秒。
   if let single_instance::InstanceCheck::AlreadyRunning = single_instance::acquire() {
-    let activated = single_instance::activate_existing();
-    logging::info(format!("已有实例在运行：唤醒已有窗口={activated}"));
-    if let Some(path) = &args.smoke_report {
-      let payload = serde_json::json!({ "alreadyRunning": true, "activated": activated });
-      let _ = std::fs::write(path, format!("{payload}\n"));
+    let takeover = single_instance::wait_and_take_over();
+    let mode = takeover.mode.unwrap_or("takeover");
+    if takeover.acquired {
+      logging::info(format!(
+        "单实例：{}（等待 {}ms，唤醒尝试 {} 次，takeoverMode={}）",
+        if takeover.activated {
+          "旧实例正在退出，宽限期内拿到互斥体，本实例接管启动"
+        } else {
+          "旧实例已退出，接管互斥体继续启动"
+        },
+        takeover.waited_ms,
+        takeover.activation_attempts,
+        mode
+      ));
+    } else {
+      logging::info(format!(
+        "已有实例在运行：唤醒已有窗口={}，等待 {}ms，唤醒尝试 {} 次，超时={}，takeoverMode={}",
+        takeover.activated,
+        takeover.waited_ms,
+        takeover.activation_attempts,
+        takeover.timed_out,
+        mode
+      ));
+      if let Some(path) = &args.smoke_report {
+        let payload = serde_json::json!({
+          "alreadyRunning": true,
+          "activated": takeover.activated,
+          "waitedMs": takeover.waited_ms,
+          "activationAttempts": takeover.activation_attempts,
+          "timedOut": takeover.timed_out,
+          "takeoverMode": mode,
+        });
+        let _ = std::fs::write(path, format!("{payload}\n"));
+      }
+      eprintln!(
+        "已有实例在运行，已尝试唤醒其窗口（activated={}，waitedMs={}，takeoverMode={}）",
+        takeover.activated, takeover.waited_ms, mode
+      );
+      return Ok(());
     }
-    eprintln!("已有实例在运行，已尝试唤醒其窗口（activated={activated}）");
-    return Ok(());
   }
 
   // 桌面配置目录：MIRROR_DESKTOP_HOME > %LOCALAPPDATA%\LiYueNpmMirror > 程序目录 > %TEMP% > 程序目录备用。
@@ -616,4 +649,6 @@ fn print_help() {
   println!("排错参数：");
   println!("  --repair-integrity    修复实例：用提权系统 icacls 移除程序文件的低完整性（Low）标签后重启（需管理员权限；由程序内提示自动调用，勿手动使用）");
   println!("  --skip-integrity-prompt  跳过低完整性标签修复询问框（自动化测试用）");
+  println!("  --smoke-report <文件> 冒烟测试：持续写入状态 JSON（自动化测试用）");
+  println!("  --smoke-cmd <文件>    冒烟测试：读取命令文件执行窗口/托盘/退出等动作（自动化测试用）");
 }

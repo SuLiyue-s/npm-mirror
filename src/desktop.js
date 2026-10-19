@@ -79,11 +79,13 @@ class DesktopHost {
     this.bridge.close();
   }
 
-  /** 通知 Rust 服务已就绪（internalAdminPort 已绑定后调用） */
-  sendReady({ internalAdminPort, dataDir, webAdmin } = {}) {
+  /** 通知 Rust 服务已就绪（internalAdminPort 已绑定后调用）
+   *  v0.0.7：新增 internalAdminUrl（含一次性令牌的完整地址，Rust 优先用它导航）；旧字段全部保留。 */
+  sendReady({ internalAdminPort, internalAdminUrl, dataDir, webAdmin } = {}) {
     const sent = this.bridge.sendReady({
       version: this.version,
       internalAdminPort: Number(internalAdminPort) || 0,
+      internalAdminUrl: internalAdminUrl ? String(internalAdminUrl) : null,
       dataDir: dataDir || util.dataRoot(),
       pid: process.pid,
       webAdmin: {
@@ -128,6 +130,21 @@ class DesktopHost {
       this.pushConsole('info', '正在重启镜像源监听…', 'desktop');
       if (typeof ctx.restartRegistry === 'function') await ctx.restartRegistry();
       return { url: withSlash(ctx.registryUrl || '') };
+    });
+
+    /* v0.0.7：托盘/设置里「重启窗口的管理界面」：只重建内部回环监听并换新令牌，
+     * 镜像源与网页版管理监听不受影响；返回含新令牌的完整 URL（仅经桥交给外壳，不落日志/API）。 */
+    this.bridge.handle('restartWindowAdmin', async () => {
+      const ctx = c();
+      this.pushConsole('info', '正在重启窗口的管理界面…', 'desktop');
+      if (typeof ctx.restartInternalAdmin !== 'function') return { ok: false, error: '服务未就绪' };
+      try {
+        const r = await ctx.restartInternalAdmin();
+        if (!r || !r.ok) return { ok: false, error: (r && r.error) || '重启窗口的管理界面失败' };
+        return { ok: true, port: r.port, url: r.url };
+      } catch (e) {
+        return { ok: false, error: (e && (e.message || e.code)) || String(e) };
+      }
     });
 
     this.bridge.handle('showWebAdmin', async () => {

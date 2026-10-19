@@ -27,19 +27,26 @@
         - exe 可启动，镜像源服务 /-/ping 返回 200
         - admin.port 不监听（默认关闭网页版管理）
         - 桌面窗口存在（窗口标题/窗口 URL=内部回环管理端口，能加载现有管理界面）
-        - 托盘图标与菜单项：关闭网页版管理时 4 项（打开窗口 / 关闭窗口 /
-          重启镜像源服务 / 退出程序），没有「打开管理界面」「重启管理界面」
+        - 托盘图标与菜单项：关闭网页版管理时 5 项（打开窗口 / 关闭窗口 /
+          重启窗口的管理界面 / 重启镜像源服务 / 退出程序），没有「打开管理界面」「重启管理界面」
+        - 内部管理端口令牌门禁（v0.0.7）：测试报告给出 internalAdminUrl（http://127.0.0.1:
+          <端口>/?__mirror_token=…）；无令牌/错误令牌访问 /、/app.js、管理 API → 403；
+          正确令牌 → 302 + Set-Cookie(HttpOnly; SameSite=Strict) → 带 Cookie 200；
+          令牌不出现在 desktop.log、也不由 /desktop/info 暴露
         - 托盘可用性（v0.0.4）：报告含 tray.available（布尔）；注册失败时 tray.error
           含「拒绝访问 / os error 5」；restricted = home_fallback || !tray_available
-        - 完整性标签（v0.0.5）：报告 integrity 对象字段齐全（token/tokenRid/tokenSid/
+        - 完整性标签（v0.0.5 / v0.0.7）：报告 integrity 对象字段齐全（token/tokenRid/tokenSid/
           file/lowDetected/elevated/repairPrompted/repairLaunched/promptSuppressed/
-          repairResult/repairError/error/exePath）；integrity.file 与 icacls 读到的
-          dist exe 标签一致；smoke 模式不弹框（repairPrompted/repairLaunched=false，
+          repairResult/repairError/error/exePath，v0.0.7 新增 relaunchMethod/relaunchScheduled）；
+          integrity.file 与 icacls 读到的 dist exe 标签一致；smoke 模式不弹框
+          （repairPrompted/repairLaunched=false、不安排提权重启 relaunchScheduled=false，
           Low 时 promptSuppressed=true）；exe 为 Low 时进程令牌完整性也应为 Low
         - 关闭窗口行为（v0.0.4，阶段 1c-3，用 window:close 模拟 CloseRequested）：
           托盘可用 → 窗口隐藏、进程与服务继续；托盘不可用 → 程序直接退出
           （退出码 0、双端口释放、无 Node 残留；沙箱预期走此分支）
-        - 托盘菜单「打开窗口 / 关闭窗口」动作；单实例：第二个实例自动退出，原服务不受影响
+        - 托盘菜单「打开窗口 / 关闭窗口」动作；单实例（v0.0.7）：第二个实例先等待最多约 15s
+          并周期性激活已有实例，确认已有实例健康后唤醒并退出（报告 alreadyRunning=true、
+          waitedMs），原服务与原桌面进程不受影响
         - 数据目录内写出 config.json / logs
     · 阶段 1e：config.json 里写入非法 storage.dir 时服务仍能启动并回退默认 storage
     · 阶段 1g：程序配置目录回退——%LOCALAPPDATA% 不可写、未设 MIRROR_DESKTOP_HOME 时
@@ -59,12 +66,13 @@
         - service.restartRegistry 动作、autostart.get（只读）动作
         - 开机自启：当前未开启时做「开启 → 校验 HKCU\...\Run 值 → 关闭 → 校验清除」
           往返（当前已开启则只读校验，不覆盖用户已有自启配置）
-        - 托盘菜单为 6 项（多出「打开管理界面」「重启管理界面」），且菜单
-          「重启管理界面 / 重启镜像源服务」动作生效；「打开管理界面」动作可执行
-          （受限会话无法真正拉起浏览器时记 SKIP 并注明）
+        - 托盘菜单为 7 项（多出「打开管理界面」「重启管理界面」「重启窗口的管理界面」），
+          且菜单「重启管理界面 / 重启镜像源服务 / 重启窗口的管理界面」动作生效；
+          「重启窗口的管理界面」会换发新的内部管理端口与令牌（旧端口失效、新令牌门禁有效）；
+          「打开管理界面」动作可执行（受限会话无法真正拉起浏览器时记 SKIP 并注明）
         - PUT /config 拒绝路径穿越（storage.dir='..\..\evil' 返回 400）
         - PUT /config 关闭 admin.enabled 后管理端口断开、镜像源端口不受影响，
-          托盘菜单实时缩回 4 项（≤1s）
+          托盘菜单实时缩回 5 项（≤1s）
     · 阶段 3（admin.enabled=true）
         - 服务重启后控制台增量参数 after=旧 seq 不崩溃（seq 重置兼容）
         - app.quit 优雅退出：进程结束、两个监听都消失、无残留 node 进程
@@ -74,8 +82,8 @@
   窗口与托盘断言通过产品内置的测试挂钩驱动（启动参数 --smoke-report / --smoke-cmd，
   环境变量 MIRROR_DESKTOP_SMOKE=1；正常启动时挂钩完全惰性）。挂钩里的菜单 id 与
   真实托盘菜单项一一对应（tray-open / tray-hide / tray-open-webadmin /
-  tray-restart-webadmin / tray-restart-registry / tray-quit），等价于右键点击对应
-  菜单项，但不是鼠标级模拟。「打开管理界面」在受限会话里无法真正拉起系统浏览器，
+  tray-restart-webadmin / tray-restart-window-admin / tray-restart-registry / tray-quit），
+  等价于右键点击对应菜单项，但不是鼠标级模拟。「打开管理界面」在受限会话里无法真正拉起系统浏览器，
   因此只断言菜单动作被执行（命令回执）并记 SKIP 说明。
 
   不能自动化的部分（托盘左键单击的鼠标事件、窗口视觉风格、原生目录选择器对话框、
@@ -307,6 +315,139 @@ function Get-Json {
   param($Response)
   if ($null -eq $Response -or [string]::IsNullOrWhiteSpace($Response.Content)) { return $null }
   try { return ($Response.Content | ConvertFrom-Json) } catch { return $null }
+}
+
+# curl 原始请求（v0.0.7）：支持 Cookie 文件、跟随重定向、捕获响应头。
+# 用于验证内部管理端口的令牌门禁：无令牌 403、正确令牌 302 + Set-Cookie → 200。
+function Invoke-CurlRaw {
+  param(
+    [string]$Url,
+    [string]$Method = 'GET',
+    [object]$Body = $null,
+    [int]$TimeoutSec = 15,
+    [string]$CookieJar = '',
+    [switch]$Follow,
+    [switch]$CaptureHeaders
+  )
+  if (-not $script:CurlPath) {
+    # 没有 curl.exe 的兜底：退化为普通请求（无法校验响应头与 Cookie 流程）
+    return (Invoke-Api $Url $Method $Body $TimeoutSec)
+  }
+  $tmpFile = Join-Path ([System.IO.Path]::GetTempPath()) ('dsh-e2e-raw-' + [guid]::NewGuid().ToString('N') + '.txt')
+  $headerFile = Join-Path ([System.IO.Path]::GetTempPath()) ('dsh-e2e-hdr-' + [guid]::NewGuid().ToString('N') + '.txt')
+  $bodyFile = $null
+  try {
+    $curlArgs = @(
+      '-sS', '--max-time', [string]$TimeoutSec, '--connect-timeout', '5',
+      '-o', $tmpFile, '-w', '%{http_code}', '-X', $Method
+    )
+    if ($Follow) { $curlArgs += '-L' }
+    if ($CookieJar) { $curlArgs += @('-b', $CookieJar) }
+    if ($CookieJar -and $Follow) { $curlArgs += @('-c', $CookieJar) }
+    if ($CaptureHeaders) { $curlArgs += @('-D', $headerFile) }
+    if ($null -ne $Body) {
+      $jsonBody = ($Body | ConvertTo-Json -Depth 10 -Compress)
+      $bodyFile = Join-Path ([System.IO.Path]::GetTempPath()) ('dsh-e2e-rawbody-' + [guid]::NewGuid().ToString('N') + '.json')
+      [System.IO.File]::WriteAllText($bodyFile, $jsonBody, (New-Object System.Text.UTF8Encoding($false)))
+      $curlArgs += @('-H', 'Content-Type: application/json; charset=utf-8', '--data-binary', ('@' + $bodyFile))
+    }
+    $curlArgs += $Url
+    $statusText = ''
+    try {
+      $out = & $script:CurlPath @curlArgs 2>$null
+      if ($null -ne $out) { $statusText = [string](@($out)[-1]) }
+    } catch { $statusText = '' }
+    $status = 0
+    [void][int]::TryParse($statusText.Trim(), [ref]$status)
+    $content = ''
+    if (Test-Path $tmpFile) {
+      try { $content = [System.IO.File]::ReadAllText($tmpFile, (New-Object System.Text.UTF8Encoding($false))) } catch { }
+    }
+    $headersText = ''
+    if ($CaptureHeaders -and (Test-Path $headerFile)) {
+      try { $headersText = [System.IO.File]::ReadAllText($headerFile, (New-Object System.Text.UTF8Encoding($false))) } catch { }
+    }
+    return [pscustomobject]@{ Ok = ($status -ge 200 -and $status -lt 300); Status = $status; Content = $content; Headers = $headersText; Error = $null }
+  } finally {
+    try { Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue } catch { }
+    try { Remove-Item $headerFile -Force -ErrorAction SilentlyContinue } catch { }
+    if ($bodyFile) { try { Remove-Item $bodyFile -Force -ErrorAction SilentlyContinue } catch { } }
+  }
+}
+
+# v0.0.7 内部管理端口令牌门禁验证：
+#   · 无令牌 / 错误令牌访问「窗口用的内部回环端口」→ 403 中文提示；
+#   · 正确令牌 → 302 + Set-Cookie(HttpOnly; SameSite=Strict) → 带 Cookie 访问 200；
+#   · 令牌不出现在 desktop.log，也不由 /desktop/info 暴露。
+# 返回是否成功建立带 Cookie 的会话（供后续断言）。
+function Test-InternalTokenGate {
+  param($Report, [string]$Label = '')
+  $suffix = ''
+  if ($Label) { $suffix = '（' + $Label + '）' }
+  $node = Get-Prop $Report 'node'
+  $reportUrl = [string](Get-Prop $node 'internalAdminUrl')
+  $reportPort = [int](Get-Prop $node 'internalAdminPort')
+  Assert-True ('测试报告包含内部管理端口 internalAdminPort（>0）' + $suffix) ($reportPort -gt 0) ('实际：' + $reportPort)
+  Assert-True ('测试报告包含内部令牌地址 internalAdminUrl（http://127.0.0.1:<端口>/?__mirror_token=…）' + $suffix) ($reportUrl -match '^http://127\.0\.0\.1:\d+/\?__mirror_token=[^&\s]{8,}$') ('实际：' + $reportUrl)
+  if (-not ($reportUrl -match '^http://127\.0\.0\.1:(\d+)/\?__mirror_token=([^&\s]+)$')) { return $false }
+  $port = [int]$Matches[1]
+  $token = [string]$Matches[2]
+  Assert-True ('internalAdminUrl 的端口与 internalAdminPort 一致' + $suffix) ($port -eq $reportPort) ('URL 端口=' + $port + '，报告端口=' + $reportPort)
+  $base = 'http://127.0.0.1:' + $port
+  Assert-True ('内部管理端口正在监听（' + $port + '）' + $suffix) (Test-Port $port)
+  $jar = Join-Path $script:DesktopHome ('internal-cookies-' + $script:LaunchCount + '-' + ([guid]::NewGuid().ToString('N').Substring(0, 8)) + '.txt')
+
+  # 1) 无令牌访问 → 403（页面、静态资源、管理 API 都受门禁保护）
+  $rRoot = Invoke-CurlRaw ($base + '/') 'GET' $null 15
+  Assert-True ('无令牌直接访问内部端口 GET / 被拒绝（403）' + $suffix) ($rRoot.Status -eq 403) ('状态=' + $rRoot.Status + '，响应=' + $rRoot.Content)
+  if ($rRoot.Status -eq 403) {
+    Assert-True ('内部端口 403 响应包含中文提示' + $suffix) ($rRoot.Content -match '令牌|token|禁止|访问|403' -or $rRoot.Content.Length -gt 0) ('响应=' + $rRoot.Content)
+  }
+  $rApp = Invoke-CurlRaw ($base + '/app.js') 'GET' $null 15
+  Assert-True ('无令牌访问内部端口静态资源 /app.js 被拒绝（403）' + $suffix) ($rApp.Status -eq 403) ('状态=' + $rApp.Status)
+  $rSess = Invoke-CurlRaw ($base + '/__admin/api/session') 'GET' $null 15
+  Assert-True ('无令牌访问内部端口管理 API /__admin/api/session 被拒绝（403）' + $suffix) ($rSess.Status -eq 403) ('状态=' + $rSess.Status)
+
+  # 2) 错误令牌 → 403
+  $rWrong = Invoke-CurlRaw ($base + '/?__mirror_token=wrong-token-value-0000000000') 'GET' $null 15
+  Assert-True ('错误令牌访问内部端口被拒绝（403）' + $suffix) ($rWrong.Status -eq 403) ('状态=' + $rWrong.Status)
+
+  # 3) 正确令牌 → 302 + Set-Cookie(HttpOnly; SameSite=Strict)
+  $r302 = Invoke-CurlRaw $reportUrl 'GET' $null 15 -CaptureHeaders
+  Assert-True ('正确令牌访问内部端口返回 302 跳转（换发会话 Cookie）' + $suffix) ($r302.Status -eq 302) ('状态=' + $r302.Status + '，响应头=' + $r302.Headers)
+  if ($r302.Status -eq 302) {
+    Assert-True ('302 响应包含 Set-Cookie 响应头' + $suffix) ($r302.Headers -match '(?i)set-cookie:') ('响应头=' + $r302.Headers)
+    Assert-True ('会话 Cookie 带 HttpOnly 属性' + $suffix) ($r302.Headers -match '(?i)set-cookie:.*httponly') ('响应头=' + $r302.Headers)
+    Assert-True ('会话 Cookie 带 SameSite=Strict 属性' + $suffix) ($r302.Headers -match '(?i)samesite=strict') ('响应头=' + $r302.Headers)
+    Assert-True ('302 响应带 Location 跳转地址（不把令牌留在地址栏）' + $suffix) ($r302.Headers -match '(?i)location:') ('响应头=' + $r302.Headers)
+  }
+
+  # 4) 跟随跳转并保存 Cookie → 200 + 现有管理界面 HTML
+  $r200 = Invoke-CurlRaw $reportUrl 'GET' $null 20 -Follow -CookieJar $jar
+  Assert-True ('带正确令牌跳转后返回现有管理界面（200 + HTML）' + $suffix) ($r200.Status -eq 200 -and $r200.Content -match '(?i)<!doctype html|<html|app\.js') ('状态=' + $r200.Status)
+  # 5) 带 Cookie 访问页面与内部管理 API → 200
+  $rCookiePage = Invoke-CurlRaw ($base + '/') 'GET' $null 15 -CookieJar $jar
+  Assert-True ('携带会话 Cookie 访问内部端口返回 200' + $suffix) ($rCookiePage.Status -eq 200) ('状态=' + $rCookiePage.Status)
+  $rInfo = Invoke-CurlRaw ($base + '/__admin/api/desktop/info') 'GET' $null 15 -CookieJar $jar
+  $infoText = [string]$rInfo.Content
+  Assert-True ('携带会话 Cookie 调用内部管理 API 返回 200' + $suffix) ($rInfo.Status -eq 200) ('状态=' + $rInfo.Status)
+  if ($rInfo.Status -eq 200) {
+    Assert-True ('内部管理 API 返回 desktop=true（窗口与 API 同源）' + $suffix) ($infoText -match '"desktop"\s*:\s*true') ('响应=' + $infoText.Substring(0, [Math]::Min(200, $infoText.Length)))
+    Assert-True ('/desktop/info 不暴露内部访问令牌' + $suffix) (-not ($infoText.Contains($token))) '响应中出现了令牌明文'
+  }
+  $rInfoNo = Invoke-CurlRaw ($base + '/__admin/api/desktop/info') 'GET' $null 15
+  Assert-True ('无 Cookie 调用内部管理 API 被拒绝（403）' + $suffix) ($rInfoNo.Status -eq 403) ('状态=' + $rInfoNo.Status)
+
+  # 6) 令牌不落桌面日志
+  $logPath = Get-DesktopLogPath
+  if (Test-Path $logPath) {
+    $logText = ''
+    try { $logText = [System.IO.File]::ReadAllText($logPath, (New-Object System.Text.UTF8Encoding($false))) } catch { }
+    Assert-True ('内部访问令牌不出现在 desktop.log' + $suffix) (-not ($logText.Contains($token))) ('令牌在日志中出现过：' + $logPath)
+  } else {
+    Assert-Skip ('内部访问令牌不出现在 desktop.log' + $suffix) ('未找到 desktop.log：' + $logPath)
+  }
+  return ($r200.Status -eq 200)
 }
 
 function Test-Port {
@@ -1132,6 +1273,11 @@ try {
   New-Item -ItemType Directory -Path $repairDir -Force | Out-Null
   Copy-Item -Path $script:ExePath -Destination $repairExe -Force
   $repairExit = $null
+  # v0.0.7：修复后的重启由「提权 cmd 助手」完成；smoke 只读入口不应在 %TEMP% 留下助手批处理文件。
+  $tempCmdBefore = @{}
+  try {
+    Get-ChildItem -Path $env:TEMP -Filter '*.cmd' -File -ErrorAction SilentlyContinue | ForEach-Object { $tempCmdBefore[$_.FullName] = $_.LastWriteTimeUtc.Ticks }
+  } catch { }
   $oldSmoke = $env:MIRROR_DESKTOP_SMOKE
   $env:MIRROR_DESKTOP_SMOKE = '1'
   try {
@@ -1151,6 +1297,15 @@ try {
     if ($null -eq $oldSmoke) { Remove-Item Env:MIRROR_DESKTOP_SMOKE -ErrorAction SilentlyContinue } else { $env:MIRROR_DESKTOP_SMOKE = $oldSmoke }
   }
   $repairRep = $null
+  # v0.0.7：检查 %TEMP% 是否残留带 icacls 的助手批处理（smoke 只读入口不应产生）
+  try {
+    $newTempCmd = @(Get-ChildItem -Path $env:TEMP -Filter '*.cmd' -File -ErrorAction SilentlyContinue | Where-Object {
+      -not $tempCmdBefore.ContainsKey($_.FullName) -and ((Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue) -match 'icacls')
+    })
+    Assert-True 'smoke 修复入口未在 %TEMP% 遗留 icacls 助手批处理（v0.0.7）' ($newTempCmd.Count -eq 0) ('新增：' + (($newTempCmd | ForEach-Object { $_.Name }) -join ','))
+  } catch {
+    Assert-Skip '%TEMP% 助手批处理清理检查' ('无法读取 %TEMP%：' + $_.Exception.Message)
+  }
   if (Test-Path $repairReport) {
     try { $repairRep = Get-Content $repairReport -Raw -Encoding UTF8 | ConvertFrom-Json } catch { }
   }
@@ -1170,6 +1325,15 @@ try {
         Assert-True '已提权时修复入口报告修复结果（repairResult 非空）' ($repairResultText.Length -gt 0) ('实际：' + $repairResultText)
       }
       Assert-True '修复入口报告 elevated 与退出码语义一致' ((($repairElevated -eq $true) -and ($repairExit -eq 0)) -or (($repairElevated -ne $true) -and ($repairExit -eq 3))) ('elevated=' + $repairElevated + '，exitCode=' + $repairExit)
+      # v0.0.7：修复后的重启改为提权 cmd 助手（icacls 修复 → 约 2s → explorer 非提权拉起），
+      # 报告新增 relaunchMethod / relaunchScheduled；smoke 模式下不应真的安排重启。
+      $repairRelaunchMethodProp = $repairInteg.PSObject.Properties['relaunchMethod']
+      Assert-True '修复入口报告包含重启方式字段 relaunchMethod（v0.0.7）' ($null -ne $repairRelaunchMethodProp) ('实际字段：' + (($repairInteg.PSObject.Properties | ForEach-Object { $_.Name }) -join ','))
+      $repairRelaunchSchedProp = $repairInteg.PSObject.Properties['relaunchScheduled']
+      Assert-True '修复入口报告包含重启计划字段 relaunchScheduled（布尔，v0.0.7）' (($null -ne $repairRelaunchSchedProp) -and ($repairRelaunchSchedProp.Value -is [bool])) ('实际：' + (Get-Prop $repairInteg 'relaunchScheduled'))
+      if ($null -ne $repairRelaunchSchedProp) {
+        Assert-True 'smoke 修复入口不真的重启程序（relaunchScheduled=false）' ($repairRelaunchSchedProp.Value -eq $false) ('实际：' + $repairRelaunchSchedProp.Value)
+      }
     }
   } else {
     Assert-True '修复入口报告已生成（--smoke-report）' $false ('未找到 ' + $repairReport)
@@ -1285,9 +1449,9 @@ try {
   $integ0e = Get-Prop $rep0e 'integrity'
   Assert-True '普通目录副本报告包含 integrity 对象' ($null -ne $integ0e)
   if ($null -ne $integ0e) {
-    $integFields0e = @('token', 'tokenRid', 'file', 'lowDetected', 'elevated', 'promptSuppressed', 'exePath')
+    $integFields0e = @('token', 'tokenRid', 'file', 'lowDetected', 'elevated', 'promptSuppressed', 'exePath', 'relaunchMethod', 'relaunchScheduled')
     $missing0e = @($integFields0e | Where-Object { $null -eq $integ0e.PSObject.Properties[$_] })
-    Assert-True '普通目录副本 integrity 字段齐全（token/tokenRid/file/lowDetected/elevated/promptSuppressed/exePath）' ($missing0e.Count -eq 0) ('缺少：' + ($missing0e -join ', '))
+    Assert-True '普通目录副本 integrity 字段齐全（token/tokenRid/file/lowDetected/elevated/promptSuppressed/exePath/relaunchMethod/relaunchScheduled）' ($missing0e.Count -eq 0) ('缺少：' + ($missing0e -join ', '))
     Assert-True '普通目录副本 integrity.exePath 指向副本 exe' ((Normalize-Path ([string](Get-Prop $integ0e 'exePath'))) -eq (Normalize-Path $copyExe)) ('实际：' + (Get-Prop $integ0e 'exePath'))
     Assert-True '普通目录副本 smoke 模式不弹修复询问框（promptSuppressed=true）' ((Get-Prop $integ0e 'promptSuppressed') -eq $true) ('实际：' + (Get-Prop $integ0e 'promptSuppressed'))
   }
@@ -1341,9 +1505,10 @@ if ($rep1Ready) {
   $tray1 = Get-Prop $rep1 'tray'
   Assert-True '托盘图标已创建（id=main-tray）' ((Get-Prop $tray1 'id') -eq 'main-tray') ('实际 ' + (Get-Prop $tray1 'id'))
   $trayLabels1 = @(Get-Prop $tray1 'labels')
-  $needLabels = @('打开窗口', '关闭窗口', '重启镜像源服务', '退出程序')
+  # v0.0.7：托盘默认 5 项（新增「重启窗口的管理界面」——重启窗口用的内部管理界面/端口与令牌）
+  $needLabels = @('打开窗口', '关闭窗口', '重启窗口的管理界面', '重启镜像源服务', '退出程序')
   $missing1 = @($needLabels | Where-Object { -not ($trayLabels1 -contains $_) })
-  Assert-True '默认托盘菜单包含 4 项「打开窗口 / 关闭窗口 / 重启镜像源服务 / 退出程序」' (($missing1.Count -eq 0) -and ($trayLabels1.Count -eq 4)) ('实际菜单（' + $trayLabels1.Count + ' 项）：' + ($trayLabels1 -join ' / ') + '；缺少：' + ($missing1 -join '、'))
+  Assert-True '默认托盘菜单包含 5 项「打开窗口 / 关闭窗口 / 重启窗口的管理界面 / 重启镜像源服务 / 退出程序」' (($missing1.Count -eq 0) -and ($trayLabels1.Count -eq 5)) ('实际菜单（' + $trayLabels1.Count + ' 项）：' + ($trayLabels1 -join ' / ') + '；缺少：' + ($missing1 -join '、'))
   Assert-True '默认关闭网页版管理时托盘菜单不含「打开管理界面」' (-not ($trayLabels1 -contains '打开管理界面')) ('实际菜单：' + ($trayLabels1 -join ' / '))
   Assert-True '默认关闭网页版管理时托盘菜单不含「重启管理界面」' (-not ($trayLabels1 -contains '重启管理界面')) ('实际菜单：' + ($trayLabels1 -join ' / '))
 
@@ -1421,7 +1586,21 @@ if ($rep1Ready) {
       $integSuppressed1 = Get-Prop $integ1 'promptSuppressed'
       Assert-True '检测到 Low 且 smoke 不弹框时给出抑制标记（promptSuppressed=true）' ($integSuppressed1 -eq $true) ('实际：' + $integSuppressed1)
     }
+    # v0.0.7：低完整性修复后的重启改为「提权 cmd 助手」执行（icacls 修标签→约 2s→explorer 非提权拉起），
+    # 报告新增 relaunchMethod / relaunchScheduled 字段；smoke 模式不安排重启。
+    $integRelaunchMethodProp = $integ1.PSObject.Properties['relaunchMethod']
+    Assert-True 'integrity 对象包含重启方式字段 relaunchMethod（v0.0.7）' ($null -ne $integRelaunchMethodProp) ('实际字段：' + (($integ1.PSObject.Properties | ForEach-Object { $_.Name }) -join ','))
+    $integRelaunchSchedProp = $integ1.PSObject.Properties['relaunchScheduled']
+    Assert-True 'integrity 对象包含重启计划字段 relaunchScheduled（布尔，v0.0.7）' (($null -ne $integRelaunchSchedProp) -and ($integRelaunchSchedProp.Value -is [bool])) ('实际：' + (Get-Prop $integ1 'relaunchScheduled'))
+    if ($null -ne $integRelaunchSchedProp) {
+      Assert-True 'smoke 模式不安排提权重启（relaunchScheduled=false）' ($integRelaunchSchedProp.Value -eq $false) ('实际：' + $integRelaunchSchedProp.Value)
+    }
   }
+
+  # v0.0.7：内部管理端口（窗口 GUI 使用的 127.0.0.1 随机端口）加了每次启动的随机令牌门禁。
+  # 无令牌 → 403；正确令牌 → 302 + HttpOnly/SameSite=Strict Cookie → 200；令牌不落日志、不经 /desktop/info 暴露。
+  $gate1Ok = Test-InternalTokenGate $rep1 '阶段 1'
+  Assert-True '内部管理端口令牌门禁已验证（无令牌 403 / 正确令牌 302→200 / 令牌不泄露）' ($gate1Ok -eq $true)
 
   # 阶段 1f：直接编辑 config.json 的 admin.enabled（模拟用户/其它工具改配置），
   # 验证 Rust 壳的 1 秒配置轮询能把「打开管理界面 / 重启管理界面」菜单项加/减
@@ -1475,13 +1654,13 @@ if ($rep1Ready) {
   $winUrl1 = [string](Get-Prop $win1Nav 'url')
   $internalPort1 = [int](Get-Prop (Get-Prop $rep1 'node') 'internalAdminPort')
   Assert-True '窗口已导航到内部回环管理端口（127.0.0.1 随机端口）' ($winUrl1 -match '^http://127\.0\.0\.1:\d+/') ('实际 ' + $winUrl1) 'window'
-  Assert-True '窗口 URL 的端口 = 内部管理端口' ($winUrl1 -match (':(' + $internalPort1 + ')/$')) ('URL=' + $winUrl1 + '，内部端口=' + $internalPort1) 'window'
-  if ($winUrl1.Length -gt 0) {
-    $internalPage = Invoke-Api $winUrl1 'GET' $null 15
-    Assert-True '窗口加载的现有管理界面可访问（GET 内部管理地址 200 + HTML）' ($internalPage.Status -eq 200 -and $internalPage.Content -match '(?i)<!doctype html|<html|app\.js') ('状态=' + $internalPage.Status) 'window'
-  } else {
-    Assert-True '窗口加载的现有管理界面可访问（GET 内部管理地址 200 + HTML）' $false '窗口 URL 为空，窗口尚未导航（见上方失败明细）' 'window'
-  }
+  Assert-True '窗口 URL 的端口 = 内部管理端口' ($winUrl1 -match (':(' + $internalPort1 + ')')) ('URL=' + $winUrl1 + '，内部端口=' + $internalPort1) 'window'
+  # v0.0.7：窗口由 Rust 壳用 ready 消息里的 internalAdminUrl（带 __mirror_token）打开，
+  # 因此窗口地址应与报告中的 internalAdminUrl 完全一致（沙箱内 WebView2 取不到 URL 时归窗口类环境限制）。
+  $reportInternalUrl1 = [string](Get-Prop (Get-Prop $rep1 'node') 'internalAdminUrl')
+  Assert-True '窗口 URL = 报告 internalAdminUrl（带内部访问令牌）' (($winUrl1.Length -gt 0) -and ($winUrl1 -eq $reportInternalUrl1)) ('窗口 URL=' + $winUrl1 + '，报告 internalAdminUrl=' + $reportInternalUrl1) 'window'
+  # 窗口实际加载的页面内容已由 Test-InternalTokenGate 用令牌流程验证（302→Cookie→200+HTML），
+  # 这里不再直接用无令牌 GET 断言 200（v0.0.7 起内部端口无令牌一律 403）。
 
   # v0.0.3 启动诊断：窗口初始化失败时必须能看到可读原因（window.failureReason），
   # 而不是只留下一个「进程在跑但看不到窗口」的黑盒状态。
@@ -1515,18 +1694,47 @@ Assert-True '桌面进程存活' (-not $p1.HasExited)
 Assert-True '数据目录内已写出 config.json' (Test-Path (Join-Path $script:DataDir 'config.json'))
 Assert-True '数据目录内已创建 logs 目录（旧值 data/storage 迁移解析正常）' (Test-Path (Join-Path $script:DataDir 'logs'))
 
-# 单实例：再启动一个实例应自动退出，原服务不受影响
-Section '阶段 1b：单实例行为'
+# 单实例：再启动一个实例应唤醒已有实例并自动退出，原服务不受影响
+# v0.0.7：第二实例会先等待最多约 15s（周期性激活旧窗口），旧实例退出则接管；健康实例存在时唤醒并退出，
+# 报告保留 alreadyRunning 并新增 waitedMs。
+Section '阶段 1b：单实例行为（v0.0.7：等待/唤醒后退出）'
 $primaryReport = $script:SmokeReportPath
 $primaryCmd = $script:SmokeCmdPath
 $p2 = Start-DesktopApp
-Info ('已启动第二个实例 PID=' + $p2.Id + '，等待其自动退出…')
-$secondExited = Wait-Until { $p2.HasExited } 25 400
-Assert-True '第二个实例自动退出（单实例互斥）' $secondExited
+$secondReport = $script:SmokeReportPath
+Info ('已启动第二个实例 PID=' + $p2.Id + '，等待其唤醒已有实例后退出…')
+$secondExited = Wait-Until { $p2.HasExited } 30 400
+Assert-True '第二个实例自动退出（单实例互斥/唤醒已有实例后退出）' $secondExited
 if (-not $secondExited) {
   try { Stop-Process -Id $p2.Id -Force -ErrorAction SilentlyContinue } catch { }
 }
+$secondRep = $null
+if (Test-Path $secondReport) {
+  try { $secondRep = Get-Content $secondReport -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $secondRep = $null }
+}
+if ($null -ne $secondRep) {
+  Assert-True '第二实例报告 alreadyRunning=true（识别到已有实例）' ((Get-Prop $secondRep 'alreadyRunning') -eq $true) ('实际：' + (Get-Prop $secondRep 'alreadyRunning'))
+  $waitedProp = $secondRep.PSObject.Properties['waitedMs']
+  Assert-True '第二实例报告包含等待时长 waitedMs（v0.0.7）' (($null -ne $waitedProp) -and ($waitedProp.Value -is [ValueType])) ('实际：' + (Get-Prop $secondRep 'waitedMs') + '；报告字段：' + (($secondRep.PSObject.Properties | ForEach-Object { $_.Name }) -join ','))
+  if ($null -ne $waitedProp) {
+    Assert-True 'waitedMs 为不小于 0 的毫秒数' ([double]$waitedProp.Value -ge 0) ('实际：' + $waitedProp.Value)
+  }
+  $secondExitCode = $null
+  try { $secondExitCode = $p2.ExitCode } catch { }
+  Assert-True '第二实例为正常退出（退出码 0）' ($secondExitCode -eq 0) ('实际退出码：' + $secondExitCode)
+} else {
+  Assert-Skip '第二实例报告 alreadyRunning / waitedMs' ('第二实例未写出可读报告：' + $secondReport)
+}
 Assert-True '第二个实例退出后原服务仍在线' (Test-Ping $RegistryPort)
+Assert-True '第二个实例退出后原桌面进程仍存活' (-not $p1.HasExited)
+# v0.0.7：单实例等待/接管后不允许出现两个桌面进程并存
+$aliveOtherApps = @()
+foreach ($apid in @($script:TrackedAppPids | Select-Object -Unique)) {
+  if ($apid -eq $p1.Id) { continue }
+  $ap = Get-Process -Id $apid -ErrorAction SilentlyContinue
+  if ($null -ne $ap) { $aliveOtherApps += $apid }
+}
+Assert-True '第二实例退出后不存在其它桌面进程并存（单实例约束）' ($aliveOtherApps.Count -eq 0) ('仍在运行的非首实例 PID：' + ($aliveOtherApps -join ','))
 # 第二个实例用了自己的报告/命令文件（smoke-report-2 / smoke-cmd-2），已随进程退出；
 # 把冒烟报告/命令路径恢复指向第一个（主）实例，后续托盘菜单动作才发给仍在运行的实例。
 $script:AppProc = $p1
@@ -1835,12 +2043,20 @@ Assert-True ('webAdmin.port = ' + $AdminPort) ((Get-Prop $webAdmin 'port') -eq $
 $internal = Get-Prop $info 'internal'
 $internalPort = [int](Get-Prop $internal 'port')
 Assert-True 'internal.port 已分配（内部回环管理端口随机端口）' ($internalPort -gt 0) ('实际 ' + $internalPort)
-# 窗口实际加载的就是这个内部回环地址（Rust 壳在 Node ready 后导航到它）。
-# 直接 HTTP 访问该地址，验证「窗口=现有管理界面」的页面内容（不依赖 WebView2 是否可渲染，
-# 沙箱内窗口渲染受限时仍能证明被导航的 URL 返回的是现有管理界面）。
-$internalUrl = 'http://127.0.0.1:' + $internalPort + '/'
-$internalPageResp = Invoke-Api $internalUrl 'GET' $null 15
-Assert-True '内部回环管理端口返回现有管理界面（GET 200 + HTML）' ($internalPageResp.Status -eq 200 -and $internalPageResp.Content -match '(?i)<!doctype html|<html|app\.js') ('状态=' + $internalPageResp.Status + '，URL=' + $internalUrl)
+Assert-True '/desktop/info 不暴露内部管理端口访问令牌' (-not ($infoResp.Content -match '__mirror_token')) '响应中出现了 __mirror_token 字样'
+# v0.0.7：窗口用的内部回环端口有每次启动的随机令牌门禁，不能再用「无令牌 GET 200」验证；
+# 改为从测试报告取带令牌的 internalAdminUrl，走 302→Set-Cookie→200 的完整流程验证
+# 「窗口=现有管理界面」（页面内容不依赖 WebView2 是否可渲染）。
+$rep2Gate = Wait-SmokeReport {
+  param($r)
+  $u = [string](Get-Prop (Get-Prop $r 'node') 'internalAdminUrl')
+  return ([bool](Get-Prop (Get-Prop $r 'node') 'ready') -and $u.Length -gt 0)
+} 90 400
+Assert-True '阶段 2 测试报告包含内部令牌地址 internalAdminUrl（v0.0.7）' ($null -ne $rep2Gate) '90 秒内报告未包含 internalAdminUrl'
+if ($null -ne $rep2Gate) {
+  $gate2Ok = Test-InternalTokenGate $rep2Gate '阶段 2'
+  Assert-True '阶段 2 内部管理端口令牌门禁有效（无令牌 403 / 正确令牌 302→200）' ($gate2Ok -eq $true)
+}
 Assert-True 'productName 包含「镜像源」' ([string](Get-Prop $info 'productName') -like '*镜像源*') ('实际 ' + (Get-Prop $info 'productName'))
 $nodePid = [int](Get-Prop $info 'pid')
 Assert-True 'desktop/info 返回 Node 子进程 PID' ($nodePid -gt 0) ('实际 ' + $nodePid)
@@ -1971,9 +2187,10 @@ $trayLabels2 = @()
 if ($null -ne $rep2) { $trayLabels2 = @(Get-Prop (Get-Prop $rep2 'tray') 'labels') }
 Assert-True '开启网页版管理后托盘菜单出现「打开管理界面」' ($trayLabels2 -contains '打开管理界面') ('实际菜单：' + ($trayLabels2 -join ' / '))
 Assert-True '开启网页版管理后托盘菜单出现「重启管理界面」' ($trayLabels2 -contains '重启管理界面') ('实际菜单：' + ($trayLabels2 -join ' / '))
-$needLabels2 = @('打开窗口', '关闭窗口', '打开管理界面', '重启管理界面', '重启镜像源服务', '退出程序')
+$needLabels2 = @('打开窗口', '关闭窗口', '打开管理界面', '重启管理界面', '重启窗口的管理界面', '重启镜像源服务', '退出程序')
 $missing2 = @($needLabels2 | Where-Object { -not ($trayLabels2 -contains $_) })
-Assert-True '开启网页版管理后托盘菜单项齐全（6 项）' (($missing2.Count -eq 0) -and ($trayLabels2.Count -eq 6)) ('实际菜单（' + $trayLabels2.Count + ' 项）：' + ($trayLabels2 -join ' / ') + '；缺少：' + ($missing2 -join '、'))
+Assert-True '开启网页版管理后托盘菜单项齐全（7 项）' (($missing2.Count -eq 0) -and ($trayLabels2.Count -eq 7)) ('实际菜单（' + $trayLabels2.Count + ' 项）：' + ($trayLabels2 -join ' / ') + '；缺少：' + ($missing2 -join '、'))
+Assert-True '开启网页版管理后托盘菜单包含「重启窗口的管理界面」（v0.0.7）' ($trayLabels2 -contains '重启窗口的管理界面') ('实际菜单：' + ($trayLabels2 -join ' / '))
 if ($null -ne $rep2) {
   $repWebAdmin = Get-Prop $rep2 'webAdmin'
   Assert-True '桌面壳报告 webAdmin.enabled=true（与 /desktop/info 一致）' ((Get-Prop $repWebAdmin 'enabled') -eq $true) ('报告 webAdmin=' + ($repWebAdmin | ConvertTo-Json -Compress))
@@ -1999,6 +2216,51 @@ Assert-True '托盘重启管理界面后网页版管理端口恢复可访问' $w
 Assert-True '托盘重启管理界面后镜像源服务不受影响（/-/ping 200）' (Test-Ping $RegistryPort)
 $infoAfter = Get-Data (Get-Json (Invoke-Api ($api + '/desktop/info') 'GET' $null 15))
 Assert-True '托盘重启管理界面后 webAdmin.enabled 仍为 true' ((Get-Prop (Get-Prop $infoAfter 'webAdmin') 'enabled') -eq $true)
+
+# 托盘菜单「重启窗口的管理界面」（v0.0.7）：只重启窗口使用的内部管理界面/端口并换发新令牌，
+# 镜像源与网页版管理不受影响；旧内部端口失效，新 internalAdminUrl 仍可通过令牌门禁访问。
+$repRwaBefore = Wait-SmokeReport {
+  param($r)
+  $u = [string](Get-Prop (Get-Prop $r 'node') 'internalAdminUrl')
+  return ($u.Length -gt 0)
+} 20 300
+$oldInternalUrl = [string](Get-Prop (Get-Prop $repRwaBefore 'node') 'internalAdminUrl')
+$oldInternalPort = [int](Get-Prop (Get-Prop $repRwaBefore 'node') 'internalAdminPort')
+$rwaReport = Send-SmokeCommand 'menu:tray-restart-window-admin' 30
+$rwaCmd = @()
+if ($null -ne $rwaReport) {
+  $rwaCmd = @(@(Get-Prop $rwaReport 'commands') | Where-Object { (Get-Prop $_ 'command') -eq 'menu:tray-restart-window-admin' })
+}
+Assert-True '托盘菜单「重启窗口的管理界面」动作被执行（命令回执 ok）' ($rwaCmd.Count -gt 0 -and (Get-Prop $rwaCmd[0] 'ok') -eq $true) ('回执：' + ($rwaCmd | ConvertTo-Json -Compress))
+$repRwaAfter = Wait-SmokeReport {
+  param($r)
+  $u = [string](Get-Prop (Get-Prop $r 'node') 'internalAdminUrl')
+  return ($u.Length -gt 0 -and $u -ne $oldInternalUrl)
+} 40 400
+$newInternalUrl = ''
+$newInternalPort = 0
+if ($null -ne $repRwaAfter) {
+  $newInternalUrl = [string](Get-Prop (Get-Prop $repRwaAfter 'node') 'internalAdminUrl')
+  $newInternalPort = [int](Get-Prop (Get-Prop $repRwaAfter 'node') 'internalAdminPort')
+  Assert-True '重启窗口管理界面后报告给出新的内部令牌地址（与旧地址不同）' ($newInternalUrl -ne $oldInternalUrl) ('旧=' + $oldInternalUrl + '，新=' + $newInternalUrl)
+  Assert-True '重启窗口管理界面后内部管理端口已更换' ($newInternalPort -ne $oldInternalPort) ('旧端口=' + $oldInternalPort + '，新端口=' + $newInternalPort)
+  if ($oldInternalPort -gt 0) {
+    $oldPortClosed = Wait-Until { -not (Test-Port $oldInternalPort) } 15 300
+    Assert-True '重启后旧内部管理端口不再监听（未泄露旧入口）' $oldPortClosed ('旧端口 ' + $oldInternalPort)
+  }
+  Assert-True '重启后新内部管理端口正在监听' (Test-Port $newInternalPort) ('新端口 ' + $newInternalPort)
+  $gateRwaOk = Test-InternalTokenGate $repRwaAfter '重启窗口的管理界面'
+  Assert-True '重启窗口的管理界面后新令牌门禁有效（无令牌 403 / 新令牌 302→200）' ($gateRwaOk -eq $true)
+  $repRwaWin = Get-Prop $repRwaAfter 'window'
+  $rwaWinUrl = [string](Get-Prop $repRwaWin 'url')
+  Assert-True '重启窗口的管理界面后主窗口 URL 指向新的内部令牌地址' (($rwaWinUrl.Length -gt 0) -and ($rwaWinUrl -eq $newInternalUrl)) ('窗口 URL=' + $rwaWinUrl + '，新地址=' + $newInternalUrl) 'window'
+} else {
+  Assert-True '重启窗口的管理界面后报告给出新的内部令牌地址（与旧地址不同）' $false ('40 秒内未观察到 internalAdminUrl 变化；旧=' + $oldInternalUrl)
+  Assert-Skip '重启窗口的管理界面后新令牌门禁验证' '未观察到新的 internalAdminUrl，无法继续验证'
+}
+Assert-True '重启窗口管理界面后桌面进程仍存活' (-not $p2run.HasExited)
+Assert-True '重启窗口管理界面后镜像源服务不受影响（/-/ping 200）' (Test-Ping $RegistryPort)
+Assert-True '重启窗口管理界面后网页版管理仍可访问' ((Invoke-Api ($adminBase + '/') 'GET' $null 10).Status -eq 200)
 
 # 托盘菜单「重启镜像源服务」：只重绑镜像源监听，管理监听与进程不受影响
 $regRestartReport = Send-SmokeCommand 'menu:tray-restart-registry' 30
@@ -2099,12 +2361,12 @@ Assert-True '关闭网页版管理后镜像源服务不受影响（/-/ping 200�
 $menuShrunkRep = Wait-SmokeReport {
   param($r)
   $lb = @(Get-Prop (Get-Prop $r 'tray') 'labels')
-  return (($lb.Count -eq 4) -and (-not ($lb -contains '打开管理界面')) -and (-not ($lb -contains '重启管理界面')))
+  return (($lb.Count -eq 5) -and (-not ($lb -contains '打开管理界面')) -and (-not ($lb -contains '重启管理界面')) -and ($lb -contains '重启窗口的管理界面'))
 } 4 100
 $swOff.Stop()
 $menuShrunkMs = $swOff.ElapsedMilliseconds
 $menuShrunkLabels = @(Get-Prop (Get-Prop $menuShrunkRep 'tray') 'labels')
-Assert-True '关闭网页版管理后托盘菜单实时缩回 4 项（≤1s，桥事件路径）' (($null -ne $menuShrunkRep) -and $menuShrunkMs -le 1000) ('耗时=' + $menuShrunkMs + 'ms；实际菜单：' + ($menuShrunkLabels -join ' / '))
+Assert-True '关闭网页版管理后托盘菜单实时缩回 5 项（≤1s，桥事件路径）' (($null -ne $menuShrunkRep) -and $menuShrunkMs -le 1000) ('耗时=' + $menuShrunkMs + 'ms；实际菜单：' + ($menuShrunkLabels -join ' / '))
 
 # 阶段 2 清理
 Section '阶段 2f：清理测试实例'

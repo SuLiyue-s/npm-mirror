@@ -89,7 +89,18 @@ fn handle_ready(app: &AppHandle, message: &Value) {
     return;
   }
   let port = port as u16;
-  let url = format!("http://127.0.0.1:{port}/");
+  // Node 桌面模式会返回带一次性访问令牌的 internalAdminUrl（GUI 同源加载用）；
+  // 仅当它是 127.0.0.1 的 http URL 时采用，否则回退到按端口拼接（老版本 Node 兼容）。
+  let token_url = message
+    .get("internalAdminUrl")
+    .and_then(|value| value.as_str())
+    .filter(|value| {
+      value.starts_with("http://127.0.0.1:") || value.starts_with("http://localhost:")
+    })
+    .map(str::to_string);
+  let url = token_url
+    .clone()
+    .unwrap_or_else(|| format!("http://127.0.0.1:{port}/"));
   let version = message
     .get("version")
     .and_then(|value| value.as_str())
@@ -113,8 +124,10 @@ fn handle_ready(app: &AppHandle, message: &Value) {
     state.update_web_admin(enabled, web_url);
   }
   state.node_restarts.store(0, Ordering::SeqCst);
+  // 日志禁止出现带令牌的完整 URL：只记录端口与是否采用令牌 URL
   logging::info(format!(
-    "Node ready：internalAdminPort={port} url={url} webAdmin={:?}",
+    "Node ready：internalAdminPort={port} tokenUrl={} webAdmin={:?}",
+    token_url.is_some(),
     state.web_admin_snapshot()
   ));
 

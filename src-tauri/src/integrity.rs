@@ -8,18 +8,16 @@ use std::sync::Mutex;
 
 use serde_json::Value;
 use windows::core::{HSTRING, PCWSTR};
-use windows::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, WAIT_TIMEOUT};
+use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_CANCELLED, HANDLE};
 use windows::Win32::Security::{
   GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenElevation,
   TokenIntegrityLevel, TOKEN_ELEVATION, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
 };
-use windows::Win32::System::Threading::{
-  GetCurrentProcess, GetExitCodeProcess, OpenProcessToken, WaitForSingleObject,
-};
+use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::Win32::UI::Shell::{
   ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
 };
-use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
 use crate::paths;
 use crate::state::StartupArgs;
@@ -178,115 +176,174 @@ pub fn read_file_integrity(path: &Path) -> FileIntegrity {
   }
 }
 
-/// 提权系统 icacls 的等待超时（毫秒）。UAC 授权 + icacls 执行通常 < 5 秒，留足时间。
-const REPAIR_WAIT_TIMEOUT_MS: u32 = 180_000;
+/// 提权助手脚本 + marker 轮询的最长等待时间（毫秒）。覆盖 UAC 授权、icacls 执行与助手内 ~2 秒延迟。
+const REPAIR_HELPER_TIMEOUT_MS: u64 = 180_000;
+/// 轮询 marker 的间隔（毫秒）。
+const REPAIR_HELPER_POLL_MS: u64 = 100;
 
-/// 系统 icacls.exe 路径（%SystemRoot%\System32\icacls.exe）。
-fn system_icacls_path() -> PathBuf {
+/// 系统目录（%SystemRoot%\System32）。
+fn system32_dir() -> PathBuf {
   let root = std::env::var_os("SystemRoot")
     .map(PathBuf::from)
     .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
-  root.join("System32").join("icacls.exe")
+  root.join("System32")
 }
 
-/// 通过 UAC 提权**系统工具** icacls.exe 去掉文件低完整性标签，并同步等待结果。
+/// 一次「提权 cmd 助手」修复尝试的结果。
+pub enum RepairAttempt {
+  /// 修复成功：助手已把文件标签改为 Medium/High，并安排 ~2 秒后以普通权限重启。
+  Repaired { detail: String, helper_path: PathBuf },
+  /// 用户在 UAC 授权框点了取消：继续以受限方式运行，不重启。
+  Cancelled { detail: String },
+  /// 修复失败（icacls 失败 / marker 超时 / 复查标签仍为 Low）。
+  Failed { detail: String },
+}
+
+/// 提权 cmd 助手脚本与 marker 的临时文件路径（纯 ASCII 文件名，避免中文路径编码问题）。
 ///
-/// 为什么不是重新提权启动自身 exe：Windows 的规则是「进程完整性 = min(用户令牌完整性, 文件完整性)」，
-/// 带 Low 标签的 exe 即使用户选择「以管理员身份运行」，新进程仍会被降为 Low，它再 spawn 的 icacls
-/// 同样继承 Low，`/setintegritylevel` 必然失败（v0.0.5 用户实测的现象）。
-/// 而 icacls.exe 本身是 Medium 标签的系统文件，提权启动后进程为 Medium+管理员令牌，可以修改标签。
-pub fn repair_label_via_elevated_system_tool(exe: &Path) -> Result<String, String> {
-  let icacls = system_icacls_path();
-  if !icacls.is_file() {
-    return Err(format!("未找到系统 icacls.exe：{}", icacls.display()));
+/// exe 路径与 marker 路径都通过**命令行参数**传给脚本，脚本自身只含 ASCII 字符。
+fn repair_helper_paths() -> (PathBuf, PathBuf) {
+  let temp = std::env::var_os("TEMP")
+    .map(PathBuf::from)
+    .or_else(|| std::env::var_os("TMP").map(PathBuf::from))
+    .unwrap_or_else(std::env::temp_dir);
+  let pid = std::process::id();
+  (
+    temp.join(format!("liyue-mirror-repair-{pid}.cmd")),
+    temp.join(format!("liyue-mirror-repair-{pid}.marker")),
+  )
+}
+
+/// 生成提权 cmd 助手脚本内容（纯 ASCII + CRLF 换行）。
+///
+/// 为什么不能直接提权启动自身 exe：Windows 规则「进程完整性 = min(用户令牌完整性, 文件完整性)」，
+/// 带 Low 标签的 exe 即使用户选择「以管理员身份运行」，新进程仍被降为 Low，它再去调 icacls 也失败
+/// （v0.0.5 用户实测现象）。cmd.exe / icacls.exe 是系统 Medium 文件，提权后进程为 Medium + 管理员
+/// 令牌，可以成功执行 `icacls /setintegritylevel Medium`。
+/// 助手成功后用 explorer.exe 把路径转发给已运行的 Explorer，实现非提权重启；并先 ping 约 2 秒，
+/// 等旧实例退出、释放单实例互斥体后新实例才能正常启动。
+fn repair_helper_script() -> String {
+  let lines = [
+    "@echo off",
+    "setlocal",
+    "\"%SystemRoot%\\System32\\icacls.exe\" \"%~1\" /setintegritylevel Medium >nul 2>&1",
+    "if errorlevel 1 (",
+    "  >\"%~2\" echo fail",
+    "  del \"%~f0\" >nul 2>&1",
+    "  exit /b 1",
+    ")",
+    ">\"%~2\" echo ok",
+    "ping -n 3 127.0.0.1 >nul",
+    "explorer.exe \"%~1\"",
+    "del \"%~f0\" >nul 2>&1",
+    "exit /b 0",
+  ];
+  format!("{}\r\n", lines.join("\r\n"))
+}
+
+/// 通过 UAC 启动提权 cmd 助手，由助手完成 icacls 修复，再轮询 marker 获取结果。
+///
+/// 成功时调用方应记录状态并**立即退出当前实例**（先释放单实例互斥体），助手会在约 2 秒后
+/// 以普通权限拉起新实例。不要等待/杀死助手进程。
+pub fn repair_label_via_cmd_helper(exe: &Path) -> RepairAttempt {
+  let (script_path, marker_path) = repair_helper_paths();
+  let _ = std::fs::remove_file(&marker_path);
+  let script = repair_helper_script();
+  if let Err(err) = std::fs::write(&script_path, script.as_bytes()) {
+    return RepairAttempt::Failed {
+      detail: format!("写入提权助手脚本失败（{}）：{err}", script_path.display()),
+    };
+  }
+  let cmd = system32_dir().join("cmd.exe");
+  if !cmd.is_file() {
+    let _ = std::fs::remove_file(&script_path);
+    return RepairAttempt::Failed {
+      detail: format!("未找到系统 cmd.exe：{}", cmd.display()),
+    };
   }
   let verb = HSTRING::from("runas");
-  let file = HSTRING::from(icacls.to_string_lossy().to_string());
-  // icacls 语法：icacls <文件> /setintegritylevel Medium（文件名在前）
+  let file = HSTRING::from(cmd.to_string_lossy().to_string());
   let params = HSTRING::from(format!(
-    "\"{}\" /setintegritylevel Medium",
-    exe.to_string_lossy()
+    "/c \"{}\" \"{}\" \"{}\"",
+    script_path.display(),
+    exe.display(),
+    marker_path.display()
   ));
-  let dir = HSTRING::from(
-    icacls
-      .parent()
-      .map(|parent| parent.to_string_lossy().to_string())
-      .unwrap_or_default(),
-  );
   let mut info = SHELLEXECUTEINFOW::default();
   info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
   info.fMask = SEE_MASK_NOCLOSEPROCESS;
   info.lpVerb = PCWSTR(verb.as_ptr());
   info.lpFile = PCWSTR(file.as_ptr());
   info.lpParameters = PCWSTR(params.as_ptr());
-  info.lpDirectory = PCWSTR(dir.as_ptr());
-  info.nShow = SW_SHOWNORMAL.0;
-  unsafe { ShellExecuteExW(&mut info) }.map_err(|err| {
+  info.nShow = SW_HIDE.0;
+  if let Err(err) = unsafe { ShellExecuteExW(&mut info) } {
     let last = unsafe { GetLastError() };
-    format!(
-      "提权启动系统 icacls 失败：{err}（GetLastError={}，{}）",
-      last.0,
-      std::io::Error::last_os_error()
-    )
-  })?;
-  let process = info.hProcess;
-  if process.0.is_null() {
-    return Err("提权启动系统 icacls 后未获得进程句柄（可能取消了 UAC 授权）".to_string());
+    let _ = std::fs::remove_file(&script_path);
+    let canceled =
+      last.0 == ERROR_CANCELLED.0 || err.code().0 == 0x8007_04C7u32 as i32;
+    if canceled {
+      return RepairAttempt::Cancelled {
+        detail: "已取消管理员授权（UAC），未做任何修改".to_string(),
+      };
+    }
+    return RepairAttempt::Failed {
+      detail: format!(
+        "提权启动 cmd 助手失败：{err}（GetLastError={}）",
+        last.0
+      ),
+    };
   }
-  let wait = unsafe { WaitForSingleObject(process, REPAIR_WAIT_TIMEOUT_MS) };
-  let mut exit_code = 0u32;
-  let exit_ok = unsafe { GetExitCodeProcess(process, &mut exit_code) }.is_ok();
-  let _ = unsafe { CloseHandle(process) };
-  if wait.0 == WAIT_TIMEOUT.0 {
-    let after = read_file_integrity(exe);
-    return Err(format!(
-      "提权系统 icacls 等待超时（{} 秒），文件标签仍为 {}",
-      REPAIR_WAIT_TIMEOUT_MS / 1000,
-      after.label
-    ));
+  // 不等待助手进程：成功后它会延迟约 2 秒再拉起新实例，这里只轮询 marker。
+  if !info.hProcess.0.is_null() {
+    let _ = unsafe { CloseHandle(info.hProcess) };
   }
-  let code_text = if exit_ok {
-    exit_code.to_string()
-  } else {
-    "未知".to_string()
-  };
-  // 必须复查文件标签：只有真的变成 Medium（或更高）才算修复成功
-  let after = read_file_integrity(exe);
-  if after.label == "Medium" || after.label == "High" {
-    Ok(format!(
-      "已通过提权系统 icacls 重置完整性标签（icacls 退出码 {code_text}），当前文件标签：{}",
-      after.label
-    ))
-  } else {
-    Err(format!(
-      "系统 icacls 退出码 {code_text}，修复后复查文件完整性标签仍为 {}（可能取消了 UAC 授权、权限不足或文件被占用）",
-      after.label
-    ))
-  }
-}
 
-/// 修复失败时给用户的可操作说明（含两条退路 + 手动命令）。
-fn repair_failure_text(err: &str, exe: &Path) -> String {
-  format!(
-    "自动修复低完整性标签失败：\n\n{err}\n\n\
-     可以这样处理：\n\
-     1. 把程序文件复制到其他文件夹（例如桌面）后再运行——复制出的文件会继承目标目录的正常完整性标签，通常即可正常使用；\n\
-     2. 右键以管理员身份打开「命令提示符」，执行：\n   icacls \"{}\" /setintegritylevel Medium\n\
-     3. 或者右键以管理员身份运行程序目录下的「修复-桌面版启动限制.cmd」。\n\n\
-     注意：直接对带 Low 标签的程序「以管理员身份运行」仍会被系统降为低完整性，无法完成修复。",
-    exe.display()
-  )
-}
-
-/// 以普通（非提权）方式重新启动程序：优先经 explorer.exe 转发，失败回退 ShellExecuteW "open"。
-pub fn relaunch_unelevated() {
-  let exe = paths::exe_path();
-  let exe_text = exe.to_string_lossy().to_string();
-  let spawned = Command::new("explorer.exe").arg(&exe_text).spawn();
-  if spawned.is_ok() {
-    return;
+  let deadline = std::time::Instant::now() + std::time::Duration::from_millis(REPAIR_HELPER_TIMEOUT_MS);
+  loop {
+    if std::time::Instant::now() >= deadline {
+      let _ = std::fs::remove_file(&script_path);
+      return RepairAttempt::Failed {
+        detail: format!(
+          "等待提权助手结果超时（{} 秒）：未得到 ok/fail 标记（可能 UAC 未响应或助手被安全软件拦截）",
+          REPAIR_HELPER_TIMEOUT_MS / 1000
+        ),
+      };
+    }
+    if let Ok(text) = std::fs::read_to_string(&marker_path) {
+      let marker = text.trim();
+      if marker == "fail" {
+        let _ = std::fs::remove_file(&marker_path);
+        let _ = std::fs::remove_file(&script_path);
+        return RepairAttempt::Failed {
+          detail:
+            "提权 cmd 助手执行 icacls /setintegritylevel Medium 失败（请检查管理员授权与文件是否被占用）"
+              .to_string(),
+        };
+      }
+      if marker == "ok" {
+        // 必须自行复查：助手报告成功 ≠ 标签真的改成功
+        let after = read_file_integrity(exe);
+        let _ = std::fs::remove_file(&marker_path);
+        let _ = std::fs::remove_file(&script_path);
+        if after.label == "Medium" || after.label == "High" {
+          return RepairAttempt::Repaired {
+            detail: format!(
+              "已通过提权 cmd 助手调用系统 icacls 重置完整性标签，当前文件标签：{}",
+              after.label
+            ),
+            helper_path: script_path,
+          };
+        }
+        return RepairAttempt::Failed {
+          detail: format!(
+            "助手报告已执行修复，但复查文件完整性标签仍为 {}（可能 icacls 未生效或被安全软件拦截）",
+            after.label
+          ),
+        };
+      }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(REPAIR_HELPER_POLL_MS));
   }
-  let _ = winutil::open_path(&exe_text);
 }
 
 /// 修复模式进程退出码：0=修复成功并已请求重启；2=修复失败；3=未以管理员权限运行；4=环境异常。
@@ -325,8 +382,14 @@ pub struct IntegrityStatus {
   pub repair_error: Option<String>,
   /// 修复方式：本版本固定为 "icacls-elevated"（提权调用系统 icacls.exe）
   pub repair_via: Option<String>,
-  /// 修复阶段：running / verified / failed（未触及时为 None）
+  /// 修复阶段：running / verified / cancelled / failed（未触及时为 None）
   pub repair_stage: Option<String>,
+  /// 修复后重启方式（v0.0.7 起为 "elevated-cmd-helper"=提权 cmd 助手延迟拉起普通权限实例）
+  pub relaunch_method: Option<String>,
+  /// 是否已安排自动重启（助手会在约 2 秒后拉起新实例；当前实例应立即退出释放互斥体）
+  pub relaunch_scheduled: bool,
+  /// 提权 cmd 助手脚本路径（诊断用）
+  pub helper_path: Option<String>,
   /// 被检测的 exe 路径
   pub exe_path: String,
 }
@@ -349,6 +412,9 @@ impl IntegrityStatus {
       "repairError": self.repair_error,
       "repairVia": self.repair_via,
       "repairStage": self.repair_stage,
+      "relaunchMethod": self.relaunch_method,
+      "relaunchScheduled": self.relaunch_scheduled,
+      "helperPath": self.helper_path,
       "error": self.error,
       "exePath": self.exe_path,
     })
@@ -403,15 +469,33 @@ pub fn collect_status() -> IntegrityStatus {
     repair_error: None,
     repair_via: Some("icacls-elevated".to_string()),
     repair_stage: None,
+    relaunch_method: None,
+    relaunch_scheduled: false,
+    helper_path: None,
     exe_path: exe.to_string_lossy().to_string(),
   }
 }
 
+/// 修复失败时给用户的可操作说明（含两条退路 + 手动命令）。
+fn repair_failure_text(err: &str, exe: &Path) -> String {
+  format!(
+    "自动修复低完整性标签失败：\n\n{err}\n\n\
+     可以这样处理：\n\
+     1. 把程序文件复制到其他文件夹（例如桌面）后再运行——复制出的文件会继承目标目录的正常完整性标签，通常即可正常使用；\n\
+     2. 右键以管理员身份打开「命令提示符」，执行：\n   icacls \"{}\" /setintegritylevel Medium\n\
+     3. 或者右键以管理员身份运行程序目录下的「修复-桌面版启动限制.cmd」。\n\n\
+     注意：直接对带 Low 标签的程序「以管理员身份运行」仍会被系统降为低完整性，无法完成修复。",
+    exe.display()
+  )
+}
+
 /// 正式启动路径的完整性自检：
 /// - 文件带 Low 标签且未提权、非 smoke、非 autostart 时，弹「是否现在修复？」；
-///   选「是」→ 同步通过 UAC 提权**系统 icacls.exe** 修复并复查标签，成功则提示
-///   「修复成功，正在以普通权限重启」并 relaunch_unelevated()，当前进程随后退出；
+///   选「是」→ 在 %TEMP% 生成纯 ASCII 助手脚本，用 `ShellExecuteExW(runas, cmd.exe)` 提权执行
+///   `icacls /setintegritylevel Medium`，轮询 marker 拿到 ok 后复查标签；成功则提示
+///   「修复成功，正在以普通权限重启」并立即退出（助手约 2 秒后拉起非提权新实例），
 ///   失败则弹可操作说明框（含“复制到其他文件夹运行”退路），继续以受限方式运行。
+/// - UAC 取消 → 提示已取消，继续受限运行。
 /// - smoke / autostart / 已提权时不弹框，只记录状态。
 pub fn startup_check(args: &StartupArgs, smoke_mode: bool) -> IntegrityStatus {
   let mut status = collect_status();
@@ -445,32 +529,48 @@ pub fn startup_check(args: &StartupArgs, smoke_mode: bool) -> IntegrityStatus {
     status.repair_prompted = true;
     if accepted {
       status.repair_stage = Some("running".to_string());
-      eprintln!(
-        "开始通过提权系统 icacls 修复低完整性标签：{}",
-        status.exe_path
-      );
-      match repair_label_via_elevated_system_tool(Path::new(&status.exe_path)) {
-        Ok(detail) => {
+      eprintln!("开始通过提权 cmd 助手修复低完整性标签：{}", status.exe_path);
+      match repair_label_via_cmd_helper(Path::new(&status.exe_path)) {
+        RepairAttempt::Repaired { detail, helper_path } => {
           let after = read_file_integrity(Path::new(&status.exe_path));
           status.file = after.label;
           status.file_raw = after.raw;
           status.repair_result = Some(detail.clone());
           status.repair_launched = true;
           status.repair_stage = Some("verified".to_string());
+          status.relaunch_method = Some("elevated-cmd-helper".to_string());
+          status.relaunch_scheduled = true;
+          status.helper_path = Some(helper_path.to_string_lossy().to_string());
           eprintln!("低完整性标签修复成功：{detail}");
           winutil::message_box(
-            format!("修复成功，正在以普通权限重启…\n\n{detail}"),
+            format!(
+              "修复成功，正在以普通权限重启…\n\n{detail}\n\n\
+               程序会自动重新启动；若几秒后没有出现窗口，请从资源管理器双击程序。"
+            ),
             format!("{} 修复完成", paths::PRODUCT_NAME),
             false,
           );
-          relaunch_unelevated();
+          // 不在这里启动新进程：助手脚本会在约 2 秒后经 explorer 拉起新实例。
+          // 当前实例（main）返回后立即退出，先释放单实例互斥体。
         }
-        Err(err) => {
-          status.repair_error = Some(err.clone());
-          status.repair_stage = Some("failed".to_string());
-          eprintln!("低完整性标签修复失败：{err}");
+        RepairAttempt::Cancelled { detail } => {
+          status.repair_stage = Some("cancelled".to_string());
+          eprintln!("已取消低完整性标签修复：{detail}");
           winutil::message_box(
-            repair_failure_text(&err, Path::new(&status.exe_path)),
+            format!(
+              "已取消管理员授权，未做任何修改。\n\n{detail}\n\n程序将继续以受限方式运行；\
+               如需修复，可重新启动程序并在提示时允许管理员授权，或把程序复制到其他文件夹运行。"
+            ),
+            format!("{} 修复已取消", paths::PRODUCT_NAME),
+            false,
+          );
+        }
+        RepairAttempt::Failed { detail } => {
+          status.repair_error = Some(detail.clone());
+          status.repair_stage = Some("failed".to_string());
+          eprintln!("低完整性标签修复失败：{detail}");
+          winutil::message_box(
+            repair_failure_text(&detail, Path::new(&status.exe_path)),
             format!("{} 修复失败", paths::PRODUCT_NAME),
             true,
           );
@@ -488,10 +588,13 @@ pub fn startup_check(args: &StartupArgs, smoke_mode: bool) -> IntegrityStatus {
 ///
 /// 注意：Low 标签的 exe 即使用户选择「以管理员身份运行」，进程仍会因
 /// 「进程完整性 = min(用户令牌完整性, 文件完整性)」规则被降为 Low，直接 spawn icacls 会失败。
-/// 因此本模式在已提权时改为**提权调用系统 icacls.exe**（系统文件是 Medium 标签，提权后为
-/// Medium+管理员令牌）完成修复。非提权时保持 exit 3 + repairError「需要管理员权限」（自动化测试依赖）。
+/// 真正的修复由主程序启动「提权 cmd 助手」（cmd.exe/icacls.exe 是系统 Medium 文件）完成；
+/// 本模式在已提权时复用同一助手，随后立即退出由助手拉起普通权限实例。
+/// 非提权时保持 exit 3 + repairError「需要管理员权限」（自动化测试依赖此行为，不要改）。
 pub fn run_repair_mode(args: &StartupArgs) -> i32 {
-  let smoke_mode = std::env::var("MIRROR_DESKTOP_SMOKE").map(|value| value == "1").unwrap_or(false);
+  let smoke_mode = std::env::var("MIRROR_DESKTOP_SMOKE")
+    .map(|value| value == "1")
+    .unwrap_or(false);
   let mut status = collect_status();
   status.low_detected = status.file == "Low";
   let report_path = args.smoke_report.clone();
@@ -511,39 +614,60 @@ pub fn run_repair_mode(args: &StartupArgs) -> i32 {
     return REPAIR_EXIT_NOT_ELEVATED;
   }
 
+  // smoke 模式不执行实际修复、不弹框、不重启（避免自动化环境触发 UAC/修改标签）
+  if smoke_mode {
+    status.repair_result = Some("smoke 模式跳过实际修复（避免触发 UAC/重启）".to_string());
+    status.repair_stage = Some("skipped".to_string());
+    eprintln!("smoke 模式：跳过实际低完整性标签修复");
+    write_repair_report(report_path.as_ref(), &status);
+    return REPAIR_EXIT_OK;
+  }
+
   let exe = paths::exe_path();
   status.repair_stage = Some("running".to_string());
-  match repair_label_via_elevated_system_tool(&exe) {
-    Ok(detail) => {
+  match repair_label_via_cmd_helper(&exe) {
+    RepairAttempt::Repaired { detail, helper_path } => {
       let after = read_file_integrity(&exe);
       status.file = after.label;
       status.file_raw = after.raw;
       status.repair_result = Some(detail.clone());
       status.repair_stage = Some("verified".to_string());
       status.repair_launched = true;
+      status.relaunch_method = Some("elevated-cmd-helper".to_string());
+      status.relaunch_scheduled = true;
+      status.helper_path = Some(helper_path.to_string_lossy().to_string());
       eprintln!("低完整性标签修复成功：{detail}");
-      if !smoke_mode {
-        winutil::message_box(
-          format!("修复成功，正在以普通权限重启…\n\n{detail}"),
-          format!("{} 修复完成", paths::PRODUCT_NAME),
-          false,
-        );
-        relaunch_unelevated();
-      }
+      winutil::message_box(
+        format!(
+          "修复成功，正在以普通权限重启…\n\n{detail}\n\n\
+           程序会自动重新启动；若几秒后没有出现窗口，请从资源管理器双击程序。"
+        ),
+        format!("{} 修复完成", paths::PRODUCT_NAME),
+        false,
+      );
       write_repair_report(report_path.as_ref(), &status);
       REPAIR_EXIT_OK
     }
-    Err(err) => {
-      status.repair_error = Some(err.clone());
+    RepairAttempt::Cancelled { detail } => {
+      status.repair_stage = Some("cancelled".to_string());
+      eprintln!("已取消低完整性标签修复：{detail}");
+      winutil::message_box(
+        format!("已取消管理员授权，未做任何修改。\n\n{detail}"),
+        format!("{} 修复已取消", paths::PRODUCT_NAME),
+        false,
+      );
+      write_repair_report(report_path.as_ref(), &status);
+      REPAIR_EXIT_FAILED
+    }
+    RepairAttempt::Failed { detail } => {
+      status.repair_error = Some(detail.clone());
       status.repair_stage = Some("failed".to_string());
-      eprintln!("低完整性标签修复失败：{err}");
-      if !smoke_mode {
-        winutil::message_box(
-          repair_failure_text(&err, &exe),
-          format!("{} 修复失败", paths::PRODUCT_NAME),
-          true,
-        );
-      }
+      eprintln!("低完整性标签修复失败：{detail}");
+      winutil::message_box(
+        repair_failure_text(&detail, &exe),
+        format!("{} 修复失败", paths::PRODUCT_NAME),
+        true,
+      );
       write_repair_report(report_path.as_ref(), &status);
       REPAIR_EXIT_FAILED
     }

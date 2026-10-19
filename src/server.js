@@ -10,6 +10,7 @@
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 
 const util = require('./util');
@@ -37,6 +38,14 @@ const MODE_TEXT = {
   proxy: 'proxy（元数据按 TTL 回源刷新，tarball 按需缓存）',
   offline: 'offline（纯离线，禁止访问外网）',
 };
+
+/* v0.0.7：桌面窗口内部管理监听的令牌门禁。
+ * 内部回环端口（127.0.0.1:随机）承载 GUI 页面与管理 API，但浏览器也能猜到/扫到端口；
+ * 因此每次内部监听启动/重启都生成一次性随机令牌：外壳用 ?__mirror_token=<令牌> 完成首访，
+ * 之后靠 HttpOnly + SameSite=Strict 的 Cookie 通行；浏览器直接访问一律 403 且不返回任何数据。 */
+const GUI_TOKEN_PARAM = '__mirror_token';
+const GUI_TOKEN_COOKIE = 'mirror_gui_token';
+const GUI_TOKEN_DENY_TEXT = '该端口仅供桌面程序窗口内部使用，浏览器无法直接访问。';
 
 /** 镜像源服务探测超时与缓存（session 每 1 秒轮询一次，多个标签页同时轮询时避免重复探测） */
 const PROBE_TIMEOUT_MS = 800;
@@ -89,6 +98,8 @@ async function createServer({ cliOpts = {} } = {}) {
   let internalServer = null;
   let internalIp = '127.0.0.1';
   let internalPort = 0;
+  let internalToken = '';          // 内部管理监听的一次性随机令牌（只交给外壳；绝不写日志/绝不经 API 暴露）
+  let internalRestarting = null;   // 「重启窗口的管理界面」进行中的 Promise（并发调用共享结果）
 
   const state = {
     startedAt: Date.now(),
@@ -166,6 +177,8 @@ async function createServer({ cliOpts = {} } = {}) {
     scripts: DESKTOP ? desktopScripts : null, // 一键脚本（仅桌面模式暴露给 API）
     get internalAdminIp() { return internalIp; },
     get internalAdminPort() { return internalPort; },
+    internalGuiUrl,
+    restartInternalAdmin,
     webAdminEnabled,
     webAdminUrl,
     webAdminState,
@@ -230,7 +243,72 @@ async function createServer({ cliOpts = {} } = {}) {
       pathname === '/style.css' || pathname === '/favicon.ico' || /^\/(assets|static)\//.test(pathname);
   }
 
-  async function handle(req, res, isAdmin) {
+  // ---------------- 桌面版：内部管理监听令牌门禁 ----------------
+
+  /** 生成内部管理监听令牌：crypto 32 字节随机 → 64 位十六进制（每次内部监听启动/重启都重新生成） */
+  function newInternalToken() {
+    return crypto.randomBytes(32).toString('hex');
+  }
+
+  /** 定时安全地比较令牌（先 sha256 定长，避免长度差异导致提前返回） */
+  function internalTokenMatches(candidate) {
+    if (!internalToken || typeof candidate !== 'string' || !candidate) return false;
+    const a = crypto.createHash('sha256').update(candidate, 'utf8').digest();
+    const b = crypto.createHash('sha256').update(internalToken, 'utf8').digest();
+    return crypto.timingSafeEqual(a, b);
+  }
+
+  /** 从请求 Cookie 头读取内部窗口令牌 */
+  function internalCookieToken(req) {
+    const raw = req.headers && req.headers.cookie;
+    if (!raw) return '';
+    for (const part of String(raw).split(';')) {
+      const i = part.indexOf('=');
+      if (i < 0) continue;
+      if (part.slice(0, i).trim() !== GUI_TOKEN_COOKIE) continue;
+      let v = part.slice(i + 1).trim();
+      if (v.length >= 2 && v.startsWith('"') && v.endsWith('"')) v = v.slice(1, -1);
+      return v;
+    }
+    return '';
+  }
+
+  /** 内部监听门禁拒绝：页面回纯文本 403，管理 API 回 JSON 403（都不返回任何页面/数据） */
+  function denyInternalGui(res, url) {
+    try { res.setHeader('cache-control', 'no-store'); } catch { /* 忽略 */ }
+    if (url.pathname === API || url.pathname.startsWith(`${API}/`)) {
+      return Hu.fail(res, 403, GUI_TOKEN_DENY_TEXT, 'EGUIINTERNAL');
+    }
+    return Hu.sendText(res, 403, `${GUI_TOKEN_DENY_TEXT}\n请通过桌面程序窗口访问管理界面。`);
+  }
+
+  /**
+   * 内部管理监听门禁（仅桌面版窗口使用的监听）：
+   *  - 首访带 ?__mirror_token=<正确令牌>：种 HttpOnly + SameSite=Strict Cookie → 302 到去掉 query 的同一地址；
+   *  - 令牌错误：403；
+   *  - 没有 Cookie / Cookie 不匹配：403（页面与 API 一律不返回数据）。
+   * 返回 true 表示已响应（调用方直接 return），false 表示放行。
+   */
+  function internalGuiGate(req, res, url) {
+    const supplied = url.searchParams.get(GUI_TOKEN_PARAM);
+    if (supplied !== null) {
+      if (!internalTokenMatches(supplied)) { denyInternalGui(res, url); return true; }
+      try {
+        res.setHeader('cache-control', 'no-store');
+        res.writeHead(302, {
+          location: url.pathname || '/',
+          'set-cookie': `${GUI_TOKEN_COOKIE}=${internalToken}; HttpOnly; SameSite=Strict; Path=/`,
+        });
+        res.end();
+      } catch { try { res.destroy(); } catch { /* 忽略 */ } }
+      return true;
+    }
+    if (internalTokenMatches(internalCookieToken(req))) return false;
+    denyInternalGui(res, url);
+    return true;
+  }
+
+  async function handle(req, res, isAdmin, isInternal) {
     const t0 = Date.now();
     let status = 200;
     const rawWriteHead = res.writeHead.bind(res);
@@ -256,8 +334,12 @@ async function createServer({ cliOpts = {} } = {}) {
     const rctx = Object.create(ctx);
     rctx.req = req; rctx.res = res; rctx.url = url; rctx.method = req.method; rctx.pathname = pathname;
     rctx.isAdminListener = !!isAdmin;
+    rctx.isInternalListener = !!isInternal;
 
     try {
+      // 桌面窗口内部的 GUI 管理监听：浏览器直接访问必须先过令牌门禁（页面/静态资源/管理 API 全部适用）
+      if (isInternal && internalGuiGate(req, res, url)) return;
+
       if (pathname === API || pathname.startsWith(`${API}/`)) {
         // 管理 API 只在独立的管理界面监听上提供。镜像源监听即使带令牌也不提供，
         // 这样局域网里即使有人扫到镜像源端口，也拿不到管理接口。
@@ -332,8 +414,8 @@ async function createServer({ cliOpts = {} } = {}) {
     }
   }
 
-  function makeServer(isAdmin) {
-    const srv = http.createServer((req, res) => handle(req, res, isAdmin));
+  function makeServer(isAdmin, isInternal = false) {
+    const srv = http.createServer((req, res) => handle(req, res, isAdmin, isInternal));
     // 收完整个请求的上限：导入整机备份时浏览器要 POST 几个 GB，本机回环虽然快（GB/s），
     // 但从局域网机器上传可能要好几分钟，原来 5 分钟会把大离线包直接切断。放到 30 分钟，
     // 慢速攻击由 headersTimeout（66s）和各个 readBody/readBodyToFile 的空闲超时（30~60s）兜底。
@@ -412,9 +494,10 @@ async function createServer({ cliOpts = {} } = {}) {
 
   // ---------------- 桌面版：内部管理监听 / 网页版管理监听 ----------------
 
-  /** 内部管理监听：127.0.0.1:0（系统分配随机端口），承载桌面 GUI 页面与管理 API，必须成功 */
+  /** 内部管理监听：127.0.0.1:0（系统分配随机端口），承载桌面 GUI 页面与管理 API，必须成功；
+   *  每次绑定都重新生成一次性令牌（门禁见 internalGuiGate）。 */
   async function bindInternalListener() {
-    const srv = makeServer(true);
+    const srv = makeServer(true, true);
     await new Promise((resolve, reject) => {
       const onError = (e) => { srv.removeListener('listening', onListening); reject(e); };
       const onListening = () => { srv.removeListener('error', onError); resolve(); };
@@ -425,6 +508,7 @@ async function createServer({ cliOpts = {} } = {}) {
     internalServer = srv;
     internalIp = '127.0.0.1';
     internalPort = srv.address().port;
+    internalToken = newInternalToken();
     return { ip: internalIp, port: internalPort };
   }
 
@@ -450,6 +534,15 @@ async function createServer({ cliOpts = {} } = {}) {
   /** 内部回环管理地址（桌面 GUI 加载的地址） */
   function internalAdminUrl() {
     return Hu.httpUrl(internalIp || '127.0.0.1', internalPort || 0);
+  }
+
+  /** 桌面 GUI 的完整内部管理地址（含一次性令牌）。
+   *  只经 ready 消息与 restartWindowAdmin 的命令响应交给外壳；绝不能写入日志或任何 API 响应。 */
+  function internalGuiUrl() {
+    if (!internalPort) return '';
+    const base = Hu.httpUrl(internalIp || '127.0.0.1', internalPort);
+    if (!internalToken) return base;
+    return `${base}/?${GUI_TOKEN_PARAM}=${internalToken}`;
   }
 
   /** 管理界面地址：桌面版网页管理开启用其地址，否则内部回环地址；非桌面版沿用旧语义 */
@@ -514,6 +607,41 @@ async function createServer({ cliOpts = {} } = {}) {
     const st = webAdminState();
     notifyWebAdminChanged(st);
     return { enabled: st.enabled && st.listening, url: st.url, listenError: st.listenError || '' };
+  }
+
+  /**
+   * 桌面版：重启「窗口的管理界面」内部监听（仅内部回环端口；镜像源与网页版管理监听不受影响）。
+   * 关闭旧监听 → 重新 listen(127.0.0.1:0) 新随机端口 → 重新生成令牌；日志只写端口，绝不写令牌。
+   * 返回 {ok:true, port, url}（url 含新令牌，只交给外壳）；停止中/失败返回 {ok:false, error}。
+   */
+  async function restartInternalAdmin() {
+    if (!DESKTOP) return { ok: false, error: '仅桌面版支持重启窗口的管理界面' };
+    if (stopping) return { ok: false, error: '服务正在停止' };
+    if (internalRestarting) return internalRestarting;
+    internalRestarting = (async () => {
+      log.info('正在重启窗口的管理界面（内部管理监听）…');
+      const old = internalServer;
+      internalServer = null;
+      internalToken = '';
+      await closeServer(old);
+      let lastErr = null;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          await bindInternalListener();
+          // 日志与运行控制台只写端口：令牌属于敏感凭证，绝不能出现在日志里
+          log.info(`窗口的管理界面已重启：127.0.0.1:${internalPort}（旧端口与旧令牌已失效）`);
+          return { ok: true, port: internalPort, url: internalGuiUrl() };
+        } catch (e) {
+          lastErr = e;
+          log.warn(`窗口的管理界面重启失败（第 ${attempt}/3 次）：${(e && (e.message || e.code)) || e}${attempt < 3 ? '，300ms 后重试…' : ''}`);
+          if (attempt < 3) await util.sleep(300);
+        }
+      }
+      const msg = `窗口的管理界面重启失败：${(lastErr && (lastErr.message || lastErr.code)) || '未知错误'}；请重启程序`;
+      log.error(msg);
+      return { ok: false, error: msg };
+    })();
+    try { return await internalRestarting; } finally { internalRestarting = null; }
   }
 
   /**
@@ -666,7 +794,7 @@ async function createServer({ cliOpts = {} } = {}) {
         '  ┌────────────────────────────────────────────────────────────┐',
         `  │  离月私人 npm 镜像源  v${VERSION}  已启动（桌面版）`,
         '  └────────────────────────────────────────────────────────────┘',
-        `  内部管理端口 : 127.0.0.1:${internalPort}（桌面 GUI 加载 http://127.0.0.1:${internalPort}/）`,
+        `  内部管理端口 : 127.0.0.1:${internalPort}（仅桌面程序窗口可访问，浏览器直接打开会被拒绝）`,
         `  网页版管理   : ${wa.enabled ? (wa.listening ? wa.url : `已开启，但监听失败：${wa.listenError}`) : '未开启（可在设置中开启，开启后可用浏览器访问）'}`,
         `  npm 源地址   : ${ctx.registryUrl}/`,
         `  镜像源监听   : ${registryIp}:${registryPort}`,
@@ -757,6 +885,8 @@ async function createServer({ cliOpts = {} } = {}) {
           const st = webAdminState();
           ctx.desktopHost.sendReady({
             internalAdminPort: internalPort,
+            // v0.0.7：含一次性令牌的完整内部管理地址；Rust 优先用它导航（旧外壳会忽略该字段）
+            internalAdminUrl: internalGuiUrl(),
             dataDir: util.dataRoot(),
             webAdmin: { enabled: st.enabled, url: st.listening ? st.url : null },
           });
@@ -807,6 +937,7 @@ async function createServer({ cliOpts = {} } = {}) {
     registryServer = null;
     adminServer = null;
     internalServer = null;
+    internalToken = '';
     try { if (ctx.desktopHost) ctx.desktopHost.stop(); } catch { /* 忽略 */ }
   }
 

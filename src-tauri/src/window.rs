@@ -393,12 +393,21 @@ pub fn hide(app: &AppHandle) {
   save_prefs(app);
 }
 
+/// 日志/诊断里隐藏内部管理 URL 的访问令牌（日志禁止出现带 token 的完整 URL）。
+fn sanitize_url(url: &str) -> String {
+  match url.find("__mirror_token=") {
+    Some(index) => format!("{}__mirror_token=***", &url[..index]),
+    None => url.to_string(),
+  }
+}
+
 pub fn navigate(app: &AppHandle, url: &str) {
+  let safe_url = sanitize_url(url);
   let parsed = match url.parse() {
     Ok(parsed) => parsed,
     Err(err) => {
-      logging::warn(format!("导航 URL 无效：{url}（{err}）"));
-      record_action(format!("导航失败（URL 无效）：{url}（{err}）"));
+      logging::warn(format!("导航 URL 无效：{safe_url}（{err}）"));
+      record_action(format!("导航失败（URL 无效）：{safe_url}（{err}）"));
       return;
     }
   };
@@ -407,7 +416,7 @@ pub fn navigate(app: &AppHandle, url: &str) {
       match webview_window.url() {
         Ok(current) => {
           if current.as_str() == url {
-            record_action(format!("导航跳过：已是目标地址 {url}"));
+            record_action(format!("导航跳过：已是目标地址 {safe_url}"));
             return;
           }
         }
@@ -417,17 +426,17 @@ pub fn navigate(app: &AppHandle, url: &str) {
       }
       match webview_window.navigate(parsed) {
         Ok(()) => {
-          record_action(format!("主窗口导航到：{url}"));
+          record_action(format!("主窗口导航到：{safe_url}"));
         }
         Err(err) => {
-          logging::warn(format!("导航到 {url} 失败：{err}"));
-          record_action(format!("导航到 {url} 失败：{err}"));
+          logging::warn(format!("导航到 {safe_url} 失败：{err}"));
+          record_action(format!("导航到 {safe_url} 失败：{err}"));
         }
       }
     }
     None => {
-      logging::warn(format!("导航失败：窗口对象不存在（目标 {url}）"));
-      record_action(format!("导航失败：窗口对象不存在（目标 {url}）"));
+      logging::warn(format!("导航失败：窗口对象不存在（目标 {safe_url}）"));
+      record_action(format!("导航失败：窗口对象不存在（目标 {safe_url}）"));
     }
   }
 }

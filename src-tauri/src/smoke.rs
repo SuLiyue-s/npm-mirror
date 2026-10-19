@@ -206,18 +206,17 @@ fn build_report(app: &AppHandle, elapsed: Duration) -> Value {
     object.insert("title".to_string(), json!(state.window_title()));
     object.insert("stateVisible".to_string(), json!(window::is_visible(app)));
   }
-  let (node_pid, node_ready, internal_port, node_url, node_data_dir) = {
+  let (node_pid, node_ready, node_data_dir) = {
     let guard = state::lock(&state.node);
     match guard.as_ref() {
-      Some(node) => (
-        Some(node.pid),
-        node.ready,
-        node.internal_port,
-        node.url.clone(),
-        node.data_dir.clone(),
-      ),
-      None => (None, false, None, None, None),
+      Some(node) => (Some(node.pid), node.ready, node.data_dir.clone()),
+      None => (None, false, None),
     }
+  };
+  // 每次报告都重新读取当前内部管理端口与令牌 URL（v0.0.7「重启窗口的管理界面」后端口/令牌会变化）
+  let (internal_port, internal_admin_url) = match state.internal_admin_snapshot() {
+    Some((port, url)) => (Some(port), Some(url)),
+    None => (None, None),
   };
   json!({
     "smoke": true,
@@ -256,7 +255,9 @@ fn build_report(app: &AppHandle, elapsed: Duration) -> Value {
       "pid": node_pid,
       "ready": node_ready,
       "internalAdminPort": internal_port,
-      "url": node_url,
+      // 内部管理地址（v0.0.7 起 Node ready 返回带一次性令牌的 URL；e2e 用它断言重启后端口/令牌变化）
+      "internalAdminUrl": internal_admin_url,
+      "url": internal_admin_url,
       "dataDir": node_data_dir,
       "restarts": state.node_restarts.load(Ordering::SeqCst),
     },
@@ -274,8 +275,8 @@ fn build_report(app: &AppHandle, elapsed: Duration) -> Value {
     "smokeCommandHelp": [
       "show", "hide", "quit", "window:close", "restart-node", "restart-registry", "restart-webadmin",
       "show-webadmin", "autostart-on", "autostart-off", "reload-config", "renderer-info",
-      "menu:tray-open", "menu:tray-hide", "menu:tray-open-webadmin",
-      "menu:tray-restart-webadmin", "menu:tray-restart-registry"
+      "menu:tray-open", "menu:tray-hide", "menu:tray-restart-window-admin",
+      "menu:tray-open-webadmin", "menu:tray-restart-webadmin", "menu:tray-restart-registry"
     ],
     "webAdmin": {
       "enabled": web_admin.enabled,

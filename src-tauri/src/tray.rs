@@ -39,6 +39,7 @@ use crate::{logging, node_proc, window, winutil};
 pub const TRAY_ID: &str = "main-tray";
 pub const MENU_OPEN: &str = "tray-open";
 pub const MENU_HIDE: &str = "tray-hide";
+pub const MENU_RESTART_WINDOW_ADMIN: &str = "tray-restart-window-admin";
 pub const MENU_OPEN_WEBADMIN: &str = "tray-open-webadmin";
 pub const MENU_RESTART_WEBADMIN: &str = "tray-restart-webadmin";
 pub const MENU_RESTART_REGISTRY: &str = "tray-restart-registry";
@@ -425,14 +426,15 @@ fn show_context_menu(app: &AppHandle, hwnd: HWND) {
   unsafe {
     append_item(menu, 1, "打开窗口");
     append_item(menu, 2, "关闭窗口");
+    append_item(menu, 3, "重启窗口的管理界面");
     append_separator(menu);
     if enabled {
-      append_item(menu, 3, "打开管理界面");
-      append_item(menu, 4, "重启管理界面");
+      append_item(menu, 4, "打开管理界面");
+      append_item(menu, 5, "重启管理界面");
     }
-    append_item(menu, 5, "重启镜像源服务");
+    append_item(menu, 6, "重启镜像源服务");
     append_separator(menu);
-    append_item(menu, 6, "退出程序");
+    append_item(menu, 7, "退出程序");
   }
 
   let mut point = POINT::default();
@@ -458,10 +460,11 @@ fn show_context_menu(app: &AppHandle, hwnd: HWND) {
       let id = match command {
         1 => MENU_OPEN,
         2 => MENU_HIDE,
-        3 => MENU_OPEN_WEBADMIN,
-        4 => MENU_RESTART_WEBADMIN,
-        5 => MENU_RESTART_REGISTRY,
-        6 => MENU_QUIT,
+        3 => MENU_RESTART_WINDOW_ADMIN,
+        4 => MENU_OPEN_WEBADMIN,
+        5 => MENU_RESTART_WEBADMIN,
+        6 => MENU_RESTART_REGISTRY,
+        7 => MENU_QUIT,
         _ => {
           logging::warn(format!("未知的托盘菜单命令 id：{command}"));
           return;
@@ -484,9 +487,13 @@ unsafe fn append_separator(menu: HMENU) {
 
 // ---------------------------------------------------------------- 菜单动作
 
-/// 更新托盘菜单文本（4 项/6 项），供 config_watch 实时刷新与日志/报告核对。
+/// 更新托盘菜单文本（默认 5 项/网页版管理开启时 7 项），供 config_watch 实时刷新与日志/报告核对。
 fn update_labels(app: &AppHandle, web_admin_enabled: bool) {
-  let mut labels = vec!["打开窗口".to_string(), "关闭窗口".to_string()];
+  let mut labels = vec![
+    "打开窗口".to_string(),
+    "关闭窗口".to_string(),
+    "重启窗口的管理界面".to_string(),
+  ];
   if web_admin_enabled {
     labels.push("打开管理界面".to_string());
     labels.push("重启管理界面".to_string());
@@ -505,12 +512,13 @@ fn update_labels(app: &AppHandle, web_admin_enabled: bool) {
 pub fn rebuild(app: &AppHandle, web_admin_enabled: bool) -> Result<(), String> {
   update_labels(app, web_admin_enabled);
   logging::info(format!(
-    "托盘菜单已刷新：{}「打开管理界面」「重启管理界面」",
+    "托盘菜单已刷新：{}（当前 {} 项；「重启窗口的管理界面」常显）",
     if web_admin_enabled {
-      "已显示"
+      "已显示「打开管理界面」「重启管理界面」"
     } else {
-      "已隐藏"
-    }
+      "已隐藏「打开管理界面」「重启管理界面」"
+    },
+    if web_admin_enabled { 7 } else { 5 }
   ));
   Ok(())
 }
@@ -530,6 +538,61 @@ fn handle_menu_action(app: &AppHandle, id: &str) {
     MENU_HIDE => {
       node_proc::log_to_gui(app, "info", "托盘操作：关闭窗口");
       run_on_main(app, |app| window::hide(app));
+    }
+    MENU_RESTART_WINDOW_ADMIN => {
+      node_proc::log_to_gui(app, "info", "托盘操作：重启窗口的管理界面");
+      let app = app.clone();
+      thread::spawn(move || {
+        match node_proc::send_cmd(
+          &app,
+          "restartWindowAdmin",
+          json!({}),
+          Duration::from_secs(30),
+        ) {
+          Ok(value) => {
+            let url = value
+              .get("url")
+              .and_then(|value| value.as_str())
+              .map(str::to_string);
+            let port = value
+              .get("port")
+              .and_then(|value| value.as_u64());
+            match url {
+              Some(url) => {
+                // 拿到新地址后先把 AppState 的内部管理端口/URL 更新为最新值，
+                // 再导航窗口；否则 smoke 报告 / app.info 会一直返回旧端口与旧令牌。
+                if let Some(port_num) = port.and_then(|value| u16::try_from(value).ok()) {
+                  app
+                    .state::<AppState>()
+                    .update_internal_admin(port_num, url.clone());
+                  logging::info(format!(
+                    "窗口管理界面已重启：port={port_num}，内部管理地址已更新，正在重新加载窗口"
+                  ));
+                } else {
+                  logging::warn(format!(
+                    "窗口管理界面已重启：Node 未返回有效 port（{port:?}），内部管理地址未更新"
+                  ));
+                }
+                node_proc::log_to_gui(&app, "info", "托盘操作：窗口管理界面已重启，正在重新加载");
+                let url_clone = url.clone();
+                run_on_main(&app, move |app| {
+                  window::navigate(app, &url_clone);
+                  window::apply_title(app);
+                  window::show(app);
+                });
+              }
+              None => {
+                logging::error(format!("重启窗口的管理界面：Node 未返回 url={value}"));
+                node_proc::log_to_gui(&app, "error", "重启窗口的管理界面失败：Node 未返回地址");
+              }
+            }
+          }
+          Err(err) => {
+            logging::error(format!("重启窗口的管理界面失败：{err}"));
+            node_proc::log_to_gui(&app, "error", format!("重启窗口的管理界面失败：{err}"));
+          }
+        }
+      });
     }
     MENU_RESTART_REGISTRY => {
       node_proc::log_to_gui(app, "info", "托盘操作：重启镜像源服务");
