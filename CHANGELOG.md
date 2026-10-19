@@ -38,7 +38,7 @@
 
 ## [0.0.10] - 2026-10-19
 
-> 本轮为**本地构建交付版，暂不发布 GitHub**；最近一次发布版仍是 [v0.0.5](https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.5)。
+> 本版本**发布到 GitHub Releases**：[v0.0.10 发布页](https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.10)（附件 `npm-mirror-desktop-0.0.10.exe` 与 `SHA256SUMS.txt`）。
 
 ### 修复
 

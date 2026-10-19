@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
   把 dist 下的桌面版单 exe 发布到 GitHub Releases。
@@ -125,6 +125,9 @@ if ($CheckToken) {
   # 校验清单也作为附件一起发布（可重复 --file）
   $sumPath = Join-Path $Root 'dist\SHA256SUMS.txt'
   if (Test-Path -LiteralPath $sumPath) { $nodeArgs += @('--file', $sumPath) }
+  # 自签代码签名证书（v0.0.8 起）：一并上传，便于用户校验/导入
+  $certPath = Join-Path $Root 'dist\codesign-suliyue.cer'
+  if (Test-Path -LiteralPath $certPath) { $nodeArgs += @('--file', $certPath) }
   if ($NotesFile) { $nodeArgs += @('--notes-file', $NotesFile) }
   if ($Draft) { $nodeArgs += '--draft' }
 }

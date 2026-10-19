@@ -5,7 +5,7 @@
 - 运行环境：Node.js **>= 18**（实测 Node.js 24），Windows / macOS / Linux 均可运行服务本体（一键脚本为 Windows `.cmd` / PowerShell）
 - 默认地址：镜像源（npm registry）<http://127.0.0.1:4873>，管理界面 <http://127.0.0.1:4874>（**两个独立监听**：管理界面只监听 `127.0.0.0/8` 本地回环，只有本机访问才能打开；端口不可与镜像源端口相同，可在配置页/`data/config.json` 的 `admin` 段修改）
 - 依赖数量：**0**（`dependencies` 与 `devDependencies` 均为空）
-- 桌面版：**单 exe（版本 0.0.10，本地构建交付版）**，`dist/npm-mirror-desktop-0.0.10.exe`，双击即用、内嵌 Node 运行时，带托盘 / 控制台页 / 工具页；v0.0.8 起窗口为**无边框 + 项目风格自绘标题栏**（v0.0.9 起窗口内右键不再弹出浏览器默认菜单；v0.0.10 起托盘菜单的窗口项按窗口状态动态只显示一项、托盘「重启镜像源服务」带气泡反馈），exe 带 **自签数字签名**（`CN=suliyue`） / 主数据目录选择 / 开机自启；**exe / 窗口 / 托盘图标统一使用网页版图标 `public/favicon.ico`**；**启动时自动检测 exe「低完整性（Low）」标签并可一键修复（UAC 提权 `icacls` 重置后自动重启）**；**必须从资源管理器双击运行**（见 [启动必读](#启动必读重要)），详见 [桌面版（单 exe）](#桌面版单-exe)
+- 桌面版：**单 exe（版本 0.0.10，已发布 GitHub Release）**，`dist/npm-mirror-desktop-0.0.10.exe`，双击即用、内嵌 Node 运行时，带托盘 / 控制台页 / 工具页；v0.0.8 起窗口为**无边框 + 项目风格自绘标题栏**（v0.0.9 起窗口内右键不再弹出浏览器默认菜单；v0.0.10 起托盘菜单的窗口项按窗口状态动态只显示一项、托盘「重启镜像源服务」带气泡反馈），exe 带 **自签数字签名**（`CN=suliyue`） / 主数据目录选择 / 开机自启；**exe / 窗口 / 托盘图标统一使用网页版图标 `public/favicon.ico`**；**启动时自动检测 exe「低完整性（Low）」标签并可一键修复（UAC 提权 `icacls` 重置后自动重启）**；**必须从资源管理器双击运行**（见 [启动必读](#启动必读重要)），详见 [桌面版（单 exe）](#桌面版单-exe)
 - 许可证：[MIT](LICENSE)
 
 ![管理界面概览](截图/管理界面-概览.png)
@@ -69,13 +69,13 @@ node cli.js start
 - **程序图标（v0.0.4）**：exe、窗口、托盘统一使用网页版图标 `public\favicon.ico`，不再是「旧图标 + Tauri logo」合成图，托盘和浏览器标签页视觉一致。
 - **托盘图标可能被 Windows 收进任务栏右侧的「^」溢出区**：点「^」把图标拖到任务栏即可固定显示；程序不会因为图标被收起而停止。
 - 数据目录默认 `<exe 所在目录>\data`；把 exe 放在项目的 `dist\` 里时，**会自动发现并使用上级项目的 `data\`**（详见下表与「使用要点」）。
-- **本次 0.0.10 为本地构建交付版，暂不发布 GitHub**：构建产物保留在 `dist\npm-mirror-desktop-0.0.10.exe`；是否发布待用户确认。最近一次 GitHub 发布仍是 [v0.0.5](https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.5)；v0.0.3 / v0.0.4 / v0.0.6 / v0.0.7 / v0.0.8 / v0.0.9 为按用户要求只在本地构建、未发布的版本。
+- **0.0.10 已发布到 GitHub Releases**：[v0.0.10 发布页](https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.10)（附件 `npm-mirror-desktop-0.0.10.exe` 与 `SHA256SUMS.txt`）；本机构建产物保留在 `dist\npm-mirror-desktop-0.0.10.exe`。最近发布版本为 v0.0.10；v0.0.3 / v0.0.4 / v0.0.6 / v0.0.7 / v0.0.8 / v0.0.9 为只在本地构建、未发布的版本。
 
 | 项目 | 说明 |
 | --- | --- |
-| 版本 | **0.0.10**（`package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` 三处一致；**本地构建交付版，暂不发布 GitHub**） |
+| 版本 | **0.0.10**（`package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` 三处一致；**已发布到 GitHub Releases（v0.0.10）**） |
 | 构建产物 | `dist/npm-mirror-desktop-0.0.10.exe`（单文件，内嵌 Node 运行时与全部程序文件；含自签数字签名） |
-| 下载 | 0.0.10 暂未发布、无下载链接（本地构建）；GitHub 最近发布版为 [v0.0.5](https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.5)，历史版本 [v0.0.2](https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.2) / [v0.0.1](https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.1) 仍可下载；v0.0.3 / v0.0.4 / v0.0.6 / v0.0.7 / v0.0.8 / v0.0.9 未发布（仅本机构建） |
+| 下载 | [GitHub Releases v0.0.10](https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.10)（附件 `npm-mirror-desktop-0.0.10.exe` 与 `SHA256SUMS.txt`）；历史版本 [v0.0.5](https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.5) / [v0.0.2](https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.2) / [v0.0.1](https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.1) 仍可下载；v0.0.3 / v0.0.4 / v0.0.6 / v0.0.7 / v0.0.8 / v0.0.9 未发布（仅本机构建） |
 | 发布者（版本信息） | **v0.0.6 起** exe 的「发布者 / CompanyName」固定为 `suliyue`（资源管理器 → 右键属性 → 详细信息可看到）；**v0.0.8 起 exe 带自签代码签名**（证书 `CN=suliyue`，签名文件随 dist 交付为 `codesign-suliyue.cer`）。因是**自签名**：未导入证书的机器上文件属性「数字签名」可能显示「无法验证」/`UnknownError`，UAC / SmartScreen 仍提示「未知发布者」——这是自签名的正常边界，只有正式 CA 证书才能消除（见下文「自签数字签名」） |
 | 程序图标 | **v0.0.4 起** exe / 窗口 / 托盘统一使用网页版图标 `public\favicon.ico`（与浏览器标签页同一套图标） |
 | 启动方式 | **Windows 资源管理器双击 exe**，或双击仓库根目录的 `启动桌面版.cmd`（自动检查「低完整性」标签并在需要时请求一次 UAC 修复，然后启动 `dist\` 里最新的桌面版 exe） |
@@ -166,7 +166,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/build-desktop.ps1
 - **低完整性标签提示（v0.0.5 构建脚本）**：构建完成后 `tools/build-desktop.ps1` 会用 `icacls` 检查产物；若新 exe 继承了工作区的 **Low（低完整性）** 标签，会打印黄色提示说明原因与修复方式（程序启动时可一键修复，也可双击 `启动桌面版.cmd` / `修复-桌面版启动限制.cmd`）。**这属于开发/沙盒环境的正常现象，不是构建失败**；发布到 GitHub 前一般不会带该标签（从仓库正常构建的 exe 不会继承）。每次重新编译后新 exe 会再次继承 Low，需要再次修复。
 - **发布者信息（v0.0.6 起）**：`src-tauri/tauri.conf.json` 中 `bundle.publisher = "suliyue"`，构建出的 exe 版本信息 `CompanyName` 固定为 `suliyue`（资源管理器 → 右键属性 → 详细信息可见）。**v0.0.8 起 exe 还会做自签代码签名**（证书 `CN=suliyue`，见上文「自签数字签名」）；因为是自签名，UAC / SmartScreen 仍显示「未知发布者」，这是正常现象，不是文件损坏。
 - **自签数字签名（v0.0.8 构建脚本）**：`tools\build-desktop.ps1` 复制 exe 到 `dist\` 后**默认先调用 `tools\sign-desktop.ps1` 签名**，再校验版本信息，最后才生成 `SHA256SUMS.txt`（签名会改变 exe 字节，顺序不能反；签名失败 = 构建失败）。证书/私钥在仓库 `.signing\`（**已 gitignore，不入库**），自签证书随产物复制为 `dist\codesign-suliyue.cer`；可用 `-NoSign` 跳过签名（仅供本地调试）。重新生成证书：`powershell -NoProfile -File tools\sign-desktop.ps1 -ForceNewCert -Exe dist\npm-mirror-desktop-0.0.10.exe`。
-- **本次 0.0.10 为本地构建交付版，暂不发布 GitHub**：产物 `dist\npm-mirror-desktop-0.0.10.exe`（含自签签名）、`dist\codesign-suliyue.cer` 与 `dist\SHA256SUMS.txt` 只在本机交付；是否发布待用户确认。最近一次 GitHub 发布仍是 [v0.0.5](https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.5)；v0.0.3 / v0.0.4 / v0.0.6 / v0.0.7 / v0.0.8 / v0.0.9 为本地构建、未发布。
+- **0.0.10 已发布到 GitHub Releases**：[v0.0.10 发布页](https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.10)（附件 `npm-mirror-desktop-0.0.10.exe` 与 `SHA256SUMS.txt`）；本机构建产物保留在 `dist\npm-mirror-desktop-0.0.10.exe`。最近发布版本为 v0.0.10；v0.0.3 / v0.0.4 / v0.0.6 / v0.0.7 / v0.0.8 / v0.0.9 为只在本地构建、未发布的版本。
 - 版本号唯一来源是 `package.json`，`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json` 用 `node tools/version.js --bump patch` 同步；发版用 `tools/release.ps1`（bump → 构建 → 提交 → tag → GitHub Release）。
 - 构建后若需要手动确认/修复完整性标签，可双击根目录的 **`修复-桌面版启动限制.cmd`**（不带参数=检查并在需要时请求 UAC 修复；`check`=只检查，退出码 0 正常 / 2 带 Low 标签；`repair`=内部提权后实际修复）；环境诊断可双击 **`诊断-桌面环境.cmd`**（只读，输出 `tmp\desktop-diagnose.txt`）。
 - `dist/`、`src-tauri/target/`、`src-tauri/embed/node.exe`、`.signing/`（签名证书私钥）均不入库（见 `.gitignore`）。
