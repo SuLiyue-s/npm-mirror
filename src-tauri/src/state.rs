@@ -108,6 +108,8 @@ pub struct AppState {
   pub tray_created: AtomicBool,
   /// 托盘注册失败原因（成功时为空字符串）
   pub tray_error: Mutex<String>,
+  /// 最近一次托盘气泡反馈（{attempted,ok,level,title,text,error,at}，冒烟报告 tray.lastBalloon 原样输出）
+  pub tray_last_balloon: Mutex<Option<Value>>,
   /// 冒烟命令 window:close 触发的退出（由退出流程判定是否清空托盘）
   pub smoke_intent_close: AtomicBool,
   /// 冒烟测试命令执行记录
@@ -159,6 +161,7 @@ impl AppState {
       tray_available: AtomicBool::new(false),
       tray_created: AtomicBool::new(false),
       tray_error: Mutex::new(String::new()),
+      tray_last_balloon: Mutex::new(None),
       smoke_intent_close: AtomicBool::new(false),
       smoke_commands: Mutex::new(Vec::new()),
       prefs: Mutex::new(DesktopPrefs::default()),
@@ -257,6 +260,15 @@ impl AppState {
 
   pub fn tray_error_snapshot(&self) -> String {
     lock(&self.tray_error).clone()
+  }
+
+  /// 记录最近一次托盘气泡反馈（沙箱内 NIM_MODIFY 预期失败，但文案仍需可断言）。
+  pub fn set_tray_last_balloon(&self, value: Value) {
+    *lock(&self.tray_last_balloon) = Some(value);
+  }
+
+  pub fn tray_last_balloon_snapshot(&self) -> Option<Value> {
+    lock(&self.tray_last_balloon).clone()
   }
 
   /// 受限启动环境：配置目录回退或托盘不可用。

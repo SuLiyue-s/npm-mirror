@@ -19,7 +19,8 @@ use windows::core::{w, HSTRING};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
-  Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
+  Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_ERROR, NIIF_INFO, NIM_ADD,
+  NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
   AppendMenuW, CreateIconFromResourceEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
@@ -412,10 +413,85 @@ pub fn shutdown() {
   logging::info("托盘图标已清理（NIM_DELETE）");
 }
 
+// ---------------------------------------------------------------- 托盘气泡
+
+/// 记录气泡结果到 AppState（冒烟报告 tray.lastBalloon 原样输出，自动化据此断言文案）。
+fn record_balloon(
+  app: &AppHandle,
+  attempted: bool,
+  ok: bool,
+  level: &str,
+  title: &str,
+  text: &str,
+  error: Option<String>,
+) {
+  let value = json!({
+    "attempted": attempted,
+    "ok": ok,
+    "level": level,
+    "title": title,
+    "text": text,
+    "error": error,
+    "at": logging::utc_now(),
+  });
+  app.state::<AppState>().set_tray_last_balloon(value);
+  logging::info(format!(
+    "托盘气泡：title={title} text={text} level={level} attempted={attempted} ok={ok} error={error:?}"
+  ));
+}
+
+/// 用已有隐藏窗口 + 托盘 uid 发 NIM_MODIFY + NIF_INFO 气泡（v0.0.10「重启镜像源服务」可见反馈）。
+/// 返回是否发送成功；隐藏窗口尚未创建时直接返回 false 并记录，不 panic。
+pub fn show_balloon(app: &AppHandle, title: &str, text: &str, is_error: bool) -> bool {
+  let level = if is_error { "error" } else { "info" };
+  let hwnd_value = TRAY_HWND.load(Ordering::SeqCst);
+  if hwnd_value == 0 {
+    record_balloon(
+      app,
+      false,
+      false,
+      level,
+      title,
+      text,
+      Some("托盘隐藏窗口尚未创建".to_string()),
+    );
+    return false;
+  }
+  let hwnd = HWND(hwnd_value as *mut c_void);
+  let mut data: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
+  data.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
+  data.hWnd = hwnd;
+  data.uID = TRAY_UID;
+  data.uFlags = NIF_INFO;
+  data.dwInfoFlags = if is_error { NIIF_ERROR } else { NIIF_INFO };
+  // 两者是 union：默认 uTimeout=0 由系统决定；显式给 5 秒更稳定（写 union 字段无需 unsafe）
+  data.Anonymous.uTimeout = 5000;
+  let title_wide: Vec<u16> = title.encode_utf16().take(63).collect();
+  data.szInfoTitle[..title_wide.len()].copy_from_slice(&title_wide);
+  let text_wide: Vec<u16> = text.encode_utf16().take(255).collect();
+  data.szInfo[..text_wide.len()].copy_from_slice(&text_wide);
+
+  let ok = unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) };
+  if ok.as_bool() {
+    record_balloon(app, true, true, level, title, text, None);
+    true
+  } else {
+    let err = std::io::Error::last_os_error();
+    let reason = format!(
+      "Shell_NotifyIconW(NIM_MODIFY) 返回失败：{err}（GetLastError={:?}）",
+      err.raw_os_error()
+    );
+    record_balloon(app, true, false, level, title, text, Some(reason));
+    false
+  }
+}
+
 // ---------------------------------------------------------------- 右键菜单
 
 fn show_context_menu(app: &AppHandle, hwnd: HWND) {
   let enabled = menu_enabled(app);
+  // v0.0.10：窗口可见性决定只显示「关闭窗口」或「打开窗口」中的一项
+  let window_visible = window::is_visible(app);
   let menu = match unsafe { CreatePopupMenu() } {
     Ok(menu) => menu,
     Err(err) => {
@@ -424,8 +500,11 @@ fn show_context_menu(app: &AppHandle, hwnd: HWND) {
     }
   };
   unsafe {
-    append_item(menu, 1, "打开窗口");
-    append_item(menu, 2, "关闭窗口");
+    if window_visible {
+      append_item(menu, 2, "关闭窗口");
+    } else {
+      append_item(menu, 1, "打开窗口");
+    }
     append_item(menu, 3, "重启窗口的管理界面");
     append_separator(menu);
     if enabled {
@@ -487,11 +566,15 @@ unsafe fn append_separator(menu: HMENU) {
 
 // ---------------------------------------------------------------- 菜单动作
 
-/// 更新托盘菜单文本（默认 5 项/网页版管理开启时 7 项），供 config_watch 实时刷新与日志/报告核对。
-fn update_labels(app: &AppHandle, web_admin_enabled: bool) {
+/// 计算当前应显示的菜单文本：窗口项随可见性动态只保留一项
+/// （可见→「关闭窗口」，不可见→「打开窗口」）。
+fn labels_for(web_admin_enabled: bool, window_visible: bool) -> Vec<String> {
   let mut labels = vec![
-    "打开窗口".to_string(),
-    "关闭窗口".to_string(),
+    if window_visible {
+      "关闭窗口".to_string()
+    } else {
+      "打开窗口".to_string()
+    },
     "重启窗口的管理界面".to_string(),
   ];
   if web_admin_enabled {
@@ -500,6 +583,13 @@ fn update_labels(app: &AppHandle, web_admin_enabled: bool) {
   }
   labels.push("重启镜像源服务".to_string());
   labels.push("退出程序".to_string());
+  labels
+}
+
+/// 更新托盘菜单文本缓存（默认 4 项/网页版管理开启时 6 项；窗口项动态）。
+fn update_labels(app: &AppHandle, web_admin_enabled: bool) {
+  let window_visible = window::is_visible(app);
+  let labels = labels_for(web_admin_enabled, window_visible);
   let state = app.state::<AppState>();
   *state::lock(&state.tray_labels) = labels.clone();
   if let Ok(mut guard) = LAST_LABELS.lock() {
@@ -507,18 +597,51 @@ fn update_labels(app: &AppHandle, web_admin_enabled: bool) {
   }
 }
 
+/// 窗口显/隐后刷新托盘菜单文本（v0.0.10，窗口 show/hide 唯一入口调用）。
+/// 仅当文本变化时写日志，避免频繁刷屏；不会弹菜单，也不会递归调用窗口操作。
+pub fn refresh_labels(app: &AppHandle) {
+  let web_admin_enabled = menu_enabled(app);
+  let window_visible = window::is_visible(app);
+  let labels = labels_for(web_admin_enabled, window_visible);
+  let changed = {
+    let state = app.state::<AppState>();
+    let mut guard = state::lock(&state.tray_labels);
+    if *guard == labels {
+      false
+    } else {
+      *guard = labels.clone();
+      true
+    }
+  };
+  if !changed {
+    return;
+  }
+  if let Ok(mut guard) = LAST_LABELS.lock() {
+    *guard = labels.clone();
+  }
+  logging::info(format!(
+    "托盘菜单状态已更新：窗口{}，当前首项「{}」（共 {} 项）",
+    if window_visible { "可见" } else { "不可见" },
+    labels.first().map(String::as_str).unwrap_or(""),
+    labels.len()
+  ));
+}
+
 /// 网页版管理开/关变化时刷新托盘菜单状态（目标 <1 秒内出现/消失）。
 /// 自绘菜单在每次右键时读取当前状态，这里只需更新文本缓存与日志。
 pub fn rebuild(app: &AppHandle, web_admin_enabled: bool) -> Result<(), String> {
   update_labels(app, web_admin_enabled);
+  let window_visible = window::is_visible(app);
   logging::info(format!(
-    "托盘菜单已刷新：{}（当前 {} 项；「重启窗口的管理界面」常显）",
+    "托盘菜单已刷新：{}（当前 {} 项；窗口{}，「{}」为窗口项，随可见性动态显示）",
     if web_admin_enabled {
       "已显示「打开管理界面」「重启管理界面」"
     } else {
       "已隐藏「打开管理界面」「重启管理界面」"
     },
-    if web_admin_enabled { 7 } else { 5 }
+    if web_admin_enabled { 6 } else { 4 },
+    if window_visible { "可见" } else { "不可见" },
+    if window_visible { "关闭窗口" } else { "打开窗口" }
   ));
   Ok(())
 }
@@ -600,6 +723,8 @@ fn handle_menu_action(app: &AppHandle, id: &str) {
       thread::spawn(move || {
         if !node_proc::node_alive(&app) {
           logging::warn("Node 未运行：重启镜像源服务改为完整重启程序");
+          node_proc::log_to_gui(&app, "warn", "重启镜像源服务：Node 未运行，正在重启程序…");
+          show_balloon(&app, "重启镜像源服务", "Node 未运行，正在重启程序…", false);
           node_proc::restart_app(&app);
           return;
         }
@@ -609,10 +734,25 @@ fn handle_menu_action(app: &AppHandle, id: &str) {
           json!({}),
           Duration::from_secs(20),
         ) {
-          Ok(value) => logging::info(format!("镜像源服务已重启：{value}")),
+          Ok(value) => {
+            logging::info(format!("镜像源服务已重启：{value}"));
+            let url = value
+              .get("url")
+              .and_then(|value| value.as_str())
+              .unwrap_or("");
+            let text = if url.is_empty() {
+              "镜像源服务已重启".to_string()
+            } else {
+              format!("镜像源服务已重启：{url}")
+            };
+            node_proc::log_to_gui(&app, "info", text.clone());
+            show_balloon(&app, "重启镜像源服务", &text, false);
+          }
           Err(err) => {
             logging::error(format!("重启镜像源服务失败：{err}"));
-            node_proc::log_to_gui(&app, "error", format!("重启镜像源服务失败：{err}"));
+            let text = format!("重启镜像源服务失败：{err}");
+            node_proc::log_to_gui(&app, "error", text.clone());
+            show_balloon(&app, "重启镜像源服务", &text, true);
           }
         }
       });

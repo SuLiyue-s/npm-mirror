@@ -36,6 +36,27 @@
 - `test/run-all.js` 一键自检（约 40~60 秒，`--destructive` 含破坏性用例），已移除 `--full` 完整回归参数；与 6 个 `test/ui-e2e-*.js` 默认地址改为管理界面端口并分别探测两个监听
 - 破坏性用例（重启镜像源服务 / 重启管理界面 / 清空日志）默认跳过，加 `--destructive` 才执行
 
+## [0.0.10] - 2026-10-19
+
+> 本轮为**本地构建交付版，暂不发布 GitHub**；最近一次发布版仍是 [v0.0.5](https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.5)。
+
+### 修复
+
+- GUI 桌面模式服务页点「重启管理界面」不再卡在刷新遮罩里：桌面模式下只重绑网页版管理监听并弹出 toast 提示，不进入刷新等待；接口 `POST /__admin/api/service/restart-admin` 返回 `{target:'admin', enabled, url, listenError}`，桌面窗口、控制台、工具页都不中断（浏览器里的网页版仍是「重启 + 自动刷新」）。
+
+### 新增
+
+- 托盘「重启镜像源服务」新增气泡通知反馈：重启成功后托盘弹气泡（标题 / 内容含「已重启」），不打断窗口与页面；受限会话里系统通知接口不可用导致气泡不显示属环境限制，尝试与失败原因写入 smoke 报告 `tray.lastBalloon{attempted, ok, level, title, text, error, at}` 和 `desktop.log`。
+- 托盘「打开窗口 / 关闭窗口」按窗口状态动态只显示一项：网页版管理关闭时菜单 4 项、开启时 6 项；第一项窗口项按 `window.visible` 动态切换（窗口隐藏 / 不可见 → 「打开窗口」），不再同时出现两项；开关后 ≤2 秒内实时更新，关闭后 ≤1 秒缩回。
+
+### 文档
+
+- README / 使用说明新增「托盘菜单与重启行为（v0.0.10）」章节，补充桌面版服务页「重启管理界面」语义、托盘气泡与动态窗口项说明、常见问题与排障。
+
+### 测试
+
+- `test/desktop-e2e.ps1`：托盘菜单断言改为 4/6 项逐项顺序校验（窗口项按 smoke 报告 `window.visible` 动态判定，并断言不同时出现两项）；新增 `menu:tray-restart-registry` 后 `tray.lastBalloon` 气泡断言（attempted=true、text 含「已重启」，受限会话 ok=false 且 error 非空属环境限制）；新增令牌会话 `POST /__admin/api/service/restart-admin` 返回 200 且 `data.target='admin'`、`enabled` 为布尔的断言（不要求窗口 reload）；`window:close` 后托盘第一项仍为「打开窗口」断言。
+- **v0.0.10 实测（2026-10-19 23:33:48，对 `dist\npm-mirror-desktop-0.0.10.exe` · 96,890,184 B · SHA256 `e36bf656…def272`，构建 23:25:02，签名者 `CN=suliyue`）：341 项 = 326 PASS / 8 FAIL（全窗口类环境限制）/ 7 SKIP，exit 3，`nonWindowFailures=0`**；托盘 4/6 项动态单项、`tray.lastBalloon` 气泡、`POST /__admin/api/service/restart-admin` 桌面语义等 v0.0.10 新增断言全部 PASS；8 项窗口类失败与 7 项 SKIP 需真实桌面人工（M42–M44）；单测 path 24/24、bridge 11/11、cancel 13/13（exit 0）；Lead 独立冒烟 65/65 PASS。
 ## [0.0.9] - 2026-10-19
 
 **桌面版屏蔽窗口内浏览器默认右键菜单（本地构建交付，暂未发布 GitHub）**：窗口 WebView2 的 `AreDefaultContextMenusEnabled` 设为 `false` 并读回确认，窗口内右键不再弹出浏览器默认菜单（返回 / 刷新 / 另存为 / 打印 / 更多工具）；网页版在普通浏览器标签页使用不受影响。

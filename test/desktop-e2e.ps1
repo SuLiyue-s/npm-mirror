@@ -27,8 +27,9 @@
         - exe 可启动，镜像源服务 /-/ping 返回 200
         - admin.port 不监听（默认关闭网页版管理）
         - 桌面窗口存在（窗口标题/窗口 URL=内部回环管理端口，能加载现有管理界面）
-        - 托盘图标与菜单项：关闭网页版管理时 5 项（打开窗口 / 关闭窗口 /
-          重启窗口的管理界面 / 重启镜像源服务 / 退出程序），没有「打开管理界面」「重启管理界面」
+        - 托盘图标与菜单项（v0.0.10）：关闭网页版管理时 4 项（窗口项 / 重启窗口的管理界面 /
+          重启镜像源服务 / 退出程序），窗口项按窗口状态动态只显示一项——窗口可见时为
+          「关闭窗口」、窗口不可见（含受限会话）时为「打开窗口」；没有「打开管理界面」「重启管理界面」
         - 内部管理端口令牌门禁（v0.0.7）：测试报告给出 internalAdminUrl（http://127.0.0.1:
           <端口>/?__mirror_token=…）；无令牌/错误令牌访问 /、/app.js、管理 API → 403；
           正确令牌 → 302 + Set-Cookie(HttpOnly; SameSite=Strict) → 带 Cookie 200；
@@ -71,13 +72,18 @@
         - service.restartRegistry 动作、autostart.get（只读）动作
         - 开机自启：当前未开启时做「开启 → 校验 HKCU\...\Run 值 → 关闭 → 校验清除」
           往返（当前已开启则只读校验，不覆盖用户已有自启配置）
-        - 托盘菜单为 7 项（多出「打开管理界面」「重启管理界面」「重启窗口的管理界面」），
+        - 托盘菜单为 6 项（窗口项 / 重启窗口的管理界面 / 打开管理界面 / 重启管理界面 /
+          重启镜像源服务 / 退出程序；窗口项按窗口状态动态只显示一项，v0.0.10），
           且菜单「重启管理界面 / 重启镜像源服务 / 重启窗口的管理界面」动作生效；
           「重启窗口的管理界面」会换发新的内部管理端口与令牌（旧端口失效、新令牌门禁有效）；
-          「打开管理界面」动作可执行（受限会话无法真正拉起浏览器时记 SKIP 并注明）
+          「打开管理界面」动作可执行（受限会话无法真正拉起浏览器时记 SKIP 并注明）；
+          「重启镜像源服务」后报告 tray.lastBalloon 气泡反馈（attempted=true、text 含「已重启」，
+          受限会话 NIM_MODIFY 失败时 ok=false 且 error 非空属环境限制）
+        - 服务页「重启管理界面」桌面语义（v0.0.10）：令牌会话 POST /service/restart-admin
+          返回 200 且 data.target='admin'、enabled 为布尔（不要求窗口 reload、不卡遮罩）
         - PUT /config 拒绝路径穿越（storage.dir='..\..\evil' 返回 400）
         - PUT /config 关闭 admin.enabled 后管理端口断开、镜像源端口不受影响，
-          托盘菜单实时缩回 5 项（≤1s）
+          托盘菜单实时缩回 4 项（≤1s，窗口项按状态动态单项）
     · 阶段 3（admin.enabled=true）
         - 服务重启后控制台增量参数 after=旧 seq 不崩溃（seq 重置兼容）
         - app.quit 优雅退出：进程结束、两个监听都消失、无残留 node 进程
@@ -1583,10 +1589,15 @@ if ($rep1Ready) {
   $tray1 = Get-Prop $rep1 'tray'
   Assert-True '托盘图标已创建（id=main-tray）' ((Get-Prop $tray1 'id') -eq 'main-tray') ('实际 ' + (Get-Prop $tray1 'id'))
   $trayLabels1 = @(Get-Prop $tray1 'labels')
-  # v0.0.7：托盘默认 5 项（新增「重启窗口的管理界面」——重启窗口用的内部管理界面/端口与令牌）
-  $needLabels = @('打开窗口', '关闭窗口', '重启窗口的管理界面', '重启镜像源服务', '退出程序')
-  $missing1 = @($needLabels | Where-Object { -not ($trayLabels1 -contains $_) })
-  Assert-True '默认托盘菜单包含 5 项「打开窗口 / 关闭窗口 / 重启窗口的管理界面 / 重启镜像源服务 / 退出程序」' (($missing1.Count -eq 0) -and ($trayLabels1.Count -eq 5)) ('实际菜单（' + $trayLabels1.Count + ' 项）：' + ($trayLabels1 -join ' / ') + '；缺少：' + ($missing1 -join '、'))
+  # v0.0.10：托盘常规 4 项；「打开窗口 / 关闭窗口」按窗口状态动态只显示一项
+  # （窗口可见 → 关闭窗口；窗口不可见，含受限会话 window.visible 为 false/null → 打开窗口）。
+  $winVisible1 = Get-Prop $win1 'visible'
+  $winItem1 = '打开窗口'
+  if ($winVisible1 -eq $true) { $winItem1 = '关闭窗口' }
+  $needLabels1 = @($winItem1, '重启窗口的管理界面', '重启镜像源服务', '退出程序')
+  $labelsOrderOk1 = (($trayLabels1 -join '|') -eq ($needLabels1 -join '|'))
+  Assert-True '默认托盘菜单 4 项且顺序正确（窗口项按状态动态 / 重启窗口的管理界面 / 重启镜像源服务 / 退出程序，v0.0.10）' (($trayLabels1.Count -eq 4) -and $labelsOrderOk1) ('window.visible=' + $winVisible1 + '；期望菜单：' + ($needLabels1 -join ' / ') + '；实际菜单（' + $trayLabels1.Count + ' 项）：' + ($trayLabels1 -join ' / '))
+  Assert-True '默认托盘只显示一个窗口项（不同时含「打开窗口」「关闭窗口」，v0.0.10）' (-not (($trayLabels1 -contains '打开窗口') -and ($trayLabels1 -contains '关闭窗口'))) ('实际菜单：' + ($trayLabels1 -join ' / '))
   Assert-True '默认关闭网页版管理时托盘菜单不含「打开管理界面」' (-not ($trayLabels1 -contains '打开管理界面')) ('实际菜单：' + ($trayLabels1 -join ' / '))
   Assert-True '默认关闭网页版管理时托盘菜单不含「重启管理界面」' (-not ($trayLabels1 -contains '重启管理界面')) ('实际菜单：' + ($trayLabels1 -join ' / '))
 
@@ -1738,12 +1749,17 @@ if ($rep1Ready) {
     $appearedRep = Wait-SmokeReport {
       param($r)
       $lb = @(Get-Prop (Get-Prop $r 'tray') 'labels')
-      return (($lb -contains '打开管理界面') -and ($lb -contains '重启管理界面'))
+      return (($lb.Count -eq 6) -and ($lb -contains '打开管理界面') -and ($lb -contains '重启管理界面'))
     } 5 200
     $sw1f.Stop()
     $appearedMs = $sw1f.ElapsedMilliseconds
     $appearedLabels = @(Get-Prop (Get-Prop $appearedRep 'tray') 'labels')
-    Assert-True '直接改 config.json admin.enabled=true 后托盘出现「打开管理界面」「重启管理界面」（≤2s）' (($null -ne $appearedRep) -and $appearedMs -le 2000) ('耗时=' + $appearedMs + 'ms；实际菜单：' + ($appearedLabels -join ' / '))
+    # v0.0.10：网页版管理开启后 6 项，顺序固定；第一项窗口项按 window.visible 动态
+    $appearedWinItem = '打开窗口'
+    if ((Get-Prop (Get-Prop $appearedRep 'window') 'visible') -eq $true) { $appearedWinItem = '关闭窗口' }
+    $needAppeared = @($appearedWinItem, '重启窗口的管理界面', '打开管理界面', '重启管理界面', '重启镜像源服务', '退出程序')
+    $appearedOrderOk = (($appearedLabels -join '|') -eq ($needAppeared -join '|'))
+    Assert-True '直接改 config.json admin.enabled=true 后托盘出现「打开管理界面」「重启管理界面」且 6 项顺序正确（≤2s，v0.0.10）' (($null -ne $appearedRep) -and ($appearedMs -le 2000) -and $appearedOrderOk) ('耗时=' + $appearedMs + 'ms；期望菜单：' + ($needAppeared -join ' / ') + '；实际菜单：' + ($appearedLabels -join ' / '))
 
     $sw1fRevert = [System.Diagnostics.Stopwatch]::StartNew()
     $cfg1fRevert = Get-Content $cfgPath1f -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -1753,11 +1769,16 @@ if ($rep1Ready) {
     $disappearedRep = Wait-SmokeReport {
       param($r)
       $lb = @(Get-Prop (Get-Prop $r 'tray') 'labels')
-      return ((-not ($lb -contains '打开管理界面')) -and (-not ($lb -contains '重启管理界面')))
+      return (($lb.Count -eq 4) -and (-not ($lb -contains '打开管理界面')) -and (-not ($lb -contains '重启管理界面')))
     } 5 200
     $sw1fRevert.Stop()
     $disappearedMs = $sw1fRevert.ElapsedMilliseconds
-    Assert-True '直接改回 admin.enabled=false 后两项从托盘消失（≤2s）' (($null -ne $disappearedRep) -and $disappearedMs -le 2000) ('耗时=' + $disappearedMs + 'ms')
+    $disappearedLabels = @(Get-Prop (Get-Prop $disappearedRep 'tray') 'labels')
+    $disappearedWinItem = '打开窗口'
+    if ((Get-Prop (Get-Prop $disappearedRep 'window') 'visible') -eq $true) { $disappearedWinItem = '关闭窗口' }
+    $needDisappeared = @($disappearedWinItem, '重启窗口的管理界面', '重启镜像源服务', '退出程序')
+    $disappearedOrderOk = (($disappearedLabels -join '|') -eq ($needDisappeared -join '|'))
+    Assert-True '直接改回 admin.enabled=false 后两项从托盘消失且 4 项顺序正确（≤2s，v0.0.10）' (($null -ne $disappearedRep) -and ($disappearedMs -le 2000) -and $disappearedOrderOk) ('耗时=' + $disappearedMs + 'ms；实际菜单：' + ($disappearedLabels -join ' / '))
     Assert-True '配置轮询刷新后镜像源服务仍在线（/-/ping 200）' (Test-Ping $RegistryPort)
   } catch {
     Assert-True '直接编辑 config.json 触发托盘刷新（阶段 1f）' $false ('异常：' + $_.Exception.Message)
@@ -1956,6 +1977,18 @@ $repHidden = Wait-SmokeReport { param($r) (Get-Prop (Get-Prop $r 'window') 'visi
 Assert-True '菜单「关闭窗口」后窗口隐藏（进程与服务继续）' ($hiddenByMenu -or ($null -ne $repHidden)) '' 'window'
 Assert-True '托盘菜单隐藏窗口后镜像源服务仍在线（/-/ping 200）' (Test-Ping $RegistryPort)
 Assert-True '托盘菜单隐藏窗口后桌面进程仍存活' (-not $p1.HasExited)
+# v0.0.10：窗口项随窗口状态动态；隐藏后菜单第一项应是「打开窗口」且仍为 4 项
+$repHiddenItem = Wait-SmokeReport {
+  param($r)
+  $lb = @(Get-Prop (Get-Prop $r 'tray') 'labels')
+  $v = Get-Prop (Get-Prop $r 'window') 'visible'
+  $expect = '打开窗口'
+  if ($v -eq $true) { $expect = '关闭窗口' }
+  return (($lb.Count -eq 4) -and (@($lb)[0] -eq $expect) -and (-not (($lb -contains '打开窗口') -and ($lb -contains '关闭窗口'))))
+} 10 300
+$hiddenLabels = @()
+if ($null -ne $repHiddenItem) { $hiddenLabels = @(Get-Prop (Get-Prop $repHiddenItem 'tray') 'labels') }
+Assert-True '隐藏窗口后托盘窗口项按状态动态为单项（v0.0.10）' (($null -ne $repHiddenItem) -and ($hiddenLabels.Count -eq 4)) ('实际菜单（' + $hiddenLabels.Count + ' 项）：' + ($hiddenLabels -join ' / '))
 
 # ---------------------------------------------------------------------------
 # 阶段 1c-3：关闭窗口行为（v0.0.4：托盘可用 → 隐藏；托盘不可用 → 退出程序）
@@ -1981,6 +2014,15 @@ if ($null -eq $trayAvailForClose) {
     Assert-True '托盘可用时：关闭窗口后窗口隐藏（进程与服务继续）' ($hidden1c -or ($null -ne $repHidden1c)) '' 'window'
     Assert-True '托盘可用时：关闭窗口后桌面进程仍存活' (-not $p1.HasExited)
     Assert-True '托盘可用时：关闭窗口后镜像源服务仍在线（/-/ping 200）' (Test-Ping $RegistryPort)
+    # v0.0.10：窗口已隐藏 → 托盘第一项应实时变回「打开窗口」
+    $repClosedItem = Wait-SmokeReport {
+      param($r)
+      $lb = @(Get-Prop (Get-Prop $r 'tray') 'labels')
+      return (($lb.Count -eq 4) -and (@($lb)[0] -eq '打开窗口'))
+    } 10 300
+    $closedLabels = @()
+    if ($null -ne $repClosedItem) { $closedLabels = @(Get-Prop (Get-Prop $repClosedItem 'tray') 'labels') }
+    Assert-True 'window:close 隐藏窗口后托盘第一项为「打开窗口」（v0.0.10）' (($null -ne $repClosedItem) -and ($closedLabels.Count -eq 4) -and (@($closedLabels)[0] -eq '打开窗口')) ('实际菜单：' + ($closedLabels -join ' / '))
     # 窗口已隐藏：重新打开，供后续阶段菜单动作使用
     Send-SmokeCommand 'menu:tray-open' 20 | Out-Null
     Wait-Until { (Get-AppWindows -RootPid $p1.Id).Count -gt 0 } 15 400 | Out-Null
@@ -1998,6 +2040,7 @@ if ($null -eq $trayAvailForClose) {
       Assert-True '托盘不可用时：退出后无本测试的 node 残留进程' ($nodeLeft1c.Count -eq 0) ('残留：' + (($nodeLeft1c | ForEach-Object { $_.ProcessId }) -join ','))
     }
     Assert-Skip '关闭窗口 = 隐藏（进程与服务继续）' '本会话托盘注册被系统拒绝（tray.available=false），「托盘可用时关闭窗口=隐藏」分支需在普通桌面会话人工验收'
+    Assert-Skip 'window:close 隐藏窗口后托盘第一项为「打开窗口」（v0.0.10 动态窗口项）' '本会话托盘注册被系统拒绝，托盘可用时的动态窗口项需在普通桌面会话人工验收'
   }
 }
 
@@ -2355,20 +2398,58 @@ Assert-True 'service.restartRegistry 动作返回成功' ($restartResp.Status -e
 $registryBack = Wait-Until { Test-Ping $RegistryPort } 30 500
 Assert-True '重启镜像源后服务恢复在线' $registryBack
 
+# v0.0.10：服务页「重启管理界面」在桌面模式改为「只重绑网页版管理监听 + 返回结构化结果」，
+# 不再进入「刷新等待/遮罩」流程（前端 toast 属 GUI 交互，由人工验收；这里验证接口契约）。
+$sess2RestartAdmin = Open-InternalSession $rep2Gate '阶段 2c 服务页重启管理界面'
+if ($sess2RestartAdmin.Ok) {
+  $restartAdminResp = Invoke-CurlRaw ($sess2RestartAdmin.Base + '/__admin/api/service/restart-admin') 'POST' @{} 25 -CookieJar $sess2RestartAdmin.Jar
+  Assert-True '服务页 restart-admin（桌面模式）返回 200' ($restartAdminResp.Status -eq 200) ('状态=' + $restartAdminResp.Status + ' 响应=' + $restartAdminResp.Content)
+  $restartAdminJson = $null
+  try { $restartAdminJson = $restartAdminResp.Content | ConvertFrom-Json } catch { $restartAdminJson = $null }
+  $restartAdminData = $null
+  if ($null -ne $restartAdminJson) { $restartAdminData = Get-Prop $restartAdminJson 'data' }
+  Assert-True '服务页 restart-admin 返回 data 对象' ($null -ne $restartAdminData) ('响应=' + $restartAdminResp.Content)
+  if ($null -ne $restartAdminData) {
+    $raTarget = Get-Prop $restartAdminData 'target'
+    Assert-True '服务页 restart-admin data.target=admin（只重绑网页版管理监听）' ($raTarget -eq 'admin') ('实际 target=' + $raTarget)
+    $raEnabled = Get-Prop $restartAdminData 'enabled'
+    Assert-True '服务页 restart-admin data.enabled 为布尔' ($raEnabled -is [bool]) ('实际 enabled=' + $raEnabled)
+    $raUrlProp = $restartAdminData.PSObject.Properties['url']
+    Assert-True '服务页 restart-admin data 含 url 字段' ($null -ne $raUrlProp) ('响应=' + $restartAdminResp.Content)
+    $raErrProp = $restartAdminData.PSObject.Properties['listenError']
+    Assert-True '服务页 restart-admin data 含 listenError 字段' ($null -ne $raErrProp) ('响应=' + $restartAdminResp.Content)
+    if ($raEnabled -eq $true -and $null -ne $raUrlProp) {
+      $raUrl = [string]$raUrlProp.Value
+      Assert-True '服务页 restart-admin data.enabled=true 时 url 为管理界面地址' ($raUrl -match '^http://127\.0\.0\.1:\d+/?') ('url=' + $raUrl)
+    }
+  }
+  $adminStill = Wait-Until { (Test-Port $AdminPort) } 15 300
+  Assert-True '服务页 restart-admin 后网页版管理端口仍在监听（不要求窗口 reload）' $adminStill
+  Assert-True '服务页 restart-admin 后网页版管理仍可访问（GET / 200）' ((Invoke-Api ($adminBase + '/') 'GET' $null 10).Status -eq 200)
+  Assert-True '服务页 restart-admin 后镜像源服务不受影响（/-/ping 200）' (Test-Ping $RegistryPort)
+  Assert-True '服务页 restart-admin 后桌面进程仍存活（未重启 Node）' (-not $p2run.HasExited)
+} else {
+  Assert-Skip '服务页 restart-admin（桌面模式）接口断言' '阶段 2 未能取得内部令牌会话'
+}
+
 # 托盘菜单：网页版管理开启后应多出「重启管理界面」项，并可用菜单动作重启两套服务
 Section '阶段 2c-1：托盘菜单（网页版管理开启后的菜单项）'
 $rep2 = Wait-SmokeReport {
   param($report)
   $labels = @(Get-Prop (Get-Prop $report 'tray') 'labels')
-  return (($labels -contains '打开管理界面') -and ($labels -contains '重启管理界面'))
+  return (($labels.Count -eq 6) -and ($labels -contains '打开管理界面') -and ($labels -contains '重启管理界面'))
 } 30 400
 $trayLabels2 = @()
 if ($null -ne $rep2) { $trayLabels2 = @(Get-Prop (Get-Prop $rep2 'tray') 'labels') }
 Assert-True '开启网页版管理后托盘菜单出现「打开管理界面」' ($trayLabels2 -contains '打开管理界面') ('实际菜单：' + ($trayLabels2 -join ' / '))
 Assert-True '开启网页版管理后托盘菜单出现「重启管理界面」' ($trayLabels2 -contains '重启管理界面') ('实际菜单：' + ($trayLabels2 -join ' / '))
-$needLabels2 = @('打开窗口', '关闭窗口', '打开管理界面', '重启管理界面', '重启窗口的管理界面', '重启镜像源服务', '退出程序')
-$missing2 = @($needLabels2 | Where-Object { -not ($trayLabels2 -contains $_) })
-Assert-True '开启网页版管理后托盘菜单项齐全（7 项）' (($missing2.Count -eq 0) -and ($trayLabels2.Count -eq 7)) ('实际菜单（' + $trayLabels2.Count + ' 项）：' + ($trayLabels2 -join ' / ') + '；缺少：' + ($missing2 -join '、'))
+# v0.0.10：网页版管理开启后 6 项，顺序固定；第一项窗口项按 window.visible 动态（沙箱 false → 打开窗口）
+$winItem2 = '打开窗口'
+if ((Get-Prop (Get-Prop $rep2 'window') 'visible') -eq $true) { $winItem2 = '关闭窗口' }
+$needLabels2 = @($winItem2, '重启窗口的管理界面', '打开管理界面', '重启管理界面', '重启镜像源服务', '退出程序')
+$labelsOrderOk2 = (($trayLabels2 -join '|') -eq ($needLabels2 -join '|'))
+Assert-True '开启网页版管理后托盘菜单 6 项且顺序正确（窗口项动态 / 重启窗口的管理界面 / 打开管理界面 / 重启管理界面 / 重启镜像源服务 / 退出程序，v0.0.10）' (($trayLabels2.Count -eq 6) -and $labelsOrderOk2) ('window.visible=' + (Get-Prop (Get-Prop $rep2 'window') 'visible') + '；期望菜单：' + ($needLabels2 -join ' / ') + '；实际菜单（' + $trayLabels2.Count + ' 项）：' + ($trayLabels2 -join ' / '))
+Assert-True '开启网页版管理后托盘只显示一个窗口项（不同时含「打开窗口」「关闭窗口」，v0.0.10）' (-not (($trayLabels2 -contains '打开窗口') -and ($trayLabels2 -contains '关闭窗口'))) ('实际菜单：' + ($trayLabels2 -join ' / '))
 Assert-True '开启网页版管理后托盘菜单包含「重启窗口的管理界面」（v0.0.7）' ($trayLabels2 -contains '重启窗口的管理界面') ('实际菜单：' + ($trayLabels2 -join ' / '))
 if ($null -ne $rep2) {
   $repWebAdmin = Get-Prop $rep2 'webAdmin'
@@ -2452,6 +2533,35 @@ $regBack = Wait-Until { Test-Ping $RegistryPort } 60 500
 Assert-True '托盘重启镜像源服务后服务恢复在线（/-/ping 200）' $regBack
 Assert-True '托盘重启镜像源服务后桌面进程仍存活' (-not $p2run.HasExited)
 Assert-True '托盘重启镜像源服务后网页版管理仍可访问' ((Invoke-Api ($adminBase + '/') 'GET' $null 10).Status -eq 200)
+
+# v0.0.10：托盘「重启镜像源服务」新增气泡通知反馈。受限会话 NIM_MODIFY 可能失败
+# （ok=false 且 error 给出原因），但 attempted=true 且 text 记录「已重启」属于契约；
+# 真实桌面会话应 ok=true。气泡外观/真实弹出属人工验收项（M43）。
+$repBalloon = Wait-SmokeReport {
+  param($r)
+  $b = Get-Prop (Get-Prop $r 'tray') 'lastBalloon'
+  if ($null -eq $b) { return $false }
+  return ([string](Get-Prop $b 'text') -match '已重启')
+} 20 300
+$balloon = $null
+if ($null -ne $repBalloon) { $balloon = Get-Prop (Get-Prop $repBalloon 'tray') 'lastBalloon' }
+Assert-True '托盘「重启镜像源服务」后 smoke 报告 tray.lastBalloon 记录气泡反馈（v0.0.10）' ($null -ne $balloon) '报告未包含 lastBalloon 或其中的 text 不含「已重启」'
+if ($null -ne $balloon) {
+  $balloonProps = @($balloon.PSObject.Properties.Name)
+  Assert-True '气泡反馈 text 含「已重启」（记录重启结果）' ([string](Get-Prop $balloon 'text') -match '已重启') ('title=' + (Get-Prop $balloon 'title') + '，text=' + (Get-Prop $balloon 'text'))
+  Assert-True '气泡反馈 attempted=true（已尝试调用系统通知接口）' ((Get-Prop $balloon 'attempted') -eq $true) ('实际 attempted=' + (Get-Prop $balloon 'attempted'))
+  Assert-True '气泡反馈字段齐全（attempted/ok/level/title/text/error/at）' (($balloonProps -contains 'attempted') -and ($balloonProps -contains 'ok') -and ($balloonProps -contains 'level') -and ($balloonProps -contains 'title') -and ($balloonProps -contains 'text') -and ($balloonProps -contains 'error') -and ($balloonProps -contains 'at')) ('实际字段=' + ($balloonProps -join ','))
+  Assert-True '气泡反馈 ok 为布尔' ((Get-Prop $balloon 'ok') -is [bool]) ('实际 ok=' + (Get-Prop $balloon 'ok'))
+  $balloonOk = Get-Prop $balloon 'ok'
+  $balloonErr = [string](Get-Prop $balloon 'error')
+  $balloonLevel = [string](Get-Prop $balloon 'level')
+  Assert-True '气泡反馈 level 为字符串（info/error）' ($balloonLevel.Length -gt 0) ('实际 level=' + $balloonLevel)
+  if ($balloonOk -eq $false) {
+    Assert-True '受限会话气泡发送失败时 error 给出原因（环境限制，重启本身已成功）' ($balloonErr.Length -gt 0) '实际 error 为空，无法说明失败原因'
+  } else {
+    Assert-True '气泡发送成功时 error 为空' ($balloonErr.Length -eq 0) ('实际 error=' + $balloonErr)
+  }
+}
 
 # 托盘菜单「打开管理界面」：用系统默认浏览器打开网页版管理页面。
 # 受限会话里系统浏览器拉不起来（且无法枚举浏览器窗口），只断言菜单动作被执行；
@@ -2540,12 +2650,16 @@ Assert-True '关闭网页版管理后镜像源服务不受影响（/-/ping 200�
 $menuShrunkRep = Wait-SmokeReport {
   param($r)
   $lb = @(Get-Prop (Get-Prop $r 'tray') 'labels')
-  return (($lb.Count -eq 5) -and (-not ($lb -contains '打开管理界面')) -and (-not ($lb -contains '重启管理界面')) -and ($lb -contains '重启窗口的管理界面'))
+  return (($lb.Count -eq 4) -and (-not ($lb -contains '打开管理界面')) -and (-not ($lb -contains '重启管理界面')) -and ($lb -contains '重启窗口的管理界面'))
 } 4 100
 $swOff.Stop()
 $menuShrunkMs = $swOff.ElapsedMilliseconds
 $menuShrunkLabels = @(Get-Prop (Get-Prop $menuShrunkRep 'tray') 'labels')
-Assert-True '关闭网页版管理后托盘菜单实时缩回 5 项（≤1s，桥事件路径）' (($null -ne $menuShrunkRep) -and $menuShrunkMs -le 1000) ('耗时=' + $menuShrunkMs + 'ms；实际菜单：' + ($menuShrunkLabels -join ' / '))
+$menuShrunkWinItem = '打开窗口'
+if ((Get-Prop (Get-Prop $menuShrunkRep 'window') 'visible') -eq $true) { $menuShrunkWinItem = '关闭窗口' }
+$needShrunk = @($menuShrunkWinItem, '重启窗口的管理界面', '重启镜像源服务', '退出程序')
+$shrunkOrderOk = (($menuShrunkLabels -join '|') -eq ($needShrunk -join '|'))
+Assert-True '关闭网页版管理后托盘菜单实时缩回 4 项且顺序正确（≤1s，桥事件路径，v0.0.10）' (($null -ne $menuShrunkRep) -and ($menuShrunkMs -le 1000) -and $shrunkOrderOk) ('耗时=' + $menuShrunkMs + 'ms；实际菜单：' + ($menuShrunkLabels -join ' / '))
 
 # 阶段 2 清理
 Section '阶段 2f：清理测试实例'

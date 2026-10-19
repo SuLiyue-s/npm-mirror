@@ -568,6 +568,8 @@ pub fn show(app: &AppHandle) {
     }
   }
   app.state::<AppState>().window_visible.store(true, Ordering::SeqCst);
+  // v0.0.10：托盘菜单「打开窗口/关闭窗口」随可见性动态只显示一项
+  crate::tray::refresh_labels(app);
 }
 
 pub fn hide(app: &AppHandle) {
@@ -587,6 +589,8 @@ pub fn hide(app: &AppHandle) {
     }
   }
   app.state::<AppState>().window_visible.store(false, Ordering::SeqCst);
+  // v0.0.10：托盘菜单「打开窗口/关闭窗口」随可见性动态只显示一项
+  crate::tray::refresh_labels(app);
   save_prefs(app);
 }
 

@@ -304,6 +304,8 @@ fn build_report(app: &AppHandle, elapsed: Duration) -> Value {
       "available": state.tray_available(),
       "error": state.tray_error_snapshot(),
       "labels": tray_labels,
+      // v0.0.10：最近一次托盘气泡反馈（{attempted,ok,level,title,text,error,at}）
+      "lastBalloon": state.tray_last_balloon_snapshot(),
     },
     "smokeCommandHelp": [
       "show", "hide", "quit", "window:close", "window:state", "window:minimize", "window:maximize-toggle",

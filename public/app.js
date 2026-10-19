@@ -5634,6 +5634,14 @@
       box.appendChild(statCard('镜像源端口', 'REGISTRY', String(listen.port || '—'), null, 'IP ' + (listen.ip || '—'), 'is-am'));
       box.appendChild(statCard('镜像包数', 'PACKAGES', fmtNum(d.stats && d.stats.packages), null, '版本 ' + fmtNum(d.stats && d.stats.versions)));
     }
+    /* 桌面版：窗口内部管理界面独立运行；网页版管理未开启时在「管理界面监听」行追加说明 */
+    var adminListenText = admin.listenError
+      ? '未启动（' + admin.listenError + '）'
+      : (((admin.ip) || '?') + ':' + ((admin.port) || '?') + '（仅本机）');
+    var waState = (state.desktop && state.desktop.webAdmin) || {};
+    if (isDesktop() && !waState.enabled) {
+      adminListenText += '（桌面版：网页版管理未开启，窗口管理界面独立运行）';
+    }
     var info = clear($('#svc-info'));
     if (info) {
       [
@@ -5642,9 +5650,7 @@
         ['版本', d.version || '—'],
         ['模式', d.mode || '—'],
         ['镜像源监听', ((listen.ip) || '?') + ':' + ((listen.port) || '?')],
-        ['管理界面监听', admin.listenError
-          ? '未启动（' + admin.listenError + '）'
-          : (((admin.ip) || '?') + ':' + ((admin.port) || '?') + '（仅本机）')],
+        ['管理界面监听', adminListenText],
         ['Registry', d.registryUrl || '—'],
         ['管理界面地址', (d.adminUrl ? d.adminUrl + '/' : '—')],
         ['启动时间', dt(d.startedAt)],
@@ -5700,6 +5706,60 @@
         message = '确定要重启整个程序吗？';
         detail = '整个程序会重启（镜像源与管理界面短暂不可用，通常几秒），适用于主数据目录等程序级配置的改动。';
       }
+    }
+    /* 桌面版：/service/restart-admin 只按配置重绑「网页版管理」监听（仅浏览器访问用），窗口内的
+     * 管理界面完全不中断；窗口页面 origin 是内部随机端口，网页版管理默认关闭时配置里的 admin
+     * 地址永远不可达，因此绝不能走 watchService 等待旧地址（否则遮罩会一直卡住）。 */
+    if (isDesktop() && isAdmin) {
+      confirmBox({
+        title: title, confirmText: confirmText, message: message,
+        detail: '桌面版中此操作会按配置重绑「网页版管理」监听（仅用于浏览器访问），窗口内的管理界面不会中断；网页版管理未开启时无需执行。'
+      }).then(function (ok) {
+        if (!ok) return;
+        setText('svc-status', '正在重绑网页版管理监听…');
+        api(apiPath, { method: 'POST', timeout: 20000 }).then(function (d) {
+          var st = d || {};
+          /* 只刷新服务/概览数据：不刷新页面、不进入重启遮罩（窗口管理界面没有中断） */
+          function refresh() {
+            state.overview = null;
+            loadService();
+            if (state.page === 'overview') loadOverview(true);
+          }
+          if (st.enabled) {
+            setText('svc-status', '网页版管理界面已重启');
+            toast('网页版管理界面已重启：' + (st.url || adminBaseFromCfg() || '网页版管理地址'), 'ok', 4000);
+            if (st.listenError) toast('网页版管理界面监听异常：' + st.listenError, 'err', 9000);
+          } else {
+            setText('svc-status', '网页版管理未开启，无需重启');
+            toast('网页版管理未开启，窗口管理界面不受影响', 'warn', 4000);
+          }
+          /* 同步 /desktop/info 缓存，服务页「管理界面监听」行的说明随重绑结果更新 */
+          if (state.desktop) {
+            state.desktop.webAdmin = {
+              enabled: !!st.enabled,
+              ip: (state.desktop.webAdmin && state.desktop.webAdmin.ip) || '',
+              port: (state.desktop.webAdmin && state.desktop.webAdmin.port) || 0,
+              url: st.url || null,
+              listening: !!st.enabled && !st.listenError,
+              listenError: st.listenError || ''
+            };
+          }
+          refresh();
+        }, function (e) {
+          /* 桌面模式下窗口管理界面并未中断；网络层短暂异常也按「操作已提交」收尾，绝不弹遮罩 */
+          if (e && (e.code === 'NETWORK' || e.code === 'TIMEOUT')) {
+            toast('操作已提交，连接短暂中断，已刷新状态', 'info', 4000);
+            connBoost(5000);
+            state.overview = null;
+            loadService();
+            if (state.page === 'overview') loadOverview(true);
+          } else {
+            setText('svc-status', '操作失败：' + e.message);
+            handleErr(e);
+          }
+        });
+      });
+      return;
     }
     confirmBox({ title: title, danger: isStop, confirmText: confirmText, message: message, detail: detail }).then(function (ok) {
       if (!ok) return;

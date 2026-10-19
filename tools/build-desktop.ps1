@@ -57,6 +57,22 @@ function Fail([string]$Text) {
   exit 1
 }
 
+function Get-Sha256Hex([string]$Path) {
+  # 不依赖 Get-FileHash（受限/嵌套 PowerShell 上下文里 Utility 模块自动加载可能失败），直接用 .NET。
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  try {
+    $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    try {
+      $bytes = $sha.ComputeHash($fs)
+    } finally {
+      $fs.Dispose()
+    }
+  } finally {
+    $sha.Dispose()
+  }
+  return ([System.BitConverter]::ToString($bytes) -replace '-', '').ToLowerInvariant()
+}
+
 $startAll = Get-Date
 Write-Host ('项目目录：' + $Root)
 
@@ -189,7 +205,7 @@ if ([string]$vi.ProductVersion -ne [string]$Version -or [string]$vi.FileVersion 
   Fail ('exe 版本信息不正确：FileVersion=' + [string]$vi.FileVersion + '，ProductVersion=' + [string]$vi.ProductVersion + '（期望 ' + $Version + '）。')
 }
 Write-Host ('版本信息校验通过：FileVersion=' + $vi.FileVersion + ' / CompanyName=' + $vi.CompanyName + ' / ProductName=' + $vi.ProductName)
-$hash = (Get-FileHash -LiteralPath $distExe -Algorithm SHA256).Hash.ToLowerInvariant()
+$hash = Get-Sha256Hex $distExe
 $sumFile = Join-Path $distDir 'SHA256SUMS.txt'
 $sumLine = $hash + '  ' + $exeName
 # 校验清单写成「UTF-8 无 BOM + LF」：带 BOM 会让 sha256sum -c 把 BOM 当成哈希前缀而校验失败

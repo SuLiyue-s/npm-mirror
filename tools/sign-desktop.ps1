@@ -71,6 +71,23 @@ function Fail([string]$Text) {
   exit 1
 }
 
+function Get-Sha256Hex([string]$Path) {
+  # 不依赖 Get-FileHash（某些受限/嵌套 PowerShell 上下文里 Microsoft.PowerShell.Utility 自动加载会失败），
+  # 直接用 .NET 计算 SHA256，保证构建与签名脚本在本机任何上下文都能跑通。
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  try {
+    $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    try {
+      $bytes = $sha.ComputeHash($fs)
+    } finally {
+      $fs.Dispose()
+    }
+  } finally {
+    $sha.Dispose()
+  }
+  return ([System.BitConverter]::ToString($bytes) -replace '-', '').ToLowerInvariant()
+}
+
 function Ensure-SecurityModule {
   # 受限/沙箱上下文里 Microsoft.PowerShell.Security 的自动加载可能瞬时失败，
   # 表现为 Get-AuthenticodeSignature 报「模块无法加载」；这里显式导入并重试。
@@ -214,6 +231,16 @@ if (($existing.Status -ne [System.Management.Automation.SignatureStatus]::NotSig
     Say ''
     Say '该文件已由本证书签名，跳过重复签名（-AllowResign 可强制重签）。'
     Say ('当前签名状态：' + [string]$existing.Status)
+    # 跳过签名时也输出完整结果：构建脚本依赖这里的 SHA256（签名后的最终哈希）。
+    $skipSize = [math]::Round((Get-Item -LiteralPath $Exe).Length / 1MB, 2)
+    $skipSha = Get-Sha256Hex $Exe
+    Say ('  文件   ：' + $Exe)
+    Say ('  大小   ：' + $skipSize + ' MB')
+    Say ('  SHA256 ：' + $skipSha + '（签名后）')
+    Say ('  签名者 ：' + [string]$existing.SignerCertificate.Subject)
+    Say ('  指纹   ：' + [string]$existing.SignerCertificate.Thumbprint)
+    Say ('  公钥证书：' + (Join-Path $DistDir 'codesign-suliyue.cer'))
+    Say ''
     exit 0
   }
   if (-not $AllowResign) {
@@ -225,10 +252,20 @@ if (($existing.Status -ne [System.Management.Automation.SignatureStatus]::NotSig
 Say ''
 Say ('正在签名：' + $Exe)
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
-try {
-  Set-AuthenticodeSignature -FilePath $Exe -Certificate $cert -HashAlgorithm SHA256 -ErrorAction Stop | Out-Null
-} catch {
-  Fail ('写入数字签名失败：' + $_.Exception.Message + '（若文件只读或目录 ACL 受限，请重新构建或手动删除该 exe 后再试）。')
+$signError = $null
+# 刚构建/复制出来的 exe 可能被杀毒软件短暂占用（"being used by another process"），这里退避重试。
+for ($attempt = 1; $attempt -le 5; $attempt++) {
+  try {
+    Set-AuthenticodeSignature -FilePath $Exe -Certificate $cert -HashAlgorithm SHA256 -ErrorAction Stop | Out-Null
+    $signError = $null
+    break
+  } catch {
+    $signError = $_.Exception.Message
+    if ($attempt -lt 5) { Start-Sleep -Milliseconds (400 * $attempt) }
+  }
+}
+if ($signError) {
+  Fail ('写入数字签名失败：' + $signError + '（若文件只读或目录 ACL 受限，请重新构建或手动删除该 exe 后再试）。')
 }
 $sw.Stop()
 $after = Get-AuthenticodeSignature -FilePath $Exe
@@ -239,7 +276,7 @@ if (([string]$after.SignerCertificate.Thumbprint) -ne ([string]$cert.Thumbprint)
 
 # ---------------------------------------------------------------- 6. 结果
 $sizeMB = [math]::Round((Get-Item -LiteralPath $Exe).Length / 1MB, 2)
-$sha = (Get-FileHash -LiteralPath $Exe -Algorithm SHA256).Hash.ToLowerInvariant()
+$sha = Get-Sha256Hex $Exe
 $statusText = [string]$after.Status
 Say ''
 Say '[签名完成]'
