@@ -5,7 +5,7 @@
 - 运行环境：Node.js **>= 18**（实测 Node.js 24），Windows / macOS / Linux 均可运行服务本体（一键脚本为 Windows `.cmd` / PowerShell）
 - 默认地址：镜像源（npm registry）<http://127.0.0.1:4873>，管理界面 <http://127.0.0.1:4874>（**两个独立监听**：管理界面只监听 `127.0.0.0/8` 本地回环，只有本机访问才能打开；端口不可与镜像源端口相同，可在配置页/`data/config.json` 的 `admin` 段修改）
 - 依赖数量：**0**（`dependencies` 与 `devDependencies` 均为空）
-- 桌面版：**单 exe（版本 0.0.5，GitHub Release）**，`dist/npm-mirror-desktop-0.0.5.exe`，双击即用、内嵌 Node 运行时，带托盘 / 控制台页 / 工具页 / 主数据目录选择 / 开机自启；**exe / 窗口 / 托盘图标统一使用网页版图标 `public/favicon.ico`**；**启动时自动检测 exe「低完整性（Low）」标签并可一键修复（UAC 提权 `icacls` 重置后自动重启）**；**必须从资源管理器双击运行**（见 [启动必读](#启动必读重要)），详见 [桌面版（单 exe）](#桌面版单-exe)
+- 桌面版：**单 exe（版本 0.0.6，本地构建交付版）**，`dist/npm-mirror-desktop-0.0.6.exe`，双击即用、内嵌 Node 运行时，带托盘 / 控制台页 / 工具页 / 主数据目录选择 / 开机自启；**exe / 窗口 / 托盘图标统一使用网页版图标 `public/favicon.ico`**；**启动时自动检测 exe「低完整性（Low）」标签并可一键修复（UAC 提权 `icacls` 重置后自动重启）**；**必须从资源管理器双击运行**（见 [启动必读](#启动必读重要)），详见 [桌面版（单 exe）](#桌面版单-exe)
 - 许可证：[MIT](LICENSE)
 
 ![管理界面概览](截图/管理界面-概览.png)
@@ -62,20 +62,21 @@ node cli.js start
 
 ### 启动必读（重要）
 
-- **必须从 Windows 资源管理器里双击 exe 运行**（或双击 `启动桌面版.cmd`）。exe 位于 `dist\` 时，双击 `dist\npm-mirror-desktop-0.0.5.exe`。
+- **必须从 Windows 资源管理器里双击 exe 运行**（或双击 `启动桌面版.cmd`）。exe 位于 `dist\` 时，双击 `dist\npm-mirror-desktop-0.0.6.exe`。
 - **不要在聊天窗口 / IDE 预览面板 / 沙盒 / 受限终端里启动**：这些环境会让程序继承受限权限，`%LOCALAPPDATA%` 无法写入、WebView2 无法创建窗口、系统托盘注册会被拒绝（`os error 5`），表现为「没有窗口 / 没有托盘图标 / 没有右键菜单，但任务管理器里有进程」。v0.0.2 的用户日志已证实这一点（`%LOCALAPPDATA%` 写入被拒 `os error 5`、WebView2 `runtime error: failed to receive message from webview`）。
-- **低完整性（Low）标签（v0.0.5）**：Windows 用「用户令牌完整性级别」与「exe 文件完整性标签」中**较低的那个**启动进程。开发 / 沙箱工作区可能给整个项目目录打上 Low 标签，构建出来的 exe 会继承它，双击后进程被强制降级——写不了 `%LOCALAPPDATA%`、托盘注册被拒。**v0.0.5 启动时会自动检测这种标签并弹框**：选「是」→ 请求一次 UAC → 自动执行 `icacls <exe> /setintegritylevel Medium` → 自动重启程序，之后一切正常；选「否」则继续受限运行（窗口内显示警示条、关闭窗口=退出程序）。也可以直接双击 `修复-桌面版启动限制.cmd`（或 `启动桌面版.cmd`，它会在启动前自动检查并修复）手动修复。
-- 版本行为差异：v0.0.2 回退配置目录但仍可能只留下无界面进程；v0.0.3 在窗口 / 托盘异常时弹可操作说明框后清理退出；**v0.0.4 起托盘改为程序自绘 Win32 注册**——注册失败会每秒重试、最多 15 秒，仍失败则在日志记录「托盘注册失败：…」并在**窗口内显示警示条**，此时**关闭窗口会直接退出程序**（不会静默隐藏到后台），请按提示改用资源管理器双击；配置目录写不了时仍**静默回退**到 `<exe 所在目录>\LiYueNpmMirror\`，只写日志不弹框。**v0.0.5 在此基础上增加低完整性标签检测/一键修复**（见上一条）。
+- **低完整性（Low）标签（v0.0.5 检测，v0.0.6 修复算法修正）**：Windows 用「用户令牌完整性级别」与「exe 文件完整性标签」中**较低的那个**启动进程。开发 / 沙箱工作区可能给整个项目目录打上 Low 标签，构建出来的 exe 会继承它，双击后进程被强制降级——写不了 `%LOCALAPPDATA%`、托盘注册被拒。**v0.0.5 起启动会自动检测这种标签并弹框；v0.0.6 修正了修复算法**：选「是」→ 请求一次 UAC → **提权后调用系统 `icacls.exe` 把 exe 文件标签改为 Medium**（只改文件标签，不是「提权重启自身」——`min(用户,文件)` 规则下提权实例对自身 Low 文件仍是 Low 完整性，这条旧路走不通）→ 复查标签为 Medium 后**以普通权限自动重启**程序，之后正常。若修复失败，按提示两条退路：①**把 exe 复制到其它文件夹**（如桌面）再双击——复制出的文件继承目标目录的正常标签；②右键「以管理员身份运行」命令提示符，执行 `icacls "<exe路径>" /setintegritylevel Medium`。选「否」则继续受限运行（窗口内显示警示条、关闭窗口=退出程序）。也可直接双击 `修复-桌面版启动限制.cmd`（或 `启动桌面版.cmd`，它会在启动前自动检查并修复）。
+- 版本行为差异：v0.0.2 回退配置目录但仍可能只留下无界面进程；v0.0.3 在窗口 / 托盘异常时弹可操作说明框后清理退出；**v0.0.4 起托盘改为程序自绘 Win32 注册**——注册失败会每秒重试、最多 15 秒，仍失败则在日志记录「托盘注册失败：…」并在**窗口内显示警示条**，此时**关闭窗口会直接退出程序**（不会静默隐藏到后台），请按提示改用资源管理器双击；配置目录写不了时仍**静默回退**到 `<exe 所在目录>\LiYueNpmMirror\`，只写日志不弹框。**v0.0.5 增加低完整性标签检测/一键修复，v0.0.6 修正修复算法（提权后改文件标签，不再是提权重启自身）**（见上一条）。
 - **程序图标（v0.0.4）**：exe、窗口、托盘统一使用网页版图标 `public\favicon.ico`，不再是「旧图标 + Tauri logo」合成图，托盘和浏览器标签页视觉一致。
 - **托盘图标可能被 Windows 收进任务栏右侧的「^」溢出区**：点「^」把图标拖到任务栏即可固定显示；程序不会因为图标被收起而停止。
 - 数据目录默认 `<exe 所在目录>\data`；把 exe 放在项目的 `dist\` 里时，**会自动发现并使用上级项目的 `data\`**（详见下表与「使用要点」）。
-- 本次 0.0.5 会发布到 **GitHub Releases**：构建产物同步上传，发布后可从 [v0.0.5 发布页](https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.5) 下载 exe 与 `SHA256SUMS.txt`；v0.0.3 / v0.0.4 是按用户要求只在本地构建、未发布的版本。
+- **本次 0.0.6 为本地构建交付版，暂不发布 GitHub**：构建产物保留在 `dist\npm-mirror-desktop-0.0.6.exe`；是否发布待用户确认。最近一次 GitHub 发布仍是 [v0.0.5](https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.5)；v0.0.3 / v0.0.4 为按用户要求只在本地构建、未发布的版本。
 
 | 项目 | 说明 |
 | --- | --- |
-| 版本 | **0.0.5**（`package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` 三处一致；**发布到 GitHub Releases**） |
-| 构建产物 | `dist/npm-mirror-desktop-0.0.5.exe`（单文件，内嵌 Node 运行时与全部程序文件） |
-| 下载 | [v0.0.5 发布页](https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.5)（exe + `SHA256SUMS.txt`）；历史版本 [v0.0.2](https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.2) / [v0.0.1](https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.1) 仍可下载；v0.0.3 / v0.0.4 未发布（仅本机构建） |
+| 版本 | **0.0.6**（`package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` 三处一致；**本地构建交付版，暂不发布 GitHub**） |
+| 构建产物 | `dist/npm-mirror-desktop-0.0.6.exe`（单文件，内嵌 Node 运行时与全部程序文件） |
+| 下载 | 0.0.6 暂未发布、无下载链接（本地构建）；GitHub 最近发布版为 [v0.0.5](https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.5)，历史版本 [v0.0.2](https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.2) / [v0.0.1](https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.1) 仍可下载；v0.0.3 / v0.0.4 未发布（仅本机构建） |
+| 发布者（版本信息） | **v0.0.6 起** exe 的「发布者 / CompanyName」固定为 `suliyue`（资源管理器 → 右键属性 → 详细信息可看到）；**未做代码签名**，所以 SmartScreen / UAC 仍显示「未知发布者」，属正常现象 |
 | 程序图标 | **v0.0.4 起** exe / 窗口 / 托盘统一使用网页版图标 `public\favicon.ico`（与浏览器标签页同一套图标） |
 | 启动方式 | **Windows 资源管理器双击 exe**，或双击仓库根目录的 `启动桌面版.cmd`（自动检查「低完整性」标签并在需要时请求一次 UAC 修复，然后启动 `dist\` 里最新的桌面版 exe） |
 | 系统要求 | Windows 10/11 x64；需要系统自带 **WebView2 运行时**（Win11 默认已装，Win10 可装 Evergreen Runtime） |
@@ -89,7 +90,7 @@ node cli.js start
 - **图标与网页版一致（v0.0.4）**：exe 文件图标、窗口图标、托盘图标全部改用 `public\favicon.ico`（网页版标签页图标），不再使用「旧图标 + Tauri logo」的合成图；`tools\compose-desktop-icon.ps1` 只负责从网页版图标生成窗口 / 托盘所需的 RGBA 素材。
 - **启动失败可见化（v0.0.3 起，v0.0.4 增强）**：创建窗口 / 托盘后校验实际可用性。窗口创建失败仍弹出可操作说明框（用资源管理器双击 exe、安装 WebView2 Runtime、不要在受限终端启动）后清理退出；**v0.0.4 托盘改为自绘 Win32 注册**，每秒重试、最多 15 秒，仍失败则写日志「托盘注册失败：…」并在窗口内显示警示条，此时**关闭窗口 = 直接退出程序**，不会再出现「进程在跑却看不到窗口和托盘」的静默状态。
 - **托盘自愈（v0.0.4）**：Windows 资源管理器重启后，程序会收到 `TaskbarCreated` 消息并自动重新注册托盘图标，不需要重启程序。
-- **低完整性标签自动检测与一键修复（v0.0.5）**：启动时检测「当前进程令牌完整性级别」和「exe 文件完整性标签」；若 exe 带 **Low（低完整性）** 标签，会弹出说明框：选「是」→ 请求 UAC → 自动执行 `icacls "<exe>" /setintegritylevel Medium` 重置标签 → 自动重启程序（之后可正常写配置目录、注册托盘）；选「否」则继续以受限方式运行并显示警示条。该问题常见于**从开发 / 沙盒目录构建出的 exe**（整个目录被打了 Low 标签，产物继承标签）；从 GitHub Release 下载到普通目录的 exe 一般不受影响。每次重新编译 exe 后都会重新继承 Low 标签，再次启动时会再次提示（或双击 `修复-桌面版启动限制.cmd` 修复）。
+- **低完整性标签自动检测与一键修复（v0.0.5 检测，v0.0.6 修复算法修正）**：启动时检测「当前进程令牌完整性级别」和「exe 文件完整性标签」；若 exe 带 **Low（低完整性）** 标签，会弹出说明框。**v0.0.6 的修复流程**：选「是」→ 请求 UAC 提权 → 在提权进程里调用**系统 `icacls.exe`** 执行 `icacls "<exe>" /setintegritylevel Medium` 修改的是**文件标签**（不是提权重启自身：按 `min(用户,文件)` 规则，提权后的进程面对自身 Low 文件仍是 Low 完整性，旧方案因此无效）→ 复查文件标签确为 Medium → **以普通权限自动重启**程序，之后可正常写配置目录、注册托盘。若修复失败（UAC 取消、文件只读、组策略限制等），提示两条退路：①**把 exe 复制到其它文件夹**（如桌面）再双击——复制出的文件继承目标目录的正常标签；②右键「以管理员身份运行」命令提示符，执行 `icacls "<exe路径>" /setintegritylevel Medium`。选「否」则继续以受限方式运行并显示警示条。该问题常见于**从开发 / 沙盒目录构建出的 exe**（整个目录被打了 Low 标签，产物继承标签）；从 GitHub Release 下载到普通目录的 exe 一般不受影响。每次重新编译 exe 后都会重新继承 Low 标签，再次启动时会再次提示（或双击 `修复-桌面版启动限制.cmd` 修复）。
 - **数据目录自动发现（v0.0.3）**：启动顺序 `--data-dir` > `MIRROR_DATA_DIR` > 上次「选择目录…」记录 > `<exe 目录>\data`（已有 `config.json` 或 `storage\` 时）> 上级项目 `data\`（`<exe 目录>\data` 不存在/为空且上级 `data\config.json` 存在时）> `<exe 目录>\data`（默认）。因此把 exe 放在项目的 `dist\` 里双击，会直接读到 `项目根\data` 的现有配置与包。
 - **`启动桌面版.cmd`（v0.0.3）**：仓库根双击即启动 `dist\` 下最新的桌面版 exe，并打印窗口 / 托盘 / 网页版管理与启动方式提示；找不到 exe 时给出构建或放置提示。
 - **托盘常驻**：托盘可用时，关闭窗口只是隐藏，托盘图标继续运行镜像源；左键单击打开窗口。右键菜单随网页版管理开关实时变化（**≤1 秒**）：关闭时 **4 项**「打开窗口 / 关闭窗口 / 重启镜像源服务 / 退出程序」；开启时 **6 项**「打开窗口 / 关闭窗口 / 打开管理界面 / 重启管理界面 / 重启镜像源服务 / 退出程序」。新增的「打开管理界面」用系统默认浏览器打开网页版管理页面（`http://<admin.ip>:<admin.port>/`），「重启管理界面」只重建该监听。**托盘注册失败时（受限环境）没有托盘菜单，且关闭窗口 = 退出程序**。
@@ -119,14 +120,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/build-desktop.ps1
 - 产物：`dist/npm-mirror-desktop-<版本>.exe` + `dist/SHA256SUMS.txt`（SHA256 校验清单，可用 `Get-FileHash` 或 `certutil -hashfile` 对照）。
 - 图标：v0.0.4 起 exe / 窗口 / 托盘统一使用网页版图标 `public\favicon.ico`；构建脚本校验 `src-tauri\icons\icon.ico` 等素材，缺失或加 `-ForceIcon` 时调用 `tools\compose-desktop-icon.ps1` 从网页版图标重新生成。
 - **低完整性标签提示（v0.0.5 构建脚本）**：构建完成后 `tools/build-desktop.ps1` 会用 `icacls` 检查产物；若新 exe 继承了工作区的 **Low（低完整性）** 标签，会打印黄色提示说明原因与修复方式（程序启动时可一键修复，也可双击 `启动桌面版.cmd` / `修复-桌面版启动限制.cmd`）。**这属于开发/沙盒环境的正常现象，不是构建失败**；发布到 GitHub 前一般不会带该标签（从仓库正常构建的 exe 不会继承）。每次重新编译后新 exe 会再次继承 Low，需要再次修复。
-- **本次 0.0.5 发布到 GitHub Releases**：构建产物 `dist\npm-mirror-desktop-0.0.5.exe` 与 `SHA256SUMS.txt` 会上传到 [v0.0.5 发布页](https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.5)；v0.0.3 / v0.0.4 为本地构建、未发布。
+- **发布者信息（v0.0.6 构建）**：`src-tauri/tauri.conf.json` 中 `bundle.publisher = "suliyue"`，构建出的 exe 版本信息 `CompanyName` 固定为 `suliyue`（资源管理器 → 右键属性 → 详细信息可见）。程序**未做代码签名**，所以 SmartScreen / UAC 仍会显示「未知发布者」，这是正常现象，不是文件损坏。
+- **本次 0.0.6 为本地构建交付版，暂不发布 GitHub**：产物 `dist\npm-mirror-desktop-0.0.6.exe` 与 `dist\SHA256SUMS.txt` 只在本机交付；是否发布待用户确认。最近一次 GitHub 发布仍是 [v0.0.5](https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.5)；v0.0.3 / v0.0.4 为本地构建、未发布。
 - 版本号唯一来源是 `package.json`，`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json` 用 `node tools/version.js --bump patch` 同步；发版用 `tools/release.ps1`（bump → 构建 → 提交 → tag → GitHub Release）。
 - 构建后若需要手动确认/修复完整性标签，可双击根目录的 **`修复-桌面版启动限制.cmd`**（不带参数=检查并在需要时请求 UAC 修复；`check`=只检查，退出码 0 正常 / 2 带 Low 标签；`repair`=内部提权后实际修复）；环境诊断可双击 **`诊断-桌面环境.cmd`**（只读，输出 `tmp\desktop-diagnose.txt`）。
 - `dist/`、`src-tauri/target/`、`src-tauri/embed/node.exe` 均不入库（见 `.gitignore`）。
 
 ### 桌面版使用要点
 
-1. **从资源管理器双击** `dist\npm-mirror-desktop-0.0.5.exe`（或双击 `启动桌面版.cmd`）。首次启动会自动初始化数据目录并生成配置与访问令牌：默认用 `<exe 所在目录>\data`；若 exe 在项目的 `dist\` 里而 `<exe 目录>\data` 不存在/为空、上级 `data\config.json` 存在，则**自动改用项目根 `data\`**（v0.0.3 新增）。**不要从聊天窗口 / IDE 预览面板 / 沙盒 / 受限终端启动**：会因继承受限权限导致 WebView2 窗口不可用、托盘注册被系统拒绝（v0.0.5 会先检测低完整性标签并弹框修复；v0.0.4 会在窗口内显示警示条；v0.0.3 会弹说明框并清理退出；v0.0.1/v0.0.2 则可能只留下看不到界面的进程）。
+1. **从资源管理器双击** `dist\npm-mirror-desktop-0.0.6.exe`（或双击 `启动桌面版.cmd`）。首次启动会自动初始化数据目录并生成配置与访问令牌：默认用 `<exe 所在目录>\data`；若 exe 在项目的 `dist\` 里而 `<exe 目录>\data` 不存在/为空、上级 `data\config.json` 存在，则**自动改用项目根 `data\`**（v0.0.3 新增）。**不要从聊天窗口 / IDE 预览面板 / 沙盒 / 受限终端启动**：会因继承受限权限导致 WebView2 窗口不可用、托盘注册被系统拒绝（v0.0.5 起会先检测低完整性标签并弹框修复，v0.0.6 修正修复算法；v0.0.4 会在窗口内显示警示条；v0.0.3 会弹说明框并清理退出；v0.0.1/v0.0.2 则可能只留下看不到界面的进程）。
 2. 窗口打开的就是管理界面；「控制台」「工具」页在左侧导航里（`MONITOR` / `SYSTEM` 分组）。若托盘图标没出现在任务栏右下角，点「^」到溢出区里找（可拖到任务栏固定）。
 3. 托盘可用时，点窗口右上角 **×** 只是隐藏窗口，镜像源继续运行；要彻底退出请用托盘右键「退出程序」或工具页的「退出程序」。**若托盘注册失败（受限环境，窗口内有警示条）**，关闭窗口会直接退出程序。
 4. 换数据目录：配置页 →「桌面 / 网页管理」→「选择目录…」→ 选一个**已存在**的文件夹 → 确认后程序自动重启并切到新目录。**数据不会自动搬迁**，需要迁移时先退出程序，把旧 `data\` 整个复制到新位置再启动。
@@ -139,11 +141,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/build-desktop.ps1
 
 **Q：启动报「创建桌面配置目录 … 拒绝访问 (os error 5)」/ 双击后没有窗口也没有托盘，但任务管理器里有进程？**
 根因都是**从受限环境启动**（聊天窗口、沙盒、IDE / 本会话预览面板、受限终端）：程序继承受限 token，`%LOCALAPPDATA%` 写不了（`os error 5`），WebView2 也拿不到窗口与托盘（`runtime error: failed to receive message from webview`）。
-正确处理：到 **Windows 资源管理器里双击** `dist\npm-mirror-desktop-0.0.5.exe`（或双击 `启动桌面版.cmd`，也可把 exe 复制到桌面再双击）。版本差异：v0.0.1 直接报错退出；v0.0.2 会回退配置目录但仍可能只留下无界面进程；v0.0.3 会弹出一段可操作说明框后清理退出；**v0.0.4 托盘注册失败前会重试 15 秒，失败后在窗口内显示警示条并在日志记录「托盘注册失败」**；**v0.0.5 启动时先检测低完整性标签，弹框选「是」可一键修复（UAC）并自动重启**。受限环境下的窗口 / 托盘功能不保证，**请始终用资源管理器启动**。
+正确处理：到 **Windows 资源管理器里双击** `dist\npm-mirror-desktop-0.0.6.exe`（或双击 `启动桌面版.cmd`，也可把 exe 复制到桌面再双击）。版本差异：v0.0.1 直接报错退出；v0.0.2 会回退配置目录但仍可能只留下无界面进程；v0.0.3 会弹出一段可操作说明框后清理退出；**v0.0.4 托盘注册失败前会重试 15 秒，失败后在窗口内显示警示条并在日志记录「托盘注册失败」**；**v0.0.5 起启动时先检测低完整性标签，弹框选「是」可一键修复（UAC）并自动重启；v0.0.6 修正为「提权后改 exe 文件标签、复查 Medium、再以普通权限重启」，修复失败会提示复制到其它文件夹或管理员 cmd 执行 `icacls` 两条退路**。受限环境下的窗口 / 托盘功能不保证，**请始终用资源管理器启动**。
 
 **Q：双击 exe 后弹框提示「低完整性（Low）」/ 修复后要 UAC？**
 这是 **Windows 完整性标签**机制：进程会按「用户令牌完整性」和「exe 文件完整性」中**较低**的那个运行。若 exe 继承自被打上 Low 标签的开发 / 沙盒目录，双击后进程会被强制降级——`%LOCALAPPDATA%` 写不了、托盘注册被拒（`os error 5`），表现为没有窗口 / 没有托盘。
-**v0.0.5 启动时会自动检测**并弹框说明：选「是」→ 弹一次 UAC → 自动执行 `icacls "<exe>" /setintegritylevel Medium` → 自动重启程序，之后正常；选「否」则继续受限运行（窗口内警示条、关闭窗口=退出程序）。也可以退出程序后双击根目录的 **`修复-桌面版启动限制.cmd`**（或直接双击 `启动桌面版.cmd`，它会在启动前自动检查并修复）。每次重新编译 exe 后都会重新继承 Low 标签，需要再次修复；从 GitHub Release 下载到普通目录的 exe 一般不受影响。
+**v0.0.5 起启动时会自动检测**并弹框说明。**v0.0.6 的修复流程**：选「是」→ 弹一次 UAC → 提权后调用系统 `icacls.exe` 执行 `icacls "<exe>" /setintegritylevel Medium` **修改 exe 文件标签**（不是「提权重启自身」：`min(用户,文件)` 规则下提权进程面对自身 Low 文件仍是 Low 完整性，旧算法因此无效）→ 复查标签确为 Medium → **以普通权限自动重启**程序，之后正常。选「否」则继续受限运行（窗口内警示条、关闭窗口=退出程序）。若修复失败（取消 UAC / 文件只读 / 组策略限制），按提示两条退路：①把 exe **复制到其它文件夹**（如桌面）再双击——复制出的文件继承目标目录的正常标签；②右键「以管理员身份运行」命令提示符，执行 `icacls "<exe路径>" /setintegritylevel Medium`。也可以退出程序后双击根目录的 **`修复-桌面版启动限制.cmd`**（或直接双击 `启动桌面版.cmd`，它会在启动前自动检查并修复）。每次重新编译 exe 后都会重新继承 Low 标签，需要再次修复；从 GitHub Release 下载到普通目录的 exe 一般不受影响。
 
 **Q：右下角托盘图标完全不出现（没有图标、也没有右键菜单）？**
 先看桌面日志 `desktop.log`（默认 `%LOCALAPPDATA%\LiYueNpmMirror\desktop.log`，回退时在 `<exe 所在目录>\LiYueNpmMirror\desktop.log`）：出现「**托盘图标已注册**」表示注册成功（图标可能只是被收进任务栏「^」溢出区，拖到任务栏即可固定）；出现「**托盘注册失败：…**」表示系统拒绝注册，常见于从受限环境 / 受限账户启动（日志含「拒绝访问 / os error 5」），此时 v0.0.4 会在窗口内显示警示条，**关闭窗口 = 退出程序**，请改用资源管理器双击 exe。另一种情况是 Windows 资源管理器重启（任务栏重建）导致图标消失：**v0.0.4 会自动重新注册**（收到 `TaskbarCreated` 消息，约 1 秒内恢复），旧版本则需重启程序。若组策略禁用了通知区域，任何程序都无法显示托盘图标。
@@ -302,7 +304,7 @@ npm私人镜像源-离线版/
 ├─ src-tauri/             Tauri 2 桌面壳（Rust：窗口/托盘/单实例/原生对话框/自启/桥协议；embed/ 内嵌 node.exe）
 ├─ tools/                 辅助脚本（tray.ps1 托盘宿主、make-icon.ps1 自绘图标、compose-desktop-icon.ps1 桌面图标合成（v0.0.4 源图 = public/favicon.ico）、build-desktop.ps1 桌面版构建、diagnose-desktop.ps1 桌面环境诊断、version.js 版本同步、release.ps1 发版）
 ├─ test/                  自动化测试与验收脚本（desktop-e2e.ps1 桌面版端到端、desktop-path-test.js 路径穿越单测）
-├─ dist/                  桌面版构建产物（exe + SHA256SUMS.txt，已 gitignore；0.0.5 发布 GitHub Release）
+├─ dist/                  桌面版构建产物（exe + SHA256SUMS.txt，已 gitignore；0.0.6 本地构建交付，0.0.5 为最近 GitHub Release）
 ├─ data/                  运行时数据（包存储/日志/配置/离线包，已 gitignore）
 ├─ 启动桌面版.cmd         桌面版入口（自动检查低完整性标签并在需要时请求 UAC 修复，启动 dist 里最新的桌面版 exe）
 ├─ 修复-桌面版启动限制.cmd 完整性标签检查/修复（check=只检查 / repair=内部提权后修复；v0.0.5 新增）
@@ -339,7 +341,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File test/desktop-e2e.ps1  # 桌�
 | `test/desktop-path-test.js` | 桌面版数据根与路径穿越防护单测：普通相对路径、旧 `data/` 前缀、`../` / `..\` / `a/../../x`、绝对路径、NUL、磁盘根、空串、`C:foo` 等 | **24/24 通过（exit 0）** |
 | `test/desktop-bridge-test.js` | 桌面版 stdio 桥协议单测：`ready` / `req` / `res` / `event` / `bye` 消息、请求 id 与并发、错误包装、超时与非法消息处理等 | **11/11 通过（exit 0）** |
 | `test/desktop-cancel-test.js` | 桌面版导入取消收敛单测：解包/扫描/写存储阶段取消 ≤2s 收敛（实测 122ms）、临时目录清理、已导入数据不被破坏、取消后可重新导入 | **13/13 通过（exit 0）** |
-| `test/desktop-e2e.ps1` | 桌面版端到端验收（Windows / PowerShell 7）：`dist` exe 存在与版本信息 → 启动进程/窗口（窗口标题、URL=内部回环管理端口、加载现有管理界面；v0.0.3 起同时断言窗口失败原因字段 `window.failureReason`）→ 内部管理 API → 控制台 API 与增量 `after` → 一键脚本 `doctor`/`status` → `admin.enabled` 端口监听开关与即时生效 → 默认数据目录 `<exe目录>\data` → **v0.0.3 数据目录自动发现（`parent-project`：exe 在 `dist\`、上级 `data\config.json` 存在时自动使用上级 `data\`）** → `/desktop/files` 白名单与穿越参数 → `PUT /config` 路径穿越 400 → 单实例 → **v0.0.4 托盘可用性（`tray.available`）：可用时关闭窗口=隐藏且服务在线；不可用时关闭窗口=退出程序、退出码 0、无 Node 残留；`/desktop/info.tray.available` 与报告一致；受限环境 `restricted=true`（`home_fallback || !tray_available`）与 `tray.error` 含拒绝原因** → **v0.0.5 完整性标签：exe `--help` 退出码 0 且输出含 `--repair-integrity` / `--skip-integrity-prompt` / `--data-dir`；把 exe 复制到临时目录后以 smoke 模式执行 `--repair-integrity` 做只读验证（未提权→退出码 3 + 「管理员权限」原因、不改副本；已提权→退出码 0 + repairResult），绝不请求真实 UAC、不改 dist 产物；测试报告含 `integrity` 对象且字段齐全（token/tokenRid/tokenSid/file/lowDetected/elevated/repairPrompted/repairLaunched/promptSuppressed/repairResult/repairError/error/exePath）、`integrity.file` 与 `icacls` 读到的 dist exe 标签一致、smoke 模式不弹框（`repairPrompted`/`repairLaunched=false`，Low 时 `promptSuppressed=true`）、exe 为 Low 时进程令牌完整性也为 Low** → 托盘菜单（关闭网页版管理时 **4 项** / 开启时 **6 项**，含「打开管理界面」「重启管理界面」，开关后 ≤2 秒实时切换、关闭后 ≤1 秒缩回；菜单动作用产品内置测试挂钩驱动，等价点菜单项）→ 程序配置目录回退（五级探测，`%LOCALAPPDATA%` 不可写时回退 `<exe目录>\LiYueNpmMirror`，只写日志不弹框）→ 图标一致性（`src-tauri\icons\icon.ico` 与 `public\favicon.ico` SHA256 相同、RGBA 素材尺寸正确）→ 开机自启注册表往返（已开启时只读跳过）→ 退出后无残留进程与监听。临时数据目录 `tmp/e2e-data`、桌面 home `tmp/e2e-home`、测试端口 14873/14874；退出码 `0`=通过、`1`=失败、`3`=仅因当前会话无法创建/显示 WebView2 窗口的环境限制 | **v0.0.5 实测（2026-10-19 18:07:49，`dist\npm-mirror-desktop-0.0.5.exe`，96,829,440 B，SHA256 `727b994a…ff644d`）：194 项 = 183 通过 / 5 失败（全窗口类环境限制）/ 6 跳过，exit 3（环境限制），非窗口类失败 0**；v0.0.5 新增断言全部通过（阶段 0b `--help`、阶段 0c 只读 `--repair-integrity`、阶段 0d 非 smoke 跳过询问框、阶段 1 `integrity` 对象与 `icacls` 交叉一致=Low）。历史：0.0.4：166 项 = 155/5/6，exit 3；0.0.3：153/143/5/5；0.0.2：143/133/5/5；0.0.1：119/5/4 |
+| `test/desktop-e2e.ps1` | 桌面版端到端验收（Windows / PowerShell 7）：`dist` exe 存在与版本信息 → 启动进程/窗口（窗口标题、URL=内部回环管理端口、加载现有管理界面；v0.0.3 起同时断言窗口失败原因字段 `window.failureReason`）→ 内部管理 API → 控制台 API 与增量 `after` → 一键脚本 `doctor`/`status` → `admin.enabled` 端口监听开关与即时生效 → 默认数据目录 `<exe目录>\data` → **v0.0.3 数据目录自动发现（`parent-project`：exe 在 `dist\`、上级 `data\config.json` 存在时自动使用上级 `data\`）** → `/desktop/files` 白名单与穿越参数 → `PUT /config` 路径穿越 400 → 单实例 → **v0.0.4 托盘可用性（`tray.available`）：可用时关闭窗口=隐藏且服务在线；不可用时关闭窗口=退出程序、退出码 0、无 Node 残留；`/desktop/info.tray.available` 与报告一致；受限环境 `restricted=true`（`home_fallback || !tray_available`）与 `tray.error` 含拒绝原因** → **v0.0.5 完整性标签：exe `--help` 退出码 0 且输出含 `--repair-integrity` / `--skip-integrity-prompt` / `--data-dir`；把 exe 复制到临时目录后以 smoke 模式执行 `--repair-integrity` 做只读验证（未提权→退出码 3 + 「管理员权限」原因、不改副本；已提权→退出码 0 + repairResult），绝不请求真实 UAC、不改 dist 产物；测试报告含 `integrity` 对象且字段齐全（token/tokenRid/tokenSid/file/lowDetected/elevated/repairPrompted/repairLaunched/promptSuppressed/repairResult/repairError/error/exePath）、`integrity.file` 与 `icacls` 读到的 dist exe 标签一致、smoke 模式不弹框（`repairPrompted`/`repairLaunched=false`，Low 时 `promptSuppressed=true`）、exe 为 Low 时进程令牌完整性也为 Low；**v0.0.6 修正修复算法后断言不变（提权后改 exe 文件标签、复查 Medium、普通权限重启，失败时给出复制到其它文件夹 / 管理员 cmd `icacls` 两条退路，e2e 只做只读验证、不弹 UAC）**；**v0.0.6 新增版本信息断言：`CompanyName=suliyue`、`FileVersion`/`ProductVersion=0.0.6`、`ProductName`/`FileDescription=离月私人 npm 镜像源`**；**v0.0.6 新增「普通目录副本」阶段：把 exe 复制到 `tmp\e2e-copy` 后用 smoke 启动，断言 `integrity` 字段完整（验证复制到普通目录后不受 Low 标签影响）** → 托盘菜单（关闭网页版管理时 **4 项** / 开启时 **6 项**，含「打开管理界面」「重启管理界面」，开关后 ≤2 秒实时切换、关闭后 ≤1 秒缩回；菜单动作用产品内置测试挂钩驱动，等价点菜单项）→ 程序配置目录回退（五级探测，`%LOCALAPPDATA%` 不可写时回退 `<exe目录>\LiYueNpmMirror`，只写日志不弹框）→ 图标一致性（`src-tauri\icons\icon.ico` 与 `public\favicon.ico` SHA256 相同、RGBA 素材尺寸正确）→ 开机自启注册表往返（已开启时只读跳过）→ 退出后无残留进程与监听。临时数据目录 `tmp/e2e-data`、桌面 home `tmp/e2e-home`、测试端口 14873/14874；退出码 `0`=通过、`1`=失败、`3`=仅因当前会话无法创建/显示 WebView2 窗口的环境限制 | **v0.0.6 实测（2026-10-19 19:09:50，`dist\npm-mirror-desktop-0.0.6.exe`，96,832,000 B，SHA256 `5125d853…765526`）：207 项 = 196 通过 / 5 失败（全窗口类环境限制）/ 6 跳过，exit 3（环境限制），非窗口类失败 0**；v0.0.6 新增断言全部通过（阶段 0 版本信息 5 项：`CompanyName=suliyue` 等；阶段 0e 普通目录副本 8/8）。历史 **v0.0.5 实测（2026-10-19 18:07:49，`dist\npm-mirror-desktop-0.0.5.exe`，96,829,440 B，SHA256 `727b994a…ff644d`）：194 项 = 183 通过 / 5 失败（全窗口类环境限制）/ 6 跳过，exit 3（环境限制），非窗口类失败 0**；v0.0.5 新增断言全部通过（阶段 0b `--help`、阶段 0c 只读 `--repair-integrity`、阶段 0d 非 smoke 跳过询问框、阶段 1 `integrity` 对象与 `icacls` 交叉一致=Low）。历史：0.0.4：166 项 = 155/5/6，exit 3；0.0.3：153/143/5/5；0.0.2：143/133/5/5；0.0.1：119/5/4 |
 | `test/acceptance-npm.ps1` | 真实 `npm install / publish / dist-tag / deprecate / unpublish` | **16/16 通过** |
 | `test/ui-e2e-*.js` | 浏览器端端到端（需要 Chrome 调试端口，可选） | 需本机 Chrome CDP 环境 |
 

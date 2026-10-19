@@ -85,19 +85,21 @@ fn take_startup_failure() -> Option<StartupError> {
 
 fn main() {
   let args = parse_args();
-  // --repair-integrity：提权修复实例入口（由主程序通过 UAC 启动）。
-  // 用管理员令牌执行 icacls /setintegritylevel Medium 去掉 exe 的 Low 标签，然后以普通权限重启程序。
+  // --repair-integrity：提权修复实例入口（由程序内修复提示或手动以管理员身份启动）。
+  // 注意：Low 标签的 exe 即使「以管理员身份运行」，进程仍会被系统降为 Low；
+  // 因此这里在已提权时改为提权调用系统 icacls.exe（Medium 文件）执行 /setintegritylevel Medium。
   if args.repair_integrity {
     let code = integrity::run_repair_mode(&args);
     std::process::exit(code);
   }
   let smoke_mode = smoke::enabled();
   // 启动自检：程序文件是否带低完整性（Low）标签（从受限环境（浏览器下载/聊天窗口/沙盒）启动常见）。
-  // 检测到且可交互时弹「是/否」询问框，选择「是」会以 UAC 提权启动 --repair-integrity 修复实例后退出本进程。
+  // 检测到且可交互时弹「是/否」询问框，选择「是」会在当前进程内通过 UAC 提权系统 icacls 修复，
+  // 成功后自动以普通权限重启并退出当前实例。
   let integrity_status = integrity::startup_check(&args, smoke_mode);
   integrity::set_status(integrity_status.clone());
   if integrity_status.repair_launched {
-    eprintln!("已启动提权修复实例（--repair-integrity），当前实例退出");
+    eprintln!("低完整性标签修复成功，已请求以普通权限重启，当前实例退出");
     return;
   }
   let error_report_path = args.smoke_report.clone();
@@ -269,7 +271,7 @@ fn run(
     logging::warn(format!("完整性标签修复失败：{error}"));
   }
   if integrity_status.repair_launched {
-    logging::info("已通过 UAC 启动提权修复实例（--repair-integrity）");
+    logging::info("低完整性标签修复成功，已请求以普通权限重启（当前实例即将退出）");
   }
   if home_resolution.fallback {
     logging::warn(format!(
@@ -612,6 +614,6 @@ fn print_help() {
   println!("  -h, --help            显示本帮助");
   println!();
   println!("排错参数：");
-  println!("  --repair-integrity    提权修复实例：移除程序文件的低完整性（Low）标签后自动重启（由程序内提示调用，勿手动使用）");
+  println!("  --repair-integrity    修复实例：用提权系统 icacls 移除程序文件的低完整性（Low）标签后重启（需管理员权限；由程序内提示自动调用，勿手动使用）");
   println!("  --skip-integrity-prompt  跳过低完整性标签修复询问框（自动化测试用）");
 }

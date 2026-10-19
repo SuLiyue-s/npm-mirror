@@ -4856,7 +4856,7 @@
     var tray = (d && d.tray) || {};
     var msgs = [];
     if (desk && tray.available === false) {
-      msgs.push('系统托盘图标不可用：当前启动环境受限，系统拒绝注册托盘图标。关闭窗口将直接退出程序；如需托盘图标，请从资源管理器双击程序启动。');
+      msgs.push('系统托盘图标不可用：当前启动环境受限，系统拒绝注册托盘图标。关闭窗口将直接退出程序；如需托盘图标，请从资源管理器双击程序启动。若自动修复失败，可把 exe 复制到其他文件夹（如桌面）后再运行——复制出的文件会继承目标目录的正常标签，通常即可正常使用。');
     }
     if (desk && d.homeFallback === true) {
       msgs.push('配置目录不可写，已改用备用目录：' + (d.homeDir || '未知') + '（详见日志）。');
@@ -5184,7 +5184,7 @@
       /* v0.0.4：外壳透传的托盘 / 受限环境状态（仅桌面模式显示；字段缺失按「未知」） */
       if (desk) {
         rows.push(['托盘图标', trayText(d)]);
-        rows.push(['启动环境', d.restricted === true ? '受限' : (d.restricted === false ? '正常' : '未知')]);
+        rows.push(['启动环境', d.restricted === true ? '受限（可复制到其他文件夹运行）' : (d.restricted === false ? '正常' : '未知')]);
         rows.push(['数据目录回退', d.homeFallback === true ? '是' : (d.homeFallback === false ? '否' : '未知')]);
       }
       rows.forEach(function (kv) { app.appendChild(kvRow(kv[0], kv[1])); });

@@ -8,6 +8,8 @@
   可以自动化的部分：
 
     · 产物：exe 存在、大小、版本信息、SHA256SUMS.txt 校验、dist 已被 .gitignore 忽略
+    · 版本信息（v0.0.6）：CompanyName=suliyue、FileVersion/ProductVersion 与
+      package.json 一致、ProductName/FileDescription=离月私人 npm 镜像源
     · 阶段 0b（v0.0.5）：exe --help 可执行（退出码 0），输出含 --repair-integrity /
       --skip-integrity-prompt / --data-dir
     · 阶段 0c（v0.0.5）：--repair-integrity 修复入口的**只读**验证——把 exe 复制到临时
@@ -16,6 +18,9 @@
     · 阶段 0d（v0.0.5）：非 smoke 启动 + --skip-integrity-prompt 时不被低完整性询问框
       阻塞——进程应走到「窗口失败说明框」或自行退出（本脚本用 WM_CLOSE 关掉说明框，
       不点「是」、不触发真实 UAC），最终退出码 1，失败报告 integrity.promptSuppressed=true
+    · 阶段 0e（v0.0.6）：把 exe 复制到普通目录 tmp\e2e-copy 后以 smoke 模式启动，
+      断言报告 integrity 字段齐全、exePath 指向副本、promptSuppressed=true、服务可访问
+      （模拟用户把 exe 复制到桌面/其它文件夹运行；不请求真实 UAC）
     · 图标（v0.0.4）：exe/窗口/托盘统一使用网页版图标——src-tauri\icons\icon.ico 与
       public\favicon.ico SHA256 相同；window-256.rgba=262144 B、tray-32.rgba=4096 B
     · 阶段 1（默认配置，admin.enabled=false）
@@ -1009,6 +1014,15 @@ if ($verCandidates.Count -gt 0) {
   Assert-Skip 'exe 版本信息' 'exe 没有写入版本资源（待集成验证）'
 }
 
+# v0.0.6：版本信息发布者固定为 suliyue，产品名固定，FileVersion/ProductVersion 与 package.json 一致
+if ($verCandidates.Count -gt 0) {
+  Assert-True 'exe 版本信息 CompanyName = suliyue（v0.0.6 起）' ($vi.CompanyName -eq 'suliyue') ('实际 CompanyName=' + $vi.CompanyName)
+  Assert-True ('exe FileVersion = ' + $script:PkgVersion) ([string]$vi.FileVersion -eq $script:PkgVersion) ('实际 FileVersion=' + $vi.FileVersion)
+  Assert-True ('exe ProductVersion = ' + $script:PkgVersion) ([string]$vi.ProductVersion -eq $script:PkgVersion) ('实际 ProductVersion=' + $vi.ProductVersion)
+  Assert-True 'exe ProductName = 离月私人 npm 镜像源' ($vi.ProductName -eq '离月私人 npm 镜像源') ('实际 ProductName=' + $vi.ProductName)
+  Assert-True 'exe FileDescription = 离月私人 npm 镜像源' ($vi.FileDescription -eq '离月私人 npm 镜像源') ('实际 FileDescription=' + $vi.FileDescription)
+}
+
 $exeInDist = (Normalize-Path (Split-Path -Parent $script:ExePath)).StartsWith((Normalize-Path (Join-Path $script:Root 'dist')))
 $sumFile = Join-Path (Split-Path -Parent $script:ExePath) 'SHA256SUMS.txt'
 if (Test-Path $sumFile) {
@@ -1235,6 +1249,55 @@ try {
 } finally {
   if ($null -ne $p0d -and -not $p0d.HasExited) { try { $p0d.Kill() } catch { } }
   Remove-Item $nonSmokeDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# ---------------------------------------------------------------------------
+# 阶段 0e：普通目录副本（v0.0.6）
+# 说明：用户真实场景常把 exe 复制到桌面 / 其它普通文件夹再运行。这里把 dist exe
+# 复制到 tmp\e2e-copy（不同目录、重新写数据目录配置），以 smoke 模式启动并断言
+# 测试报告里的 integrity 字段完整——验证复制到普通目录后程序仍可正常启动/检测。
+# 不请求真实 UAC、不改 dist 产物。
+# ---------------------------------------------------------------------------
+Section '阶段 0e：普通目录副本（v0.0.6，smoke 启动断言 integrity 字段）'
+$copyRoot = Join-Path $script:Root 'tmp\e2e-copy'
+$copyExe = Join-Path $copyRoot ('npm-mirror-desktop-' + $script:PkgVersion + '.exe')
+$copyData = Join-Path $copyRoot 'data'
+$p0e = $null
+try {
+  if (Test-Path $copyRoot) { Remove-Item $copyRoot -Recurse -Force -ErrorAction SilentlyContinue }
+  New-Item -ItemType Directory -Path $copyRoot -Force | Out-Null
+  Copy-Item $script:ExePath $copyExe -Force
+  Assert-True 'exe 已复制到普通目录 tmp\e2e-copy' (Test-Path $copyExe) $copyExe
+  $prevDataDir0e = $script:DataDir
+  try {
+    $script:DataDir = $copyData
+    $seeded0e = Set-TestConfig -WebAdminEnabled $false
+  } finally {
+    $script:DataDir = $prevDataDir0e
+  }
+  Assert-True '普通目录副本测试配置已生成' $seeded0e
+  $p0e = Start-DesktopApp -Exe $copyExe -DataDirArg $copyData -ReportPrefix 'copy'
+  $rep0e = Wait-SmokeReport { [bool](Get-Prop $_ 'node').ready -and ($null -ne (Get-Prop $_ 'integrity')) } 150 400
+  if ($null -eq $rep0e) {
+    $rep0e = $script:LastSmokeReport
+  }
+  Assert-True '普通目录副本 smoke 报告已生成（node ready）' ($null -ne $rep0e -and [bool](Get-Prop (Get-Prop $rep0e 'node') 'ready')) '报告缺失或 node 未就绪'
+  $integ0e = Get-Prop $rep0e 'integrity'
+  Assert-True '普通目录副本报告包含 integrity 对象' ($null -ne $integ0e)
+  if ($null -ne $integ0e) {
+    $integFields0e = @('token', 'tokenRid', 'file', 'lowDetected', 'elevated', 'promptSuppressed', 'exePath')
+    $missing0e = @($integFields0e | Where-Object { $null -eq $integ0e.PSObject.Properties[$_] })
+    Assert-True '普通目录副本 integrity 字段齐全（token/tokenRid/file/lowDetected/elevated/promptSuppressed/exePath）' ($missing0e.Count -eq 0) ('缺少：' + ($missing0e -join ', '))
+    Assert-True '普通目录副本 integrity.exePath 指向副本 exe' ((Normalize-Path ([string](Get-Prop $integ0e 'exePath'))) -eq (Normalize-Path $copyExe)) ('实际：' + (Get-Prop $integ0e 'exePath'))
+    Assert-True '普通目录副本 smoke 模式不弹修复询问框（promptSuppressed=true）' ((Get-Prop $integ0e 'promptSuppressed') -eq $true) ('实际：' + (Get-Prop $integ0e 'promptSuppressed'))
+  }
+  $ping0e = Wait-Until { Test-Ping $RegistryPort } 60 400
+  Assert-True '普通目录副本镜像源服务可访问（GET /-/ping 200）' $ping0e
+} finally {
+  Stop-TrackedProcesses
+  $freed0e = Wait-Until { (-not (Test-Port $RegistryPort)) -and (-not (Test-Port $AdminPort)) } 20 300
+  Info ('阶段 0e 清理后测试端口已释放：' + $freed0e)
+  Remove-Item $copyRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 # ---------------------------------------------------------------------------

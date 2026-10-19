@@ -150,6 +150,19 @@ $distExe = Join-Path $distDir $exeName
 Copy-Item -LiteralPath $builtExe -Destination $distExe -Force
 $sizeMB = [math]::Round((Get-Item -LiteralPath $distExe).Length / 1MB, 2)
 if ($sizeMB -lt 20) { Fail ('产物仅 ' + $sizeMB + ' MB，明显小于预期（应内嵌 node.exe 约 90MB），构建异常。') }
+
+# 版本信息校验：发布者（CompanyName）与版本号必须正确写入 exe 资源。
+# tauri-build 的 CompanyName 来源 = tauri.conf.json 的 bundle.publisher（未设置时回退取 identifier 第 2 段），
+# 这里显式校验，避免发布者字段悄悄丢失或回退成其他值。
+$vi = (Get-Item -LiteralPath $distExe).VersionInfo
+$expectPublisher = 'suliyue'
+if ([string]$vi.CompanyName -ne $expectPublisher) {
+  Fail ('exe 发布者信息不正确：CompanyName=' + [string]$vi.CompanyName + '（期望 ' + $expectPublisher + '）。请检查 src-tauri/tauri.conf.json 的 bundle.publisher。')
+}
+if ([string]$vi.ProductVersion -ne [string]$Version -or [string]$vi.FileVersion -ne [string]$Version) {
+  Fail ('exe 版本信息不正确：FileVersion=' + [string]$vi.FileVersion + '，ProductVersion=' + [string]$vi.ProductVersion + '（期望 ' + $Version + '）。')
+}
+Write-Host ('版本信息校验通过：FileVersion=' + $vi.FileVersion + ' / CompanyName=' + $vi.CompanyName + ' / ProductName=' + $vi.ProductName)
 $hash = (Get-FileHash -LiteralPath $distExe -Algorithm SHA256).Hash.ToLowerInvariant()
 $sumFile = Join-Path $distDir 'SHA256SUMS.txt'
 $sumLine = $hash + '  ' + $exeName
