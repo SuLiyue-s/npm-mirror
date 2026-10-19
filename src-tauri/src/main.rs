@@ -96,7 +96,7 @@ fn main() {
     logging::error(format!("启动失败：{message}"));
     // smoke 模式统一由主程序写一份失败报告后退出（不弹框），便于受限环境 e2e 断言
     if let Some(path) = &error_report_path {
-      let payload = build_failure_report(&message, error.kind());
+      let payload = build_failure_report(&message, error.kind(), None);
       let _ = std::fs::write(path, format!("{payload}\n"));
     }
     if !smoke_mode {
@@ -159,7 +159,7 @@ fn show_window_failure_box(failure: &window::WindowFailure) {
 /// 弹可操作说明框，然后退出。此时尚未启动 Node，不会残留子进程/托盘图标。
 fn handle_startup_failure(app: &AppHandle, error: &StartupError) {
   if let Some(path) = app.state::<AppState>().args.smoke_report.clone() {
-    let payload = build_failure_report(&error.message(), error.kind());
+    let payload = build_failure_report(&error.message(), error.kind(), Some(app));
     let _ = std::fs::write(path, format!("{payload}\n"));
   }
   match error {
@@ -325,6 +325,8 @@ fn run(args: state::StartupArgs) -> Result<(), StartupError> {
     }
     RunEvent::Exit => {
       node_proc::kill_node(app_handle);
+      // 清理托盘图标（NIM_DELETE）与 HICON，避免任务栏残留幽灵图标
+      tray::shutdown();
       window::save_prefs(app_handle);
       logging::info("桌面程序进程退出");
     }
@@ -425,7 +427,11 @@ fn start_initial_node(app: &AppHandle) {
 }
 
 /// 构造启动失败报告：smoke 模式下写 --smoke-report（fields 与成功报告尽量兼容）。
-fn build_failure_report(message: &str, kind: &str) -> serde_json::Value {
+fn build_failure_report(
+  message: &str,
+  kind: &str,
+  app: Option<&AppHandle>,
+) -> serde_json::Value {
   let summary = STARTUP_SUMMARY
     .lock()
     .ok()
@@ -450,6 +456,45 @@ fn build_failure_report(message: &str, kind: &str) -> serde_json::Value {
     "version": env!("CARGO_PKG_VERSION"),
     "logPath": logging::log_path().map(|path| path.display().to_string()),
   });
+  // setup 阶段的失败可从 AppState 补充与冒烟报告一致的字段（home/dataDir/tray 状态）
+  if let Some(app) = app {
+    let state = app.state::<AppState>();
+    if let Some(object) = report.as_object_mut() {
+      object.insert(
+        "home".to_string(),
+        serde_json::json!({
+          "path": state.home_dir.to_string_lossy(),
+          "fallback": state.home_fallback,
+          "warnings": state.home_warnings,
+        }),
+      );
+      object.insert(
+        "homeDir".to_string(),
+        serde_json::json!(state.home_dir.to_string_lossy()),
+      );
+      object.insert(
+        "dataDir".to_string(),
+        serde_json::json!(state.data_dir_snapshot().to_string_lossy()),
+      );
+      object.insert(
+        "dataDirSource".to_string(),
+        serde_json::json!(state.data_dir_source_snapshot()),
+      );
+      object.insert(
+        "restricted".to_string(),
+        serde_json::json!(state.restricted()),
+      );
+      object.insert(
+        "tray".to_string(),
+        serde_json::json!({
+          "created": state.tray_created(),
+          "available": state.tray_available(),
+          "error": state.tray_error_snapshot(),
+          "labels": tray_labels,
+        }),
+      );
+    }
+  }
   // 合并启动阶段环境摘要（home/dataDir/dataDirSource/webview2Version 等）
   if let (Some(object), Some(extra)) = (report.as_object_mut(), summary.as_object()) {
     for (key, value) in extra {

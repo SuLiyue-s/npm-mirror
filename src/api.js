@@ -2309,6 +2309,15 @@ async function handleAdmin(ctx) {  const { req, res, url, method, store, log } =
     const wa = typeof ctx.webAdminState === 'function'
       ? ctx.webAdminState()
       : { enabled: true, ip: ctx.adminListenIp, port: ctx.adminListenPort, url: ctx.adminUrl, listening: true, listenError: ctx.adminListenError || '' };
+    /* v0.0.4：外壳 app.info 新增托盘/受限环境信息（供前端警示条与工具页状态使用）。
+     * 旧外壳（v0.0.3 及以前）没有这些字段、非桌面模式也没有外壳——统一给安全默认值：
+     * tray.available=null 表示「未知」，restricted/homeFallback=false、homeDir=null，前端据此不显示警示条。 */
+    const appMeta = (info) => ({
+      tray: (info && info.tray) || { available: null, error: '', labels: [] },
+      restricted: !!(info && info.restricted),
+      homeFallback: !!(info && info.homeFallback),
+      homeDir: (info && info.homeDir) || null,
+    });
     const baseInfo = {
       desktop: !!ctx.desktop,
       version: ctx.state.version,
@@ -2330,6 +2339,8 @@ async function handleAdmin(ctx) {  const { req, res, url, method, store, log } =
         exePath: null,
         exeDir: util.appRoot(),
         internal: { ip: wa.ip, port: wa.port },
+        // 无外壳：托盘/受限环境字段全部按默认值返回（前端统一处理，不报错）
+        ...appMeta(null),
       });
     }
     let appInfo = null;
@@ -2343,6 +2354,8 @@ async function handleAdmin(ctx) {  const { req, res, url, method, store, log } =
       // DESIGN §1.5/§13.7：桌面版默认主数据目录 = <exe 所在目录>\data（程序运行目录 runtime 仅是兜底）
       dataDirDefault: path.join(exeDir, 'data'),
       internal: { ip: ctx.internalAdminIp || '127.0.0.1', port: ctx.internalAdminPort || 0 },
+      // v0.0.4：透传外壳的托盘/受限环境信息；旧外壳缺字段时由 appMeta 给默认值
+      ...appMeta(appInfo),
     });
   }
 

@@ -6,6 +6,7 @@ use tauri::image::Image;
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent};
 
 use crate::logging;
+use crate::node_proc;
 use crate::paths;
 use crate::state::{self, AppState};
 
@@ -296,10 +297,10 @@ pub fn create(app: &AppHandle) -> Result<WebviewWindow, WindowFailure> {
   let window_for_events = webview_window.clone();
   webview_window.on_window_event(move |event| match event {
     WindowEvent::CloseRequested { api, .. } => {
-      // 关闭窗口只隐藏，程序继续在托盘运行
+      // v0.0.4 语义：托盘可用时关闭=隐藏到托盘；托盘不可用（受限环境/注册失败）时关闭=退出程序，
+      // 与「关闭窗口时不可用则退出」一致，避免程序变成无法唤出的后台常驻进程。
       api.prevent_close();
-      hide(&app_for_events);
-      record_action("关闭请求：已隐藏到托盘".to_string());
+      handle_close_request(&app_for_events, "WM_CLOSE");
     }
     WindowEvent::Resized(size) => {
       let scale = window_for_events.scale_factor().unwrap_or(1.0);
@@ -328,6 +329,26 @@ pub fn create(app: &AppHandle) -> Result<WebviewWindow, WindowFailure> {
     _ => {}
   });
   Ok(webview_window)
+}
+
+/// 窗口关闭请求的统一处理（WM_CLOSE 与冒烟命令 window:close 共用）：
+/// - 托盘可用：隐藏窗口，程序继续在托盘运行；
+/// - 托盘不可用：直接优雅退出程序（清理 Node/托盘），避免留下无法唤出的后台进程。
+pub fn handle_close_request(app: &AppHandle, source: &str) {
+  let tray_available = app.state::<AppState>().tray_available();
+  logging::info(format!(
+    "窗口关闭请求（{source}）：托盘可用={tray_available}"
+  ));
+  if tray_available {
+    hide(app);
+    record_action(format!("关闭请求（{source}）：已隐藏到托盘（托盘可用）"));
+  } else {
+    record_action(format!(
+      "关闭请求（{source}）：托盘不可用，直接退出程序"
+    ));
+    logging::warn("托盘不可用：关闭窗口将退出程序（不驻留后台）");
+    node_proc::shutdown_and_exit(app, 0);
+  }
 }
 
 pub fn show(app: &AppHandle) {

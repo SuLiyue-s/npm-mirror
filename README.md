@@ -5,7 +5,7 @@
 - 运行环境：Node.js **>= 18**（实测 Node.js 24），Windows / macOS / Linux 均可运行服务本体（一键脚本为 Windows `.cmd` / PowerShell）
 - 默认地址：镜像源（npm registry）<http://127.0.0.1:4873>，管理界面 <http://127.0.0.1:4874>（**两个独立监听**：管理界面只监听 `127.0.0.0/8` 本地回环，只有本机访问才能打开；端口不可与镜像源端口相同，可在配置页/`data/config.json` 的 `admin` 段修改）
 - 依赖数量：**0**（`dependencies` 与 `devDependencies` 均为空）
-- 桌面版：**单 exe（版本 0.0.3，本地构建）**，`dist/npm-mirror-desktop-0.0.3.exe`，双击即用、内嵌 Node 运行时，带托盘 / 控制台页 / 工具页 / 主数据目录选择 / 开机自启；**必须从资源管理器双击运行**（见 [启动必读](#启动必读重要)），详见 [桌面版（单 exe）](#桌面版单-exe)
+- 桌面版：**单 exe（版本 0.0.4，本地构建）**，`dist/npm-mirror-desktop-0.0.4.exe`，双击即用、内嵌 Node 运行时，带托盘 / 控制台页 / 工具页 / 主数据目录选择 / 开机自启；**exe / 窗口 / 托盘图标统一使用网页版图标 `public/favicon.ico`**；**必须从资源管理器双击运行**（见 [启动必读](#启动必读重要)），详见 [桌面版（单 exe）](#桌面版单-exe)
 - 许可证：[MIT](LICENSE)
 
 ![管理界面概览](截图/管理界面-概览.png)
@@ -62,18 +62,20 @@ node cli.js start
 
 ### 启动必读（重要）
 
-- **必须从 Windows 资源管理器里双击 exe 运行**（或双击 `启动桌面版.cmd`）。exe 位于 `dist\` 时，双击 `dist\npm-mirror-desktop-0.0.3.exe`。
-- **不要在聊天窗口 / IDE 预览面板 / 沙盒 / 受限终端里启动**：这些环境会让程序继承受限权限，`%LOCALAPPDATA%` 无法写入、WebView2 无法创建窗口与托盘，表现为「没有窗口、没有托盘图标、也没有右键菜单，但任务管理器里有进程」。v0.0.2 的用户日志已证实这一点（`%LOCALAPPDATA%` 写入被拒 `os error 5`、WebView2 `runtime error: failed to receive message from webview`）。
-- v0.0.3 的行为：从受限环境启动时**会弹出一个可操作的说明框**（提示改用资源管理器双击 exe、必要时安装 WebView2 Runtime），随后自动清理并退出，不再静默留在后台；配置目录写不了时**静默回退**到 `<exe 所在目录>\LiYueNpmMirror\`，只写日志、不再弹「创建目录失败」框。
+- **必须从 Windows 资源管理器里双击 exe 运行**（或双击 `启动桌面版.cmd`）。exe 位于 `dist\` 时，双击 `dist\npm-mirror-desktop-0.0.4.exe`。
+- **不要在聊天窗口 / IDE 预览面板 / 沙盒 / 受限终端里启动**：这些环境会让程序继承受限权限，`%LOCALAPPDATA%` 无法写入、WebView2 无法创建窗口、系统托盘注册会被拒绝（`os error 5`），表现为「没有窗口 / 没有托盘图标 / 没有右键菜单，但任务管理器里有进程」。v0.0.2 的用户日志已证实这一点（`%LOCALAPPDATA%` 写入被拒 `os error 5`、WebView2 `runtime error: failed to receive message from webview`）。
+- 版本行为差异：v0.0.2 回退配置目录但仍可能只留下无界面进程；v0.0.3 在窗口 / 托盘异常时弹可操作说明框后清理退出；**v0.0.4 起托盘改为程序自绘 Win32 注册**——注册失败会每秒重试、最多 15 秒，仍失败则在日志记录「托盘注册失败：…」并在**窗口内显示警示条**，此时**关闭窗口会直接退出程序**（不会静默隐藏到后台），请按提示改用资源管理器双击；配置目录写不了时仍**静默回退**到 `<exe 所在目录>\LiYueNpmMirror\`，只写日志不弹框。
+- **程序图标（v0.0.4）**：exe、窗口、托盘统一使用网页版图标 `public\favicon.ico`，不再是「旧图标 + Tauri logo」合成图，托盘和浏览器标签页视觉一致。
 - **托盘图标可能被 Windows 收进任务栏右侧的「^」溢出区**：点「^」把图标拖到任务栏即可固定显示；程序不会因为图标被收起而停止。
 - 数据目录默认 `<exe 所在目录>\data`；把 exe 放在项目的 `dist\` 里时，**会自动发现并使用上级项目的 `data\`**（详见下表与「使用要点」）。
-- 本次 0.0.3 是**本地构建**，不上传 GitHub；从 GitHub 下载安装请用 [v0.0.2 发布版](https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.2)。
+- 本次 0.0.4 是**本地构建**，不上传 GitHub；从 GitHub 下载安装请用 [v0.0.2 发布版](https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.2)。
 
 | 项目 | 说明 |
 | --- | --- |
-| 版本 | **0.0.3**（`package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` 三处一致；**本地构建，未发布 GitHub Releases**） |
-| 构建产物 | `dist/npm-mirror-desktop-0.0.3.exe`（单文件，内嵌 Node 运行时与全部程序文件） |
+| 版本 | **0.0.4**（`package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` 三处一致；**本地构建，未发布 GitHub Releases**） |
+| 构建产物 | `dist/npm-mirror-desktop-0.0.4.exe`（单文件，内嵌 Node 运行时与全部程序文件） |
 | 下载 | **本次不发 Release**：产物由本机 `tools/build-desktop.ps1` 构建后直接放在 `dist\`；历史版本 [v0.0.2](https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.2) / [v0.0.1](https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.1) 仍可从 GitHub Releases 下载 |
+| 程序图标 | **v0.0.4 起** exe / 窗口 / 托盘统一使用网页版图标 `public\favicon.ico`（与浏览器标签页同一套图标） |
 | 启动方式 | **Windows 资源管理器双击 exe**，或双击仓库根目录的 `启动桌面版.cmd`（自动启动 `dist\` 里最新的桌面版 exe） |
 | 系统要求 | Windows 10/11 x64；需要系统自带 **WebView2 运行时**（Win11 默认已装，Win10 可装 Evergreen Runtime） |
 | 数据目录 | 默认 `<exe 所在目录>\data`，与网页版 / 命令行版共用同一套数据格式；**v0.0.3 起会自动发现上级项目 `data\`**（见「桌面版特性」），也可在配置页用「选择目录…」更换 |
@@ -83,10 +85,12 @@ node cli.js start
 ### 桌面版特性
 
 - **单文件运行**：exe 内嵌 node.exe 与全部程序文件，首次运行解压到程序配置目录的 `runtime\<版本>\`，之后直接复用；目标机器无需安装 Node.js。程序配置目录不可写（受限账户 / 沙盒 / 安全软件拦截）时，**v0.0.2 起自动回退**到 `<exe 所在目录>\LiYueNpmMirror\`（v0.0.3 起回退只写日志、不再弹框），不再直接启动失败。
-- **启动失败可见化（v0.0.3）**：创建窗口 / 托盘后校验 WebView2 与托盘是否真的可用；不可用时弹出可操作说明框（用资源管理器双击 exe、安装 WebView2 Runtime、不要在受限终端启动），随后清理 Node 子进程与托盘退出，不再出现「进程在跑却看不到窗口和托盘」。
+- **图标与网页版一致（v0.0.4）**：exe 文件图标、窗口图标、托盘图标全部改用 `public\favicon.ico`（网页版标签页图标），不再使用「旧图标 + Tauri logo」的合成图；`tools\compose-desktop-icon.ps1` 只负责从网页版图标生成窗口 / 托盘所需的 RGBA 素材。
+- **启动失败可见化（v0.0.3 起，v0.0.4 增强）**：创建窗口 / 托盘后校验实际可用性。窗口创建失败仍弹出可操作说明框（用资源管理器双击 exe、安装 WebView2 Runtime、不要在受限终端启动）后清理退出；**v0.0.4 托盘改为自绘 Win32 注册**，每秒重试、最多 15 秒，仍失败则写日志「托盘注册失败：…」并在窗口内显示警示条，此时**关闭窗口 = 直接退出程序**，不会再出现「进程在跑却看不到窗口和托盘」的静默状态。
+- **托盘自愈（v0.0.4）**：Windows 资源管理器重启后，程序会收到 `TaskbarCreated` 消息并自动重新注册托盘图标，不需要重启程序。
 - **数据目录自动发现（v0.0.3）**：启动顺序 `--data-dir` > `MIRROR_DATA_DIR` > 上次「选择目录…」记录 > `<exe 目录>\data`（已有 `config.json` 或 `storage\` 时）> 上级项目 `data\`（`<exe 目录>\data` 不存在/为空且上级 `data\config.json` 存在时）> `<exe 目录>\data`（默认）。因此把 exe 放在项目的 `dist\` 里双击，会直接读到 `项目根\data` 的现有配置与包。
 - **`启动桌面版.cmd`（v0.0.3）**：仓库根双击即启动 `dist\` 下最新的桌面版 exe，并打印窗口 / 托盘 / 网页版管理与启动方式提示；找不到 exe 时给出构建或放置提示。
-- **托盘常驻**：关闭窗口只是隐藏，托盘图标继续运行镜像源；左键单击打开窗口。右键菜单随网页版管理开关实时变化（**≤1 秒**）：关闭时 **4 项**「打开窗口 / 关闭窗口 / 重启镜像源服务 / 退出程序」；开启时 **6 项**「打开窗口 / 关闭窗口 / 打开管理界面 / 重启管理界面 / 重启镜像源服务 / 退出程序」。新增的「打开管理界面」用系统默认浏览器打开网页版管理页面（`http://<admin.ip>:<admin.port>/`），「重启管理界面」只重建该监听。
+- **托盘常驻**：托盘可用时，关闭窗口只是隐藏，托盘图标继续运行镜像源；左键单击打开窗口。右键菜单随网页版管理开关实时变化（**≤1 秒**）：关闭时 **4 项**「打开窗口 / 关闭窗口 / 重启镜像源服务 / 退出程序」；开启时 **6 项**「打开窗口 / 关闭窗口 / 打开管理界面 / 重启管理界面 / 重启镜像源服务 / 退出程序」。新增的「打开管理界面」用系统默认浏览器打开网页版管理页面（`http://<admin.ip>:<admin.port>/`），「重启管理界面」只重建该监听。**托盘注册失败时（受限环境）没有托盘菜单，且关闭窗口 = 退出程序**。
 - **控制台页**：把服务日志、一键脚本输出、桌面端操作日志实时汇总（最多保留 3000 行），可暂停 / 继续 / 清空 / 复制 / 下载，按级别与来源筛选。
 - **工具页**：桌面程序信息（版本 / 程序路径 / 主数据目录 / 运行模式）、重启程序 / 退出程序 / 隐藏窗口、重启镜像源 / 重启管理界面 / 打开网页版管理、开机自启开关、一键脚本（环境自检 / 查看状态 / 从 npm 缓存补包 / 一键导出全部包 / 一键导入离线包）、打开数据目录 / 日志目录 / 配置文件。
 - **网页版管理开关**（`admin.enabled`，默认 **关闭**）：默认桌面版不开放浏览器可访问的管理端口，只能从桌面窗口管理；需要浏览器 / 局域网访问时在「配置 → 桌面 / 网页管理」打开，端口即 `admin.ip` / `admin.port`（默认 `127.0.0.1:4874`），保存即时生效、不用重启程序。
@@ -99,7 +103,7 @@ node cli.js start
 ### 构建桌面版（本机离线）
 
 ```powershell
-# 在仓库根目录执行：校验三处版本号一致 → 嵌入 node.exe → 生成/校验图标 → 离线 cargo build → 输出 dist
+# 在仓库根目录执行：校验三处版本号一致 → 嵌入 node.exe → 校验/生成图标（源图 = public/favicon.ico）→ 离线 cargo build → 输出 dist
 powershell -NoProfile -ExecutionPolicy Bypass -File tools/build-desktop.ps1
 
 # 可选参数
@@ -111,15 +115,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/build-desktop.ps1
 
 - 构建环境：Windows + Rust（msvc toolchain）+ Visual Studio 生成工具 + Windows SDK；仓库已把 cargo 依赖缓存放在 `tmp/cargo-home`（约 357MB，**不要删**），构建脚本默认用 `CARGO_HOME=<repo>\tmp\cargo-home` + `CARGO_NET_OFFLINE=true` 离线构建，无网络也能编译。
 - 产物：`dist/npm-mirror-desktop-<版本>.exe` + `dist/SHA256SUMS.txt`（SHA256 校验清单，可用 `Get-FileHash` 或 `certutil -hashfile` 对照）。
-- **本次 0.0.3 为本地构建，不推送 GitHub、不发布 Release**：`dist\npm-mirror-desktop-0.0.3.exe` 只保留在本机；GitHub 上的 [v0.0.2](https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.2) 仍是最近一个发布版本。构建完成后可直接双击 `启动桌面版.cmd` 启动 `dist\` 里最新的 exe。
+- 图标：v0.0.4 起 exe / 窗口 / 托盘统一使用网页版图标 `public\favicon.ico`；构建脚本校验 `src-tauri\icons\icon.ico` 等素材，缺失或加 `-ForceIcon` 时调用 `tools\compose-desktop-icon.ps1` 从网页版图标重新生成。
+- **本次 0.0.4 为本地构建，不推送 GitHub、不发布 Release**：`dist\npm-mirror-desktop-0.0.4.exe` 只保留在本机；GitHub 上的 [v0.0.2](https://github.com/SuLiyue-s/npm-mirror/releases/tag/v0.0.2) 仍是最近一个发布版本。构建完成后可直接双击 `启动桌面版.cmd` 启动 `dist\` 里最新的 exe。
 - 版本号唯一来源是 `package.json`，`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json` 用 `node tools/version.js --bump patch` 同步；发版用 `tools/release.ps1`（bump → 构建 → 提交 → tag → GitHub Release）。
 - `dist/`、`src-tauri/target/`、`src-tauri/embed/node.exe` 均不入库（见 `.gitignore`）。
 
 ### 桌面版使用要点
 
-1. **从资源管理器双击** `dist\npm-mirror-desktop-0.0.3.exe`（或双击 `启动桌面版.cmd`）。首次启动会自动初始化数据目录并生成配置与访问令牌：默认用 `<exe 所在目录>\data`；若 exe 在项目的 `dist\` 里而 `<exe 目录>\data` 不存在/为空、上级 `data\config.json` 存在，则**自动改用项目根 `data\`**（v0.0.3 新增）。**不要从聊天窗口 / IDE 预览面板 / 沙盒 / 受限终端启动**：会因继承受限权限导致 WebView2 窗口与托盘不可用；v0.0.3 会弹说明框并清理退出，v0.0.1/v0.0.2 则可能只留下看不到界面的进程。
+1. **从资源管理器双击** `dist\npm-mirror-desktop-0.0.4.exe`（或双击 `启动桌面版.cmd`）。首次启动会自动初始化数据目录并生成配置与访问令牌：默认用 `<exe 所在目录>\data`；若 exe 在项目的 `dist\` 里而 `<exe 目录>\data` 不存在/为空、上级 `data\config.json` 存在，则**自动改用项目根 `data\`**（v0.0.3 新增）。**不要从聊天窗口 / IDE 预览面板 / 沙盒 / 受限终端启动**：会因继承受限权限导致 WebView2 窗口不可用、托盘注册被系统拒绝（v0.0.4 会在窗口内显示警示条，v0.0.3 会弹说明框并清理退出，v0.0.1/v0.0.2 则可能只留下看不到界面的进程）。
 2. 窗口打开的就是管理界面；「控制台」「工具」页在左侧导航里（`MONITOR` / `SYSTEM` 分组）。若托盘图标没出现在任务栏右下角，点「^」到溢出区里找（可拖到任务栏固定）。
-3. 点窗口右上角 **×** 只是隐藏窗口，镜像源继续运行；要彻底退出请用托盘右键「退出程序」或工具页的「退出程序」。
+3. 托盘可用时，点窗口右上角 **×** 只是隐藏窗口，镜像源继续运行；要彻底退出请用托盘右键「退出程序」或工具页的「退出程序」。**若托盘注册失败（受限环境，窗口内有警示条）**，关闭窗口会直接退出程序。
 4. 换数据目录：配置页 →「桌面 / 网页管理」→「选择目录…」→ 选一个**已存在**的文件夹 → 确认后程序自动重启并切到新目录。**数据不会自动搬迁**，需要迁移时先退出程序，把旧 `data\` 整个复制到新位置再启动。
 5. 从旧版迁移：把 exe 放进现有项目的 `dist\` 或项目根目录运行，v0.0.3 会自动发现并使用 `项目根\data`；也可以把旧 `data\` 复制到 exe 同级的 `data\`，或在配置页用「选择目录…」指过去。
 6. 卸载：退出程序后删除 exe 与 `data\` 即可；开机自启在工具页关掉（或删除注册表 `LiYueNpmMirror` 值），程序配置目录（默认 `%LOCALAPPDATA%\LiYueNpmMirror\`，不可写时是 `<exe 所在目录>\LiYueNpmMirror\`，含运行时解压缓存 / 桌面日志 / 目录记录）可一并删除。
@@ -130,13 +135,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/build-desktop.ps1
 
 **Q：启动报「创建桌面配置目录 … 拒绝访问 (os error 5)」/ 双击后没有窗口也没有托盘，但任务管理器里有进程？**
 根因都是**从受限环境启动**（聊天窗口、沙盒、IDE / 本会话预览面板、受限终端）：程序继承受限 token，`%LOCALAPPDATA%` 写不了（`os error 5`），WebView2 也拿不到窗口与托盘（`runtime error: failed to receive message from webview`）。
-正确处理：到 **Windows 资源管理器里双击** `dist\npm-mirror-desktop-0.0.3.exe`（或双击 `启动桌面版.cmd`，也可把 exe 复制到桌面再双击）。版本差异：v0.0.1 直接报错退出；v0.0.2 会回退配置目录但仍可能只留下无界面进程；**v0.0.3 会弹出一段可操作说明框后清理退出，并把回退信息写进日志**。受限环境下的窗口功能不保证，**请始终用资源管理器启动**。
+正确处理：到 **Windows 资源管理器里双击** `dist\npm-mirror-desktop-0.0.4.exe`（或双击 `启动桌面版.cmd`，也可把 exe 复制到桌面再双击）。版本差异：v0.0.1 直接报错退出；v0.0.2 会回退配置目录但仍可能只留下无界面进程；v0.0.3 会弹出一段可操作说明框后清理退出；**v0.0.4 托盘注册失败前会重试 15 秒，失败后在窗口内显示警示条并在日志记录「托盘注册失败」**。受限环境下的窗口 / 托盘功能不保证，**请始终用资源管理器启动**。
+
+**Q：右下角托盘图标完全不出现（没有图标、也没有右键菜单）？**
+先看桌面日志 `desktop.log`（默认 `%LOCALAPPDATA%\LiYueNpmMirror\desktop.log`，回退时在 `<exe 所在目录>\LiYueNpmMirror\desktop.log`）：出现「**托盘图标已注册**」表示注册成功（图标可能只是被收进任务栏「^」溢出区，拖到任务栏即可固定）；出现「**托盘注册失败：…**」表示系统拒绝注册，常见于从受限环境 / 受限账户启动（日志含「拒绝访问 / os error 5」），此时 v0.0.4 会在窗口内显示警示条，**关闭窗口 = 退出程序**，请改用资源管理器双击 exe。另一种情况是 Windows 资源管理器重启（任务栏重建）导致图标消失：**v0.0.4 会自动重新注册**（收到 `TaskbarCreated` 消息，约 1 秒内恢复），旧版本则需重启程序。若组策略禁用了通知区域，任何程序都无法显示托盘图标。
 
 **Q：把 exe 放在 `dist\` 里运行，数据却建到了 `dist\data`、读不到项目原来的数据？**
 v0.0.2 及更早版本默认用 `<exe 目录>\data`，所以会新建一个空数据目录。**v0.0.3 起会自动发现上级项目数据**：当 `<exe 目录>\data` 不存在或为空、而 `<exe 目录>\..\data\config.json` 存在时，自动使用 `项目根\data`（桌面日志与 `/desktop/info` 的数据目录来源会显示 `parent-project`）。若想强制指定：用「配置 → 桌面 / 网页管理 → 选择目录…」，或启动参数 `--data-dir <路径>`。
 
 **Q：启动后看不到窗口 / 托盘图标？**
-先按上一条确认是从资源管理器启动；确定是普通桌面会话时，检查系统是否安装 **WebView2 运行时**（Win11 自带），并查看程序配置目录下的 `desktop.log`（默认 `%LOCALAPPDATA%\LiYueNpmMirror\desktop.log`，不可写时在 `<exe 所在目录>\LiYueNpmMirror\desktop.log`）。托盘图标可能只是被收进了任务栏「^」溢出区。
+先按上一条确认是从资源管理器启动；确定是普通桌面会话时，检查系统是否安装 **WebView2 运行时**（Win11 自带），并查看程序配置目录下的 `desktop.log`（默认 `%LOCALAPPDATA%\LiYueNpmMirror\desktop.log`，不可写时在 `<exe 所在目录>\LiYueNpmMirror\desktop.log`）：窗口问题看 `window.failureReason` 一类记录，托盘问题看「托盘图标已注册 / 托盘注册失败」。托盘图标也可能只是被收进了任务栏「^」溢出区。
 
 **Q：导入离线包时点了取消，一直显示「等待开始…」？**
 这是 v0.0.2 及更早版本的缺陷，**v0.0.3 已修复**：取消会中止解包 / 扫描 / 写入各阶段并在约 1~2 秒内进入「已取消」，未完成包的临时目录会清理，不影响之后的正常导入导出。
@@ -157,7 +165,7 @@ exe 未做代码签名，SmartScreen 会提示「Windows 已保护你的电脑�
 只接受**已存在的文件夹**；根目录（如 `D:\`）、文件路径、相对路径都会被拒绝。想用新磁盘就先在资源管理器里建好文件夹再选。权限受限的目录（如 `C:\Program Files` 下）可能写不进去，建议放用户目录或数据盘。
 
 **Q：托盘图标不见了？**
-Windows 可能把图标收进「^」溢出区，拖到任务栏即可固定；程序退出后重新双击 exe 即可恢复。
+Windows 可能把图标收进「^」溢出区，拖到任务栏即可固定；如果是资源管理器重启导致的任务栏重建，**v0.0.4 会自动重新注册**（约 1 秒内恢复）；程序退出后重新双击 exe 即可恢复。
 
 > 网页版 / 命令行版的完整功能在桌面窗口中同样可用；桌面版专属操作细节见 [使用说明.md](使用说明.md)。
 
@@ -284,9 +292,9 @@ npm私人镜像源-离线版/
 │  └─ util.js             工具函数（semver、原子写、包名/版本校验、数据根与路径穿越防护等）
 ├─ public/                原生前端（app.js / index.html / style.css / favicon.ico；桌面版新增控制台页、工具页）
 ├─ src-tauri/             Tauri 2 桌面壳（Rust：窗口/托盘/单实例/原生对话框/自启/桥协议；embed/ 内嵌 node.exe）
-├─ tools/                 辅助脚本（tray.ps1 托盘宿主、make-icon.ps1 自绘图标、build-desktop.ps1 桌面版构建、version.js 版本同步、release.ps1 发版）
+├─ tools/                 辅助脚本（tray.ps1 托盘宿主、make-icon.ps1 自绘图标、compose-desktop-icon.ps1 桌面图标合成（v0.0.4 源图 = public/favicon.ico）、build-desktop.ps1 桌面版构建、version.js 版本同步、release.ps1 发版）
 ├─ test/                  自动化测试与验收脚本（desktop-e2e.ps1 桌面版端到端、desktop-path-test.js 路径穿越单测）
-├─ dist/                  桌面版构建产物（exe + SHA256SUMS.txt，已 gitignore；0.0.3 为本地构建未发布）
+├─ dist/                  桌面版构建产物（exe + SHA256SUMS.txt，已 gitignore；0.0.4 为本地构建未发布）
 ├─ data/                  运行时数据（包存储/日志/配置/离线包，已 gitignore）
 ├─ 启动桌面版.cmd         桌面版入口（自动启动 dist 里最新的桌面版 exe，v0.0.3 新增）
 ├─ 使用说明.md            详细操作手册（第十三章为桌面版）
@@ -321,7 +329,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File test/desktop-e2e.ps1  # 桌�
 | `test/desktop-path-test.js` | 桌面版数据根与路径穿越防护单测：普通相对路径、旧 `data/` 前缀、`../` / `..\` / `a/../../x`、绝对路径、NUL、磁盘根、空串、`C:foo` 等 | **24/24 通过（exit 0）** |
 | `test/desktop-bridge-test.js` | 桌面版 stdio 桥协议单测：`ready` / `req` / `res` / `event` / `bye` 消息、请求 id 与并发、错误包装、超时与非法消息处理等 | **11/11 通过（exit 0）** |
 | `test/desktop-cancel-test.js` | 桌面版导入取消收敛单测：解包/扫描/写存储阶段取消 ≤2s 收敛（实测 122ms）、临时目录清理、已导入数据不被破坏、取消后可重新导入 | **13/13 通过（exit 0）** |
-| `test/desktop-e2e.ps1` | 桌面版端到端验收（Windows / PowerShell 7）：`dist` exe 存在与版本信息 → 启动进程/窗口（窗口标题、URL=内部回环管理端口、加载现有管理界面；v0.0.3 起同时断言窗口失败原因字段 `window.failureReason`）→ 内部管理 API → 控制台 API 与增量 `after` → 一键脚本 `doctor`/`status` → `admin.enabled` 端口监听开关与即时生效 → 默认数据目录 `<exe目录>\data` → **v0.0.3 数据目录自动发现（`parent-project`：exe 在 `dist\`、上级 `data\config.json` 存在时自动使用上级 `data\`）** → `/desktop/files` 白名单与穿越参数 → `PUT /config` 路径穿越 400 → 单实例 → 关闭窗口后服务仍在线 → 托盘菜单（关闭网页版管理时 **4 项** / 开启时 **6 项**，含「打开管理界面」「重启管理界面」，开关后 ≤2 秒实时切换、关闭后 ≤1 秒缩回；菜单动作用产品内置测试挂钩驱动，等价点菜单项）→ 程序配置目录回退（五级探测，`%LOCALAPPDATA%` 不可写时回退 `<exe目录>\LiYueNpmMirror`，v0.0.3 静默回退只写日志）→ 开机自启注册表往返（已开启时只读跳过）→ 退出后无残留进程与监听。临时数据目录 `tmp/e2e-data`、桌面 home `tmp/e2e-home`、测试端口 14873/14874；退出码 `0`=通过、`1`=失败、`3`=仅因当前会话无法创建/显示 WebView2 窗口的环境限制 | **v0.0.3 实测：153 项 = 143 通过 / 5 失败（均为窗口类环境限制）/ 5 跳过，exit 3，非窗口类失败 0（2026-10-19，`dist\npm-mirror-desktop-0.0.3.exe`，SHA256 `8f89fcb2…790c6`；阶段 1g 配置目录回退 9/9、阶段 1h 数据目录自动发现 9/9、托盘 4/6 项与实时切换全部通过）**；历史 0.0.2：143 项 = 133/5/5，exit 3；0.0.1：119/5/4，exit 3 |
+| `test/desktop-e2e.ps1` | 桌面版端到端验收（Windows / PowerShell 7）：`dist` exe 存在与版本信息 → 启动进程/窗口（窗口标题、URL=内部回环管理端口、加载现有管理界面；v0.0.3 起同时断言窗口失败原因字段 `window.failureReason`）→ 内部管理 API → 控制台 API 与增量 `after` → 一键脚本 `doctor`/`status` → `admin.enabled` 端口监听开关与即时生效 → 默认数据目录 `<exe目录>\data` → **v0.0.3 数据目录自动发现（`parent-project`：exe 在 `dist\`、上级 `data\config.json` 存在时自动使用上级 `data\`）** → `/desktop/files` 白名单与穿越参数 → `PUT /config` 路径穿越 400 → 单实例 → **v0.0.4 托盘可用性（`tray.available`）：可用时关闭窗口=隐藏且服务在线；不可用时关闭窗口=退出程序、退出码 0、无 Node 残留；`/desktop/info.tray.available` 与报告一致；受限环境 `restricted=true`（`home_fallback || !tray_available`）与 `tray.error` 含拒绝原因** → 托盘菜单（关闭网页版管理时 **4 项** / 开启时 **6 项**，含「打开管理界面」「重启管理界面」，开关后 ≤2 秒实时切换、关闭后 ≤1 秒缩回；菜单动作用产品内置测试挂钩驱动，等价点菜单项）→ 程序配置目录回退（五级探测，`%LOCALAPPDATA%` 不可写时回退 `<exe目录>\LiYueNpmMirror`，只写日志不弹框）→ 图标一致性（`src-tauri\icons\icon.ico` 与 `public\favicon.ico` SHA256 相同、RGBA 素材尺寸正确）→ 开机自启注册表往返（已开启时只读跳过）→ 退出后无残留进程与监听。临时数据目录 `tmp/e2e-data`、桌面 home `tmp/e2e-home`、测试端口 14873/14874；退出码 `0`=通过、`1`=失败、`3`=仅因当前会话无法创建/显示 WebView2 窗口的环境限制 | **v0.0.4 实测：166 项 = 155 通过 / 5 失败 / 6 跳过，exit 3（环境限制），非窗口类失败 0**（2026-10-19，`dist\npm-mirror-desktop-0.0.4.exe`，96,808,448 B，SHA256 `3c845384…4fff0c`；5 个失败全部为窗口/WebView2 类断言；阶段 1c-3 托盘不可用→关窗退出、图标一致性、托盘 4/6 项与实时切换、阶段 1h 自动发现全部通过）；历史 v0.0.3：153 项 = 143 通过 / 5 失败（均为窗口类环境限制）/ 5 跳过，exit 3，非窗口类失败 0（2026-10-19，`dist\npm-mirror-desktop-0.0.3.exe`，SHA256 `8f89fcb2…790c6`；阶段 1g 配置目录回退 9/9、阶段 1h 数据目录自动发现 9/9、托盘 4/6 项与实时切换全部通过）；0.0.2：143/133/5/5，exit 3；0.0.1：119/5/4，exit 3 |
 | `test/acceptance-npm.ps1` | 真实 `npm install / publish / dist-tag / deprecate / unpublish` | **16/16 通过** |
 | `test/ui-e2e-*.js` | 浏览器端端到端（需要 Chrome 调试端口，可选） | 需本机 Chrome CDP 环境 |
 

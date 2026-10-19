@@ -2,7 +2,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::ChildStdin;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
@@ -97,6 +97,14 @@ pub struct AppState {
   pub node_restarts: AtomicU32,
   /// 托盘菜单项文本（冒烟证据用）
   pub tray_labels: Mutex<Vec<String>>,
+  /// 托盘图标当前是否确认注册成功（Shell_NotifyIconW NIM_ADD 返回 TRUE）
+  pub tray_available: AtomicBool,
+  /// 是否已尝试过托盘注册（无论成败；冒烟报告的 tray.created）
+  pub tray_created: AtomicBool,
+  /// 托盘注册失败原因（成功时为空字符串）
+  pub tray_error: Mutex<String>,
+  /// 冒烟命令 window:close 触发的退出（由退出流程判定是否清空托盘）
+  pub smoke_intent_close: AtomicBool,
   /// 冒烟测试命令执行记录
   pub smoke_commands: Mutex<Vec<Value>>,
   /// 窗口位置/大小（退出时写 desktop.json）
@@ -140,6 +148,10 @@ impl AppState {
       allow_exit: AtomicBool::new(false),
       node_restarts: AtomicU32::new(0),
       tray_labels: Mutex::new(Vec::new()),
+      tray_available: AtomicBool::new(false),
+      tray_created: AtomicBool::new(false),
+      tray_error: Mutex::new(String::new()),
+      smoke_intent_close: AtomicBool::new(false),
       smoke_commands: Mutex::new(Vec::new()),
       prefs: Mutex::new(DesktopPrefs::default()),
       log_path,
@@ -194,6 +206,40 @@ impl AppState {
 
   pub fn web_admin_snapshot(&self) -> WebAdminState {
     lock(&self.web_admin).clone()
+  }
+
+  /// 托盘图标是否已成功注册。
+  pub fn tray_available(&self) -> bool {
+    self.tray_available.load(Ordering::SeqCst)
+  }
+
+  /// 标记已尝试过托盘注册（用于冒烟报告 tray.created）。
+  pub fn mark_tray_attempted(&self) {
+    self.tray_created.store(true, Ordering::SeqCst);
+  }
+
+  pub fn tray_created(&self) -> bool {
+    self.tray_created.load(Ordering::SeqCst)
+  }
+
+  /// 更新托盘注册状态与失败原因。
+  pub fn set_tray_available(&self, available: bool, error: String) {
+    self.tray_available.store(available, Ordering::SeqCst);
+    *lock(&self.tray_error) = error;
+  }
+
+  pub fn tray_error_snapshot(&self) -> String {
+    lock(&self.tray_error).clone()
+  }
+
+  /// 受限启动环境：配置目录回退或托盘不可用。
+  pub fn restricted(&self) -> bool {
+    self.home_fallback || !self.tray_available()
+  }
+
+  /// 标记冒烟命令 window:close 触发的关闭（退出流程据此清空托盘图标）。
+  pub fn mark_smoke_intent_close(&self) {
+    self.smoke_intent_close.store(true, Ordering::SeqCst);
   }
 
   pub fn config_snapshot(&self) -> UiConfig {

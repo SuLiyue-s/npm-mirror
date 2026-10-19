@@ -68,6 +68,15 @@
   <!-- ══════════════ 内容区 ══════════════ -->
   <main class="content" id="content">
 
+    <!-- 桌面版受限环境警示：托盘不可用 / 配置目录回退时显示。放在所有 .view 之前，切页不会消失，也不提供关闭按钮 -->
+    <div class="banner desktop-warn" id="desktop-warn" hidden>
+      <span class="lamp lamp-warn"></span>
+      <div class="desktop-warn-body">
+        <div class="desktop-warn-msg" id="desktop-warn-msg"></div>
+        <div class="desktop-warn-err" id="desktop-warn-err" hidden></div>
+      </div>
+    </div>
+
     <!-- ───────── 1. 概览 ───────── -->
     <section class="view" id="view-overview">
       <div class="view-head">

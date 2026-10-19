@@ -1,15 +1,37 @@
-// 系统托盘：合成图标、动态右键菜单、左键单击显示窗口
-// 菜单项：打开窗口 / 关闭窗口 / [打开管理界面 / 重启管理界面（仅网页版管理开启时显示）] /
-//         重启镜像源服务 / 退出程序
-use std::sync::Mutex;
+// 系统托盘：自绘 Win32 实现（Shell_NotifyIconW + 隐藏顶层窗口 + 动态右键菜单）。
+//
+// v0.0.4 起不再依赖 tauri tray-icon 的注册逻辑（其构造 NOTIFYICONDATAW 时未显式设置 cbSize，
+// 且受限 token 下 NIM_ADD 失败会被静默忽略，用户看不到任何托盘图标）：
+// - 专用线程 + 隐藏顶层窗口（不是 HWND_MESSAGE，才能接收 Explorer 的 TaskbarCreated 广播）
+// - Shell_NotifyIconW(NIM_ADD) 显式设置 cbSize / uFlags / hIcon / uCallbackMessage / szTip
+// - 注册失败记录 Windows 错误文本，1 秒重试、最多 15 秒；仍失败则 available=false（程序继续运行）
+// - 右键菜单每次弹出时按当前配置动态构建（网页版管理开启时才出现「打开管理界面/重启管理界面」）
+use std::ffi::c_void;
+use std::mem::size_of;
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
 use serde_json::json;
-use tauri::image::Image;
-use tauri::menu::{IsMenuItem, Menu, MenuItem, PredefinedMenuItem};
-use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager, Wry};
+use windows::core::{w, HSTRING};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Shell::{
+  Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+  AppendMenuW, CreateIconFromResourceEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+  DestroyIcon, DestroyMenu, DispatchMessageW, GetCursorPos, GetMessageW, PostMessageW,
+  PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, TrackPopupMenu,
+  TranslateMessage, HICON, HMENU, LR_DEFAULTCOLOR, MF_SEPARATOR, MF_STRING, MSG,
+  TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_DESTROY, WM_LBUTTONUP, WM_NULL,
+  WM_RBUTTONUP, WNDCLASSW, WNDCLASS_STYLES, WS_POPUP,
+};
+use windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE;
+
+use tauri::{AppHandle, Manager};
 
 use crate::state::{self, AppState};
 use crate::{logging, node_proc, window, winutil};
@@ -22,11 +44,25 @@ pub const MENU_RESTART_WEBADMIN: &str = "tray-restart-webadmin";
 pub const MENU_RESTART_REGISTRY: &str = "tray-restart-registry";
 pub const MENU_QUIT: &str = "tray-quit";
 
-// 由 tools/compose-desktop-icon.ps1 生成，纯 RGBA 字节（32x32）
-static TRAY_ICON: &[u8] = include_bytes!("../icons/tray-32.rgba");
+/// 托盘回调消息：WM_APP + 1（隐藏窗口收到鼠标事件）
+const WM_TRAY_CALLBACK: u32 = WM_APP + 1;
+/// 托盘图标 id
+const TRAY_UID: u32 = 1;
+/// 注册失败重试：每秒一次、最多 15 秒
+const REGISTER_RETRY_SECS: u32 = 15;
 
-// 最近一次构建的菜单项文本（启动失败报告用，无需 AppHandle）
+static TRAY_APP: OnceLock<AppHandle> = OnceLock::new();
+static TRAY_HWND: AtomicIsize = AtomicIsize::new(0);
+static TRAY_ICON_HANDLE: AtomicIsize = AtomicIsize::new(0);
+static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
+static REGISTER_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+/// 最近一次构建的菜单项文本（启动失败报告/冒烟证据用，无需 AppHandle）。
 static LAST_LABELS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// 内嵌程序图标（v0.0.4 起与网页版图标 public/favicon.ico 完全一致，由
+/// tools/compose-desktop-icon.ps1 逐字节复制生成），用于从其中解析 HICON。
+static ICON_ICO: &[u8] = include_bytes!("../icons/icon.ico");
 
 /// 读取最近一次托盘菜单文本（报告/诊断用）。
 pub fn labels_snapshot() -> Vec<String> {
@@ -36,66 +72,420 @@ pub fn labels_snapshot() -> Vec<String> {
     .unwrap_or_default()
 }
 
-pub fn init(app: &AppHandle) -> Result<(), String> {
+/// 网页版管理是否开启（与 config_watch 实时刷新一致：config.admin.enabled 或 Node 桥报告已开启）。
+fn menu_enabled(app: &AppHandle) -> bool {
   let state = app.state::<AppState>();
-  // 与 config_watch 的实时刷新保持一致：config.admin.enabled 或 Node 桥报告已开启都算开启
-  let menu_enabled = state.config_snapshot().admin_enabled || state.web_admin_snapshot().enabled;
-  let menu = build_menu(app, menu_enabled)?;
-  let tooltip = format!("{}（单击打开窗口）", state.product_name);
-  TrayIconBuilder::with_id(TRAY_ID)
-    .icon(Image::new(TRAY_ICON, 32, 32))
-    .tooltip(tooltip)
-    .menu(&menu)
-    .show_menu_on_left_click(false)
-    .on_menu_event(|app, event| handle_menu_event(app, event.id().as_ref()))
-    .on_tray_icon_event(|tray, event| handle_tray_event(tray, &event))
-    .build(app)
-    .map_err(|err| format!("创建托盘图标失败：{err}"))?;
-  logging::info(format!(
-    "托盘图标已创建：{}",
-    state::lock(&state.tray_labels).join(" / ")
-  ));
-  Ok(())
+  state.config_snapshot().admin_enabled || state.web_admin_snapshot().enabled
 }
 
-fn build_menu(app: &AppHandle, web_admin_enabled: bool) -> Result<Menu<Wry>, String> {
-  let create = |id: &str, text: &str| -> Result<MenuItem<Wry>, String> {
-    MenuItem::with_id(app, id, text, true, None::<&str>)
-      .map_err(|err| format!("创建托盘菜单项 {id} 失败：{err}"))
-  };
-  let open = create(MENU_OPEN, "打开窗口")?;
-  let hide = create(MENU_HIDE, "关闭窗口")?;
-  let separator_top = PredefinedMenuItem::separator(app)
-    .map_err(|err| format!("创建托盘菜单分隔线失败：{err}"))?;
-  let open_web_admin = if web_admin_enabled {
-    Some(create(MENU_OPEN_WEBADMIN, "打开管理界面")?)
-  } else {
-    None
-  };
-  let restart_web_admin = if web_admin_enabled {
-    Some(create(MENU_RESTART_WEBADMIN, "重启管理界面")?)
-  } else {
-    None
-  };
-  let restart_registry = create(MENU_RESTART_REGISTRY, "重启镜像源服务")?;
-  let separator_bottom = PredefinedMenuItem::separator(app)
-    .map_err(|err| format!("创建托盘菜单分隔线失败：{err}"))?;
-  let quit = create(MENU_QUIT, "退出程序")?;
-
-  let mut items: Vec<&dyn IsMenuItem<Wry>> = vec![&open, &hide, &separator_top];
-  if let Some(item) = &open_web_admin {
-    items.push(item);
+/// 初始化托盘：启动专用线程创建隐藏窗口并注册图标。
+/// 隐藏窗口创建失败返回 Err（启动失败路径）；图标注册失败不阻塞启动（异步重试 + available=false）。
+pub fn init(app: &AppHandle) -> Result<(), String> {
+  update_labels(app, menu_enabled(app));
+  let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
+  let app_clone = app.clone();
+  thread::spawn(move || tray_thread(app_clone, ready_tx));
+  match ready_rx.recv_timeout(Duration::from_secs(5)) {
+    Ok(Ok(())) => Ok(()),
+    Ok(Err(err)) => Err(err),
+    Err(_) => Err("托盘线程启动超时（5 秒内未创建隐藏窗口）".to_string()),
   }
-  if let Some(item) = &restart_web_admin {
-    items.push(item);
-  }
-  items.push(&restart_registry);
-  items.push(&separator_bottom);
-  items.push(&quit);
-  let menu = Menu::with_items(app, &items)
-    .map_err(|err| format!("创建托盘菜单失败：{err}"))?;
+}
 
-  // 记录实际菜单项文本，供冒烟测试/日志核对
+fn tray_thread(app: AppHandle, ready_tx: Sender<Result<(), String>>) {
+  // 全局保存 AppHandle，消息回调里需要窗口/退出等操作
+  let _ = TRAY_APP.set(app.clone());
+
+  // Explorer 的 TaskbarCreated 广播消息号（必须在创建窗口前注册）
+  let taskbar_msg = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
+  TASKBAR_CREATED_MSG.store(taskbar_msg, Ordering::SeqCst);
+
+  let hwnd = match create_hidden_window() {
+    Ok(hwnd) => hwnd,
+    Err(err) => {
+      let _ = ready_tx.send(Err(err));
+      return;
+    }
+  };
+  TRAY_HWND.store(hwnd.0 as isize, Ordering::SeqCst);
+  let _ = ready_tx.send(Ok(()));
+
+  // 首次注册：成功则直接可用；失败则记录原因并启动 1 秒间隔的后台重试
+  match try_add_icon(&app) {
+    Ok(()) => {}
+    Err(err) => {
+      logging::warn(format!(
+        "托盘图标首次注册失败：{err}；1 秒后开始重试（最多 {REGISTER_RETRY_SECS} 秒）"
+      ));
+      register_with_retries(app.clone());
+    }
+  }
+
+  // 消息循环：处理托盘鼠标事件、TaskbarCreated 广播
+  let mut msg = MSG::default();
+  loop {
+    let ret = unsafe { GetMessageW(&mut msg, None, 0, 0) };
+    if ret.0 <= 0 {
+      break;
+    }
+    unsafe {
+      let _ = TranslateMessage(&msg);
+      DispatchMessageW(&msg);
+    }
+  }
+}
+
+fn create_hidden_window() -> Result<HWND, String> {
+  unsafe {
+    let module = GetModuleHandleW(None)
+      .map_err(|err| format!("获取模块句柄失败（GetModuleHandleW）：{}", err.message()))?;
+    let instance = HINSTANCE(module.0);
+    let class_name = w!("LiYueNpmMirrorTrayWindow");
+
+    let wc = WNDCLASSW {
+      style: WNDCLASS_STYLES(0),
+      lpfnWndProc: Some(wnd_proc),
+      hInstance: instance,
+      lpszClassName: class_name,
+      ..Default::default()
+    };
+    let atom = RegisterClassW(&wc);
+    if atom == 0 {
+      let err = std::io::Error::last_os_error();
+      // 1410 = ERROR_CLASS_ALREADY_EXISTS：同进程重复初始化时可直接复用
+      if err.raw_os_error() != Some(1410) {
+        return Err(format!("注册托盘窗口类失败（RegisterClassW）：{err}"));
+      }
+    }
+
+    let hwnd = CreateWindowExW(
+      WINDOW_EX_STYLE::default(),
+      class_name,
+      w!("LiYueNpmMirrorTrayWindow"),
+      WS_POPUP,
+      0,
+      0,
+      0,
+      0,
+      None,
+      None,
+      Some(instance),
+      None,
+    )
+    .map_err(|err| format!("创建托盘隐藏窗口失败（CreateWindowExW）：{}", err.message()))?;
+    Ok(hwnd)
+  }
+}
+
+unsafe extern "system" fn wnd_proc(
+  hwnd: HWND,
+  msg: u32,
+  wparam: WPARAM,
+  lparam: LPARAM,
+) -> LRESULT {
+  let taskbar_created = TASKBAR_CREATED_MSG.load(Ordering::SeqCst);
+  if taskbar_created != 0 && msg == taskbar_created {
+    logging::info("收到 TaskbarCreated 广播：重新注册托盘图标");
+    if let Some(app) = TRAY_APP.get() {
+      register_with_retries(app.clone());
+    }
+    return LRESULT(0);
+  }
+  if msg == WM_TRAY_CALLBACK {
+    let mouse_message = (lparam.0 & 0xFFFF) as u32;
+    if let Some(app) = TRAY_APP.get() {
+      match mouse_message {
+        WM_LBUTTONUP => {
+          logging::info("托盘左键单击：显示主窗口");
+          run_on_main(app, |app| window::show(app));
+        }
+        WM_RBUTTONUP => {
+          show_context_menu(app, hwnd);
+        }
+        _ => {}
+      }
+    }
+    return LRESULT(0);
+  }
+  if msg == WM_DESTROY {
+    PostQuitMessage(0);
+    return LRESULT(0);
+  }
+  DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+fn run_on_main(app: &AppHandle, action: impl FnOnce(&AppHandle) + Send + 'static) {
+  let app_clone = app.clone();
+  if let Err(err) = app.run_on_main_thread(move || action(&app_clone)) {
+    logging::warn(format!("切换到主线程执行窗口操作失败：{err}"));
+  }
+}
+
+// ---------------------------------------------------------------- 托盘注册
+
+/// 解析内嵌 icon.ico，按 32 → 48 → 256 顺序查找帧并创建 HICON。
+fn load_tray_icon() -> Result<HICON, String> {
+  if ICON_ICO.len() < 6 {
+    return Err("内嵌 icon.ico 数据过小".to_string());
+  }
+  let reserved = u16::from_le_bytes([ICON_ICO[0], ICON_ICO[1]]);
+  let icon_type = u16::from_le_bytes([ICON_ICO[2], ICON_ICO[3]]);
+  let count = u16::from_le_bytes([ICON_ICO[4], ICON_ICO[5]]) as usize;
+  if reserved != 0 || icon_type != 1 || count == 0 {
+    return Err(format!(
+      "内嵌 icon.ico 不是有效 ICO（reserved={reserved} type={icon_type} count={count}）"
+    ));
+  }
+
+  struct Frame {
+    width: usize,
+    height: usize,
+    offset: usize,
+    size: usize,
+  }
+  let mut frames = Vec::with_capacity(count);
+  for index in 0..count {
+    let base = 6 + index * 16;
+    if base + 16 > ICON_ICO.len() {
+      return Err(format!("内嵌 icon.ico 目录越界（帧 {index}）"));
+    }
+    // ICO 目录里 0 表示 256
+    let width = if ICON_ICO[base] == 0 { 256 } else { ICON_ICO[base] as usize };
+    let height = if ICON_ICO[base + 1] == 0 { 256 } else { ICON_ICO[base + 1] as usize };
+    let size = u32::from_le_bytes([
+      ICON_ICO[base + 8],
+      ICON_ICO[base + 9],
+      ICON_ICO[base + 10],
+      ICON_ICO[base + 11],
+    ]) as usize;
+    let offset = u32::from_le_bytes([
+      ICON_ICO[base + 12],
+      ICON_ICO[base + 13],
+      ICON_ICO[base + 14],
+      ICON_ICO[base + 15],
+    ]) as usize;
+    if offset + size > ICON_ICO.len() {
+      return Err(format!("内嵌 icon.ico 帧越界（{width}x{height}）"));
+    }
+    frames.push(Frame {
+      width,
+      height,
+      offset,
+      size,
+    });
+  }
+
+  let mut errors: Vec<String> = Vec::new();
+  for wanted in [32usize, 48, 256] {
+    let frame = frames.iter().find(|frame| frame.width == wanted);
+    let Some(frame) = frame else {
+      continue;
+    };
+    let bytes = &ICON_ICO[frame.offset..frame.offset + frame.size];
+    match unsafe {
+      CreateIconFromResourceEx(bytes, true, 0x0003_0000, 0, 0, LR_DEFAULTCOLOR)
+    } {
+      Ok(icon) => {
+        logging::info(format!(
+          "托盘图标 HICON 已创建：使用内嵌 icon.ico 中 {}x{} 帧（{size} 字节）",
+          frame.width,
+          frame.height,
+          size = frame.size
+        ));
+        return Ok(icon);
+      }
+      Err(err) => errors.push(format!(
+        "{}x{} 帧失败：{}",
+        frame.width,
+        frame.height,
+        err.message()
+      )),
+    }
+  }
+  Err(format!(
+    "从内嵌 icon.ico 创建托盘图标失败（{}）",
+    if errors.is_empty() {
+      "找不到 32/48/256 帧".to_string()
+    } else {
+      errors.join("；")
+    }
+  ))
+}
+
+/// 尝试注册托盘图标；失败返回中文原因（含 Windows 错误码/文本）。
+fn try_add_icon(app: &AppHandle) -> Result<(), String> {
+  let hwnd_value = TRAY_HWND.load(Ordering::SeqCst);
+  let state = app.state::<AppState>();
+  state.mark_tray_attempted();
+  if hwnd_value == 0 {
+    let reason = "托盘隐藏窗口尚未创建".to_string();
+    state.set_tray_available(false, reason.clone());
+    return Err(reason);
+  }
+  let hwnd = HWND(hwnd_value as *mut c_void);
+  let icon = match load_tray_icon() {
+    Ok(icon) => icon,
+    Err(err) => {
+      state.set_tray_available(false, err.clone());
+      return Err(err);
+    }
+  };
+  TRAY_ICON_HANDLE.store(icon.0 as isize, Ordering::SeqCst);
+
+  let tooltip = format!("{}（单击打开窗口）", state.product_name);
+  let mut data: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
+  data.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
+  data.hWnd = hwnd;
+  data.uID = TRAY_UID;
+  data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+  data.uCallbackMessage = WM_TRAY_CALLBACK;
+  data.hIcon = icon;
+  let wide: Vec<u16> = tooltip.encode_utf16().take(127).collect();
+  data.szTip[..wide.len()].copy_from_slice(&wide);
+
+  let ok = unsafe { Shell_NotifyIconW(NIM_ADD, &data) };
+  if ok.as_bool() {
+    state.set_tray_available(true, String::new());
+    logging::info(format!("托盘图标注册成功：{tooltip}"));
+    Ok(())
+  } else {
+    let err = std::io::Error::last_os_error();
+    let reason = format!(
+      "Shell_NotifyIconW(NIM_ADD) 返回失败：{err}（GetLastError={:?}）",
+      err.raw_os_error()
+    );
+    state.set_tray_available(false, reason.clone());
+    Err(reason)
+  }
+}
+
+/// 启动后台重试线程：每 1 秒重试一次，最多 15 次；仍失败则记录「托盘注册失败：…」。
+fn register_with_retries(app: AppHandle) {
+  if REGISTER_IN_PROGRESS.swap(true, Ordering::SeqCst) {
+    return;
+  }
+  thread::spawn(move || {
+    let mut last_error = app
+      .state::<AppState>()
+      .tray_error_snapshot();
+    for attempt in 1..=REGISTER_RETRY_SECS {
+      thread::sleep(Duration::from_secs(1));
+      match try_add_icon(&app) {
+        Ok(()) => {
+          logging::info(format!(
+            "托盘图标注册成功（第 {attempt} 次重试，共重试 {REGISTER_RETRY_SECS} 秒窗口内）"
+          ));
+          REGISTER_IN_PROGRESS.store(false, Ordering::SeqCst);
+          return;
+        }
+        Err(err) => last_error = err,
+      }
+    }
+    let state = app.state::<AppState>();
+    state.set_tray_available(false, last_error.clone());
+    logging::error(format!(
+      "托盘注册失败：{last_error}（重试 {REGISTER_RETRY_SECS} 次仍失败，程序继续运行；托盘菜单可通过主窗口/网页版管理界面操作）"
+    ));
+    REGISTER_IN_PROGRESS.store(false, Ordering::SeqCst);
+  });
+}
+
+/// 退出前清理托盘图标与 HICON（主线程 RunEvent::Exit 调用，任意线程可执行）。
+pub fn shutdown() {
+  let hwnd_value = TRAY_HWND.load(Ordering::SeqCst);
+  if hwnd_value != 0 {
+    let mut data: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
+    data.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
+    data.hWnd = HWND(hwnd_value as *mut c_void);
+    data.uID = TRAY_UID;
+    unsafe {
+      let _ = Shell_NotifyIconW(NIM_DELETE, &data);
+    }
+  }
+  let icon_value = TRAY_ICON_HANDLE.swap(0, Ordering::SeqCst);
+  if icon_value != 0 {
+    unsafe {
+      let _ = DestroyIcon(HICON(icon_value as *mut c_void));
+    }
+  }
+  logging::info("托盘图标已清理（NIM_DELETE）");
+}
+
+// ---------------------------------------------------------------- 右键菜单
+
+fn show_context_menu(app: &AppHandle, hwnd: HWND) {
+  let enabled = menu_enabled(app);
+  let menu = match unsafe { CreatePopupMenu() } {
+    Ok(menu) => menu,
+    Err(err) => {
+      logging::warn(format!("创建托盘右键菜单失败：{}", err.message()));
+      return;
+    }
+  };
+  unsafe {
+    append_item(menu, 1, "打开窗口");
+    append_item(menu, 2, "关闭窗口");
+    append_separator(menu);
+    if enabled {
+      append_item(menu, 3, "打开管理界面");
+      append_item(menu, 4, "重启管理界面");
+    }
+    append_item(menu, 5, "重启镜像源服务");
+    append_separator(menu);
+    append_item(menu, 6, "退出程序");
+  }
+
+  let mut point = POINT::default();
+  if unsafe { GetCursorPos(&mut point) }.is_err() {
+    logging::warn("获取鼠标位置失败，托盘右键菜单在默认位置弹出");
+  }
+  unsafe {
+    let _ = SetForegroundWindow(hwnd);
+    let result = TrackPopupMenu(
+      menu,
+      TPM_RETURNCMD | TPM_LEFTALIGN | TPM_RIGHTBUTTON,
+      point.x,
+      point.y,
+      None,
+      hwnd,
+      None,
+    );
+    // 让菜单正常关闭（TrackPopupMenu 的经典要求）
+    let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+    let _ = DestroyMenu(menu);
+    let command = result.0 as u32;
+    if command > 0 {
+      let id = match command {
+        1 => MENU_OPEN,
+        2 => MENU_HIDE,
+        3 => MENU_OPEN_WEBADMIN,
+        4 => MENU_RESTART_WEBADMIN,
+        5 => MENU_RESTART_REGISTRY,
+        6 => MENU_QUIT,
+        _ => {
+          logging::warn(format!("未知的托盘菜单命令 id：{command}"));
+          return;
+        }
+      };
+      handle_menu_action(app, id);
+    }
+  }
+}
+
+unsafe fn append_item(menu: HMENU, command: usize, text: &str) {
+  let text = HSTRING::from(text);
+  let _ = AppendMenuW(menu, MF_STRING, command, &text);
+}
+
+unsafe fn append_separator(menu: HMENU) {
+  let empty = HSTRING::default();
+  let _ = AppendMenuW(menu, MF_SEPARATOR, 0, &empty);
+}
+
+// ---------------------------------------------------------------- 菜单动作
+
+/// 更新托盘菜单文本（4 项/6 项），供 config_watch 实时刷新与日志/报告核对。
+fn update_labels(app: &AppHandle, web_admin_enabled: bool) {
   let mut labels = vec!["打开窗口".to_string(), "关闭窗口".to_string()];
   if web_admin_enabled {
     labels.push("打开管理界面".to_string());
@@ -108,59 +498,38 @@ fn build_menu(app: &AppHandle, web_admin_enabled: bool) -> Result<Menu<Wry>, Str
   if let Ok(mut guard) = LAST_LABELS.lock() {
     *guard = labels;
   }
-  Ok(menu)
 }
 
-/// 网页版管理开/关变化时重建托盘菜单（目标 <1 秒内出现/消失）。
+/// 网页版管理开/关变化时刷新托盘菜单状态（目标 <1 秒内出现/消失）。
+/// 自绘菜单在每次右键时读取当前状态，这里只需更新文本缓存与日志。
 pub fn rebuild(app: &AppHandle, web_admin_enabled: bool) -> Result<(), String> {
-  let menu = build_menu(app, web_admin_enabled)?;
-  match app.tray_by_id(TRAY_ID) {
-    Some(tray) => {
-      tray
-        .set_menu(Some(menu))
-        .map_err(|err| format!("更新托盘菜单失败：{err}"))?;
-      logging::info(format!(
-        "托盘菜单已刷新：{}「打开管理界面」「重启管理界面」",
-        if web_admin_enabled {
-          "已显示"
-        } else {
-          "已隐藏"
-        }
-      ));
-      Ok(())
+  update_labels(app, web_admin_enabled);
+  logging::info(format!(
+    "托盘菜单已刷新：{}「打开管理界面」「重启管理界面」",
+    if web_admin_enabled {
+      "已显示"
+    } else {
+      "已隐藏"
     }
-    None => Err("更新托盘菜单失败：托盘图标不存在".to_string()),
-  }
+  ));
+  Ok(())
 }
 
-fn handle_tray_event(tray: &TrayIcon<Wry>, event: &TrayIconEvent) {
-  if let TrayIconEvent::Click {
-    button: MouseButton::Left,
-    button_state: MouseButtonState::Up,
-    ..
-  } = event
-  {
-    let app = tray.app_handle();
-    logging::info("托盘左键单击：显示主窗口");
-    window::show(app);
-  }
-}
-
-/// 供冒烟测试模拟点击托盘菜单项。
+/// 供冒烟测试模拟点击托盘菜单项（语义与真实点击一致）。
 pub fn activate_menu(app: &AppHandle, id: &str) {
-  handle_menu_event(app, id);
+  handle_menu_action(app, id);
 }
 
-fn handle_menu_event(app: &AppHandle, id: &str) {
+fn handle_menu_action(app: &AppHandle, id: &str) {
   logging::info(format!("托盘菜单点击：{id}"));
   match id {
     MENU_OPEN => {
       node_proc::log_to_gui(app, "info", "托盘操作：打开窗口");
-      window::show(app);
+      run_on_main(app, |app| window::show(app));
     }
     MENU_HIDE => {
       node_proc::log_to_gui(app, "info", "托盘操作：关闭窗口");
-      window::hide(app);
+      run_on_main(app, |app| window::hide(app));
     }
     MENU_RESTART_REGISTRY => {
       node_proc::log_to_gui(app, "info", "托盘操作：重启镜像源服务");

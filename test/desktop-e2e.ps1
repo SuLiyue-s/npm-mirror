@@ -8,14 +8,20 @@
   可以自动化的部分：
 
     · 产物：exe 存在、大小、版本信息、SHA256SUMS.txt 校验、dist 已被 .gitignore 忽略
+    · 图标（v0.0.4）：exe/窗口/托盘统一使用网页版图标——src-tauri\icons\icon.ico 与
+      public\favicon.ico SHA256 相同；window-256.rgba=262144 B、tray-32.rgba=4096 B
     · 阶段 1（默认配置，admin.enabled=false）
         - exe 可启动，镜像源服务 /-/ping 返回 200
         - admin.port 不监听（默认关闭网页版管理）
         - 桌面窗口存在（窗口标题/窗口 URL=内部回环管理端口，能加载现有管理界面）
         - 托盘图标与菜单项：关闭网页版管理时 4 项（打开窗口 / 关闭窗口 /
           重启镜像源服务 / 退出程序），没有「打开管理界面」「重启管理界面」
-        - 关闭窗口后进程存活、服务仍在线（关闭=隐藏）；托盘菜单「打开窗口 / 关闭窗口」
-        - 单实例：第二个实例自动退出，原服务不受影响
+        - 托盘可用性（v0.0.4）：报告含 tray.available（布尔）；注册失败时 tray.error
+          含「拒绝访问 / os error 5」；restricted = home_fallback || !tray_available
+        - 关闭窗口行为（v0.0.4，阶段 1c-3，用 window:close 模拟 CloseRequested）：
+          托盘可用 → 窗口隐藏、进程与服务继续；托盘不可用 → 程序直接退出
+          （退出码 0、双端口释放、无 Node 残留；沙箱预期走此分支）
+        - 托盘菜单「打开窗口 / 关闭窗口」动作；单实例：第二个实例自动退出，原服务不受影响
         - 数据目录内写出 config.json / logs
     · 阶段 1e：config.json 里写入非法 storage.dir 时服务仍能启动并回退默认 storage
     · 阶段 1g：程序配置目录回退——%LOCALAPPDATA% 不可写、未设 MIRROR_DESKTOP_HOME 时
@@ -1030,6 +1036,26 @@ Assert-NoForeignDesktop
 Initialize-ProcessApi
 $script:Token = ''
 
+# v0.0.4：程序图标统一为网页版图标 public\favicon.ico（exe / 窗口 / 托盘同一套图），
+# 构建脚本只从该图标生成窗口 / 托盘所需的 RGBA 素材。
+$faviconPath = Join-Path $script:Root 'public\favicon.ico'
+$iconIcoPath = Join-Path $script:Root 'src-tauri\icons\icon.ico'
+if ((Test-Path $faviconPath) -and (Test-Path $iconIcoPath)) {
+  $hashFav = (Get-FileHash $faviconPath -Algorithm SHA256).Hash.ToLower()
+  $hashIco = (Get-FileHash $iconIcoPath -Algorithm SHA256).Hash.ToLower()
+  Assert-True 'exe/窗口图标与网页版图标一致（src-tauri\icons\icon.ico = public\favicon.ico）' ($hashFav -eq $hashIco) ('favicon=' + $hashFav + '，icon=' + $hashIco)
+} else {
+  Assert-Skip '程序图标与网页版图标一致性' '未找到 public\favicon.ico 或 src-tauri\icons\icon.ico'
+}
+$winRgbaPath = Join-Path $script:Root 'src-tauri\icons\window-256.rgba'
+$trayRgbaPath = Join-Path $script:Root 'src-tauri\icons\tray-32.rgba'
+if ((Test-Path $winRgbaPath) -and (Test-Path $trayRgbaPath)) {
+  Assert-True '窗口图标素材 window-256.rgba 为 256×256 RGBA（262144 B）' ((Get-Item $winRgbaPath).Length -eq 262144) ('实际 ' + (Get-Item $winRgbaPath).Length + ' B')
+  Assert-True '托盘图标素材 tray-32.rgba 为 32×32 RGBA（4096 B）' ((Get-Item $trayRgbaPath).Length -eq 4096) ('实际 ' + (Get-Item $trayRgbaPath).Length + ' B')
+} else {
+  Assert-Skip '窗口/托盘图标素材尺寸' '未找到 src-tauri\icons 下的 RGBA 素材'
+}
+
 # ---------------------------------------------------------------------------
 # 阶段 1：默认配置（admin.enabled=false）
 # ---------------------------------------------------------------------------
@@ -1076,6 +1102,24 @@ if ($rep1Ready) {
   Assert-True '默认托盘菜单包含 4 项「打开窗口 / 关闭窗口 / 重启镜像源服务 / 退出程序」' (($missing1.Count -eq 0) -and ($trayLabels1.Count -eq 4)) ('实际菜单（' + $trayLabels1.Count + ' 项）：' + ($trayLabels1 -join ' / ') + '；缺少：' + ($missing1 -join '、'))
   Assert-True '默认关闭网页版管理时托盘菜单不含「打开管理界面」' (-not ($trayLabels1 -contains '打开管理界面')) ('实际菜单：' + ($trayLabels1 -join ' / '))
   Assert-True '默认关闭网页版管理时托盘菜单不含「重启管理界面」' (-not ($trayLabels1 -contains '重启管理界面')) ('实际菜单：' + ($trayLabels1 -join ' / '))
+
+  # v0.0.4：托盘改为程序自绘 Win32 注册，注册结果可检测（tray.available / tray.error）；
+  # 受限会话（沙箱拒绝托盘注册）下 available=false，restricted = home_fallback || !tray_available。
+  $trayAvailProp1 = $null
+  if ($null -ne $tray1) { $trayAvailProp1 = $tray1.PSObject.Properties['available'] }
+  $trayAvail1 = $null
+  if ($null -ne $trayAvailProp1) { $trayAvail1 = $trayAvailProp1.Value }
+  Assert-True '报告包含托盘可用性字段 tray.available（布尔）' (($null -ne $trayAvailProp1) -and ($trayAvail1 -is [bool])) ('实际：' + $trayAvail1)
+  $trayErr1 = [string](Get-Prop $tray1 'error')
+  if ($trayAvail1 -eq $false) {
+    Assert-True '托盘注册失败时报告给出原因（tray.error 含「拒绝访问 / os error 5」）' ($trayErr1 -match '拒绝|os error|error 5') ('实际：' + $trayErr1)
+  } elseif ($trayAvail1 -eq $true) {
+    Assert-True '托盘注册成功时 tray.error 为空' ($trayErr1.Length -eq 0) ('实际：' + $trayErr1)
+  }
+  $homeFallback1 = [bool](Get-Prop (Get-Prop $rep1 'home') 'fallback')
+  $restr1 = Get-Prop $rep1 'restricted'
+  $expectRestr1 = ($homeFallback1 -or ($trayAvail1 -ne $true))
+  Assert-True '受限标记 restricted 与「home 回退 / 托盘不可用」一致（本会话预期 true）' ($restr1 -eq $expectRestr1) ('tray.available=' + $trayAvail1 + '，home.fallback=' + $homeFallback1 + '，restricted=' + $restr1)
 
   # 阶段 1f：直接编辑 config.json 的 admin.enabled（模拟用户/其它工具改配置），
   # 验证 Rust 壳的 1 秒配置轮询能把「打开管理界面 / 重启管理界面」菜单项加/减
@@ -1188,17 +1232,14 @@ $script:SmokeReportPath = $primaryReport
 $script:SmokeCmdPath = $primaryCmd
 $script:LastSmokeReport = $null
 
-# 关闭窗口 = 隐藏，进程与服务继续
-Section '阶段 1c：关闭窗口 = 隐藏'
+# 关闭窗口的真实行为在阶段 1c-3 用内置测试挂钩 window:close 验证：
+# v0.0.4 起托盘可用 → 隐藏窗口、进程与服务继续；托盘不可用 → 程序直接退出。
+Section '阶段 1c：窗口状态检查（关闭窗口行为见阶段 1c-3）'
 if ($hasWindow) {
-  Info '向主窗口发送 WM_CLOSE（等价于点窗口右上角关闭按钮）…'
-  [DesktopE2E.Win32]::CloseWindow($appWindows[0])
-  $hidden = Wait-Until { (Get-AppWindows -RootPid $p1.Id).Count -eq 0 } 12 400
-  Assert-True '关闭窗口后窗口已隐藏' $hidden
-  Assert-True '关闭窗口后桌面进程仍存活（未退出）' (-not $p1.HasExited)
-  Assert-True '关闭窗口后镜像源服务仍在线（/-/ping 200）' (Test-Ping $RegistryPort)
+  $winTitle1c = [DesktopE2E.Win32]::GetTitle($appWindows[0])
+  Assert-True '桌面窗口可见（当前会话有可交互桌面）' $true ('标题：' + $winTitle1c)
 } else {
-  Assert-Skip '关闭窗口=隐藏（进程与服务继续）' '没有找到可关闭的窗口，需人工确认'
+  Assert-Skip '桌面窗口可见性' '未检测到可见窗口（受限会话/无交互桌面），窗口类断言按环境限制处理（exit 3）'
 }
 
 # 托盘菜单动作：通过产品内置测试挂钩（MIRROR_DESKTOP_SMOKE=1）触发与真实右键菜单
@@ -1226,6 +1267,50 @@ $repHidden = Wait-SmokeReport { param($r) (Get-Prop (Get-Prop $r 'window') 'visi
 Assert-True '菜单「关闭窗口」后窗口隐藏（进程与服务继续）' ($hiddenByMenu -or ($null -ne $repHidden)) '' 'window'
 Assert-True '托盘菜单隐藏窗口后镜像源服务仍在线（/-/ping 200）' (Test-Ping $RegistryPort)
 Assert-True '托盘菜单隐藏窗口后桌面进程仍存活' (-not $p1.HasExited)
+
+# ---------------------------------------------------------------------------
+# 阶段 1c-3：关闭窗口行为（v0.0.4：托盘可用 → 隐藏；托盘不可用 → 退出程序）
+# 用内置测试挂钩 window:close 模拟 CloseRequested（等价于点击窗口右上角 ×）。
+# 受限会话里托盘注册被系统拒绝（tray.available=false），预期走「直接退出程序」分支：
+# 进程退出码 0、镜像源/管理端口释放、无 Node 残留，避免无窗口无托盘的静默后台进程。
+# ---------------------------------------------------------------------------
+Section '阶段 1c-3：关闭窗口行为（托盘可用→隐藏 / 托盘不可用→退出程序，v0.0.4）'
+$trayAvailForClose = $null
+if ($null -ne $rep1) {
+  $trayPropForClose = (Get-Prop $rep1 'tray').PSObject.Properties['available']
+  if ($null -ne $trayPropForClose) { $trayAvailForClose = $trayPropForClose.Value }
+}
+Info ('当前托盘可用性 tray.available=' + $trayAvailForClose + '（受限会话预期 false）')
+if ($null -eq $trayAvailForClose) {
+  Assert-Skip '关闭窗口行为（托盘可用性未知）' '测试报告未包含 tray.available 字段，无法判定按哪个分支验收'
+} else {
+  # window:close 会立即触发隐藏/退出，报告可能来不及回执该命令，因此以行为断言为准。
+  [void](Send-SmokeCommand 'window:close' 15)
+  if ($trayAvailForClose -eq $true) {
+    $hidden1c = Wait-Until { (Get-AppWindows -RootPid $p1.Id).Count -eq 0 } 15 400
+    $repHidden1c = Wait-SmokeReport { param($r) (Get-Prop (Get-Prop $r 'window') 'visible') -eq $false } 10 300
+    Assert-True '托盘可用时：关闭窗口后窗口隐藏（进程与服务继续）' ($hidden1c -or ($null -ne $repHidden1c)) '' 'window'
+    Assert-True '托盘可用时：关闭窗口后桌面进程仍存活' (-not $p1.HasExited)
+    Assert-True '托盘可用时：关闭窗口后镜像源服务仍在线（/-/ping 200）' (Test-Ping $RegistryPort)
+    # 窗口已隐藏：重新打开，供后续阶段菜单动作使用
+    Send-SmokeCommand 'menu:tray-open' 20 | Out-Null
+    Wait-Until { (Get-AppWindows -RootPid $p1.Id).Count -gt 0 } 15 400 | Out-Null
+  } else {
+    $exited1c = Wait-Until { $p1.HasExited } 25 400
+    Assert-True '托盘不可用时：关闭窗口 = 直接退出程序（不再静默留在后台）' $exited1c
+    if ($exited1c) {
+      $code1c = $null
+      try { $p1.Refresh(); $code1c = $p1.ExitCode } catch { }
+      Assert-True '托盘不可用时：关闭窗口后进程退出码为 0（正常退出，非崩溃）' ($code1c -eq 0) ('实际 ExitCode=' + $code1c)
+      $portsClosed1c = Wait-Until { (-not (Test-Port $RegistryPort)) -and (-not (Test-Port $AdminPort)) } 15 300
+      Assert-True '托盘不可用时：退出后镜像源/管理端口均不再监听' $portsClosed1c
+      Start-Sleep -Milliseconds 500
+      $nodeLeft1c = @(Get-OurNodeProcs)
+      Assert-True '托盘不可用时：退出后无本测试的 node 残留进程' ($nodeLeft1c.Count -eq 0) ('残留：' + (($nodeLeft1c | ForEach-Object { $_.ProcessId }) -join ','))
+    }
+    Assert-Skip '关闭窗口 = 隐藏（进程与服务继续）' '本会话托盘注册被系统拒绝（tray.available=false），「托盘可用时关闭窗口=隐藏」分支需在普通桌面会话人工验收'
+  }
+}
 
 # 阶段 1 清理（强停是本测试的清理手段，不是产品行为验收）
 Section '阶段 1d：清理测试实例'
@@ -1317,6 +1402,9 @@ if ($null -ne $rep1g) {
   $fallbackNode = Get-Prop $rep1g 'node'
   $fallbackNodePid = [int](Get-Prop $fallbackNode 'pid')
   if ($fallbackNodePid -gt 0 -and -not ($script:TrackedNodePids -contains $fallbackNodePid)) { [void]$script:TrackedNodePids.Add($fallbackNodePid) }
+  # v0.0.4：受限标记 = home 回退 或 托盘不可用；本阶段 home.fallback=true，故 restricted 必须为 true。
+  $restr1g = Get-Prop $rep1g 'restricted'
+  Assert-True '回退场景下 restricted=true（受限环境标记）' ($restr1g -eq $true) ('home.fallback=' + (Get-Prop (Get-Prop $rep1g 'home') 'fallback') + '，restricted=' + $restr1g)
 } else {
   Assert-Skip '程序配置目录回退（smoke 报告 home.fallback）' '等待超时或报告未包含 home 字段（旧 exe 不支持该字段时无法判定），需人工确认'
 }
@@ -1456,6 +1544,23 @@ $nodePid = [int](Get-Prop $info 'pid')
 Assert-True 'desktop/info 返回 Node 子进程 PID' ($nodePid -gt 0) ('实际 ' + $nodePid)
 if ($nodePid -gt 0 -and -not ($script:TrackedNodePids -contains $nodePid)) {
   [void]$script:TrackedNodePids.Add($nodePid)
+}
+
+# v0.0.4：/desktop/info 的 tray.available 必须与测试报告一致（同一状态来源）
+$rep2Tray = Get-Prop (Wait-SmokeReport { param($r) return ($null -ne (Get-Prop (Get-Prop $r 'tray') 'available')) } 90 400) 'tray'
+$infoTray = Get-Prop $info 'tray'
+$infoTrayProp = $null
+if ($null -ne $infoTray) { $infoTrayProp = $infoTray.PSObject.Properties['available'] }
+if ($null -eq $infoTrayProp) {
+  Assert-True '/desktop/info 返回 tray 对象（含 available 字段）' $false ('info.tray=' + ($infoTray | ConvertTo-Json -Compress))
+} else {
+  $rep2TrayProp = $null
+  if ($null -ne $rep2Tray) { $rep2TrayProp = $rep2Tray.PSObject.Properties['available'] }
+  if ($null -eq $rep2TrayProp) {
+    Assert-Skip '/desktop/info.tray.available 与测试报告一致' '测试报告未在超时内包含 tray.available 字段'
+  } else {
+    Assert-True '/desktop/info.tray.available 与测试报告一致' ($infoTrayProp.Value -eq $rep2TrayProp.Value) ('info=' + $infoTrayProp.Value + '，report=' + $rep2TrayProp.Value)
+  }
 }
 
 # /desktop/files

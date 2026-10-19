@@ -871,6 +871,12 @@ pre.code{
 .banner .btn{margin-left:auto}
 .banner.ok{background:linear-gradient(90deg,rgba(46,230,196,.1),transparent 80%);border-color:rgba(46,230,196,.4);color:#a7f5e6}
 
+/* 桌面版受限环境警示条：完全复用 .banner 的配色/边框/圆角，只补充两行排版与窄屏换行，不新造配色 */
+.desktop-warn{align-items:flex-start}
+.desktop-warn .desktop-warn-body{flex:1;min-width:0}
+.desktop-warn .desktop-warn-msg{overflow-wrap:anywhere;line-height:1.6}
+.desktop-warn .desktop-warn-err{margin-top:3px;font-size:10.5px;color:var(--txt-dim);overflow-wrap:anywhere;white-space:pre-wrap}
+
 /* ---------- 19. Toast ---------- */
 .toasts{position:fixed;right:16px;bottom:16px;z-index:9000;display:flex;flex-direction:column;gap:8px;max-width:min(420px,86vw)}
 .toast{

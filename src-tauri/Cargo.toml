@@ -1,6 +1,6 @@
 [package]
 name = "npm-mirror-desktop"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2021"
 description = "离月私人 npm 镜像源 · 桌面版"
 authors = ["苏离月 (SuLiyue)"]
@@ -13,17 +13,19 @@ default-run = "npm-mirror-desktop"
 tauri-build = { version = "2.6.3", features = [] }
 
 [dependencies]
-tauri = { version = "2.11.3", features = ["tray-icon"] }
+tauri = { version = "2.11.3" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 winreg = "0.55"
 windows = { version = "0.61", features = [
   "Win32_Foundation",
+  "Win32_Graphics_Gdi",
   "Win32_UI_Shell",
   "Win32_UI_Shell_Common",
   "Win32_UI_WindowsAndMessaging",
   "Win32_Security",
   "Win32_System_Com",
+  "Win32_System_LibraryLoader",
   "Win32_System_Threading",
 ] }
 

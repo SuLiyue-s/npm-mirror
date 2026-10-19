@@ -4801,6 +4801,7 @@
       else setTip($('#chip-version'), '服务端版本');
       adaptDesktopUi();
       updateDesktopCfgGroup();
+      paintDesktopWarn();
       if (state.page === 'tools') paintTools();
       return state.desktop;
     }, function (e) {
@@ -4808,6 +4809,7 @@
       document.documentElement.dataset.desktop = '0';
       adaptDesktopUi();
       updateDesktopCfgGroup();
+      paintDesktopWarn();
       if (state.page === 'tools') paintTools();
       return state.desktop;
     }).catch(function () {});
@@ -4832,6 +4834,46 @@
       if (procB) procB.textContent = '重启程序';
       if (procI) procI.textContent = '重启整个 Node 进程，镜像源与管理界面短暂不可用';
     }
+  }
+
+  /* 托盘图标状态文本：外壳 v0.0.4+ 透传 tray 字段；旧外壳 / 非桌面模式字段缺失（available=null）→ 未知 */
+  function trayText(d) {
+    var t = (d && d.tray) || {};
+    if (t.available === true) return '可用';
+    if (t.available === false) return '不可用' + (t.error ? '（' + t.error + '）' : '');
+    return '未知';
+  }
+
+  /* 桌面版受限环境常驻警示条：托盘不可用 / 配置目录回退。
+   * 位于内容区顶部、所有页面共用，切页不会消失；两个问题同时出现时合并为一条，避免堆叠两条。 */
+  function paintDesktopWarn() {
+    var box = $('#desktop-warn');
+    if (!box) return;
+    var msgEl = $('#desktop-warn-msg');
+    var errEl = $('#desktop-warn-err');
+    var d = state.desktop;
+    var desk = !!(d && d.desktop);
+    var tray = (d && d.tray) || {};
+    var msgs = [];
+    if (desk && tray.available === false) {
+      msgs.push('系统托盘图标不可用：当前启动环境受限，系统拒绝注册托盘图标。关闭窗口将直接退出程序；如需托盘图标，请从资源管理器双击程序启动。');
+    }
+    if (desk && d.homeFallback === true) {
+      msgs.push('配置目录不可写，已改用备用目录：' + (d.homeDir || '未知') + '（详见日志）。');
+    }
+    if (!msgs.length) {
+      box.hidden = true;
+      if (msgEl) msgEl.textContent = '';
+      if (errEl) { errEl.hidden = true; errEl.textContent = ''; }
+      return;
+    }
+    if (msgEl) msgEl.textContent = msgs.join(' ');
+    var err = tray.available === false && tray.error ? '错误信息：' + tray.error : '';
+    if (errEl) {
+      errEl.textContent = err;
+      errEl.hidden = !err;
+    }
+    box.hidden = false;
   }
 
   /* ---------- 控制台页 ---------- */
@@ -5129,7 +5171,7 @@
     /* A. 桌面程序 */
     var app = clear($('#tools-app-info'));
     if (app) {
-      [
+      var rows = [
         ['运行模式', desk ? '桌面版' : '网页版'],
         ['程序版本', d.version || o.version || '—'],
         ['程序路径', d.exePath || '—'],
@@ -5138,7 +5180,14 @@
         ['Node', d.node || '—'],
         ['平台', d.platform || '—'],
         ['PID', d.pid || o.pid || '—']
-      ].forEach(function (kv) { app.appendChild(kvRow(kv[0], kv[1])); });
+      ];
+      /* v0.0.4：外壳透传的托盘 / 受限环境状态（仅桌面模式显示；字段缺失按「未知」） */
+      if (desk) {
+        rows.push(['托盘图标', trayText(d)]);
+        rows.push(['启动环境', d.restricted === true ? '受限' : (d.restricted === false ? '正常' : '未知')]);
+        rows.push(['数据目录回退', d.homeFallback === true ? '是' : (d.homeFallback === false ? '否' : '未知')]);
+      }
+      rows.forEach(function (kv) { app.appendChild(kvRow(kv[0], kv[1])); });
     }
     setToolEnabled('tools-restart', desk, '仅桌面版可用：网页版请在「服务」页操作');
     setToolEnabled('tools-hidewin', desk, '仅桌面版可用：网页版没有桌面窗口');

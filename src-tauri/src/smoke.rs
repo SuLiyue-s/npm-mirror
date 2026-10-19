@@ -177,6 +177,13 @@ fn execute_command(app: &AppHandle, command: &str) -> (bool, String) {
       (true, "已重新读取 config.json".to_string())
     }
     "renderer-info" => (true, format!("window={:?}", window::current_url(app))),
+    // 窗口关闭处理：与 WindowEvent::CloseRequested 完全相同的逻辑（托盘可用→隐藏；不可用→退出）。
+    // 沙箱没有真实窗口，无法发送 WM_CLOSE，用该命令覆盖窗口关闭行为测试。
+    "window:close" => {
+      app.state::<AppState>().mark_smoke_intent_close();
+      window::handle_close_request(app, "smoke:window:close");
+      (true, "已触发窗口关闭处理（托盘可用则隐藏，否则退出程序）".to_string())
+    }
     other => (false, format!("未知冒烟命令：{other}")),
   }
 }
@@ -232,7 +239,9 @@ fn build_report(app: &AppHandle, elapsed: Duration) -> Value {
     "dataDir": state.data_dir_snapshot().to_string_lossy(),
     "dataDirSource": state.data_dir_source_snapshot(),
     "dataDirDefault": paths::exe_dir().join("data").to_string_lossy(),
-    "restricted": state.home_fallback,
+    "restricted": state.restricted(),
+    // 托盘不可用也会被视为受限（即使 MIRROR_DESKTOP_HOME 可写，例如沙箱/受限 token）
+    "homeFallback": state.home_fallback,
     "webview2Version": winutil::webview2_version(),
     "logPath": state.log_path.as_ref().map(|path| path.to_string_lossy().to_string()),
     "uptimeSecs": elapsed.as_secs_f64(),
@@ -253,11 +262,15 @@ fn build_report(app: &AppHandle, elapsed: Duration) -> Value {
     "webview2Dir": state.home_dir.join("webview2").to_string_lossy(),
     "tray": {
       "id": tray::TRAY_ID,
-      "created": app.tray_by_id(tray::TRAY_ID).is_some(),
+      // created=已尝试注册（托盘线程创建 + NIM_ADD 已发出）
+      "created": state.tray_created(),
+      // available=当前确认注册成功；受限环境/沙箱下预期 false
+      "available": state.tray_available(),
+      "error": state.tray_error_snapshot(),
       "labels": tray_labels,
     },
     "smokeCommandHelp": [
-      "show", "hide", "quit", "restart-node", "restart-registry", "restart-webadmin",
+      "show", "hide", "quit", "window:close", "restart-node", "restart-registry", "restart-webadmin",
       "show-webadmin", "autostart-on", "autostart-off", "reload-config", "renderer-info",
       "menu:tray-open", "menu:tray-hide", "menu:tray-open-webadmin",
       "menu:tray-restart-webadmin", "menu:tray-restart-registry"
