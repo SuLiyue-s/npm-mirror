@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
 .SYNOPSIS
   构建「离月私人 npm 镜像源」桌面版单 exe（Tauri）。
@@ -153,12 +153,14 @@ if ($sizeMB -lt 20) { Fail ('产物仅 ' + $sizeMB + ' MB，明显小于预期�
 $hash = (Get-FileHash -LiteralPath $distExe -Algorithm SHA256).Hash.ToLowerInvariant()
 $sumFile = Join-Path $distDir 'SHA256SUMS.txt'
 $sumLine = $hash + '  ' + $exeName
+# 校验清单写成「UTF-8 无 BOM + LF」：带 BOM 会让 sha256sum -c 把 BOM 当成哈希前缀而校验失败
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 if (Test-Path -LiteralPath $sumFile) {
   $others = Get-Content -LiteralPath $sumFile | Where-Object { $_ -and ($_ -notmatch [regex]::Escape($exeName)) }
-  $lines = @($others) + @($sumLine) | Where-Object { $_ }
-  Set-Content -LiteralPath $sumFile -Value ($lines -join "`n") -Encoding utf8
+  $lines = @(@($others) + @($sumLine) | Where-Object { $_ } | ForEach-Object { $_.TrimStart([char]0xFEFF) })
+  [System.IO.File]::WriteAllText($sumFile, (($lines -join "`n") + "`n"), $utf8NoBom)
 } else {
-  Set-Content -LiteralPath $sumFile -Value $sumLine -Encoding utf8
+  [System.IO.File]::WriteAllText($sumFile, ($sumLine + "`n"), $utf8NoBom)
 }
 
 $cost = [math]::Round(((Get-Date) - $startAll).TotalMinutes, 1)
