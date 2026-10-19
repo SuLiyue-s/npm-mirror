@@ -7,6 +7,7 @@
  * 用法：
  *   node tools/publish-release.js --check-token --token <TOKEN>
  *   node tools/publish-release.js --version 0.0.1 --file dist/npm-mirror-desktop-0.0.1.exe \
+ *        [--file dist/SHA256SUMS.txt] \
  *        --token <TOKEN> [--repo SuLiyue-s/npm-mirror] [--notes "..."|--notes-file tmp/notes.md] [--draft]
  *
  * 说明：
@@ -38,7 +39,12 @@ function parseArgs(argv) {
       const key = a.slice(2);
       const val = argv[i + 1];
       if (val === undefined || val.startsWith('--')) fail(1, '缺少参数值：' + a);
-      out[key] = val;
+      if (key === 'file') {
+        if (!out.files) out.files = [];
+        out.files.push(val);
+      } else {
+        out[key] = val;
+      }
       i++;
     } else {
       fail(1, '未知参数：' + a);
@@ -239,10 +245,15 @@ async function main() {
 
   const version = args.version;
   if (!version || !/^\d+\.\d+\.\d+$/.test(version)) fail(1, '缺少或非法 --version（应为 x.y.z）。');
-  const file = args.file ? path.resolve(args.file) : path.resolve(__dirname, '..', 'dist', 'npm-mirror-desktop-' + version + '.exe');
-  if (!fs.existsSync(file)) fail(1, '找不到待上传文件：' + file);
-  const sizeMB = fs.statSync(file).size / 1048576;
-  if (sizeMB < 20) fail(1, '文件仅 ' + sizeMB.toFixed(2) + ' MB，疑似构建异常，拒绝发布。');
+  const fileList = (args.files && args.files.length)
+    ? args.files.map((f) => path.resolve(f))
+    : [path.resolve(__dirname, '..', 'dist', 'npm-mirror-desktop-' + version + '.exe')];
+  for (const f of fileList) {
+    if (!fs.existsSync(f)) fail(1, '找不到待上传文件：' + f);
+  }
+  const exeFile = fileList[0];
+  const sizeMB = fs.statSync(exeFile).size / 1048576;
+  if (sizeMB < 20) fail(1, '主程序仅 ' + sizeMB.toFixed(2) + ' MB，疑似构建异常，拒绝发布。');
 
   let notes = args.notes || '';
   if (args['notes-file']) {
@@ -254,8 +265,11 @@ async function main() {
   const name = 'v' + version + ' 桌面版单 exe';
 
   const release = await getOrCreateRelease(token, repo, version, tag, name, notes, !!args.draft);
-  await uploadAsset(token, repo, release.id, file);
-  console.log('[release] 完成：' + release.html_url);
+  const uploaded = [];
+  for (const f of fileList) {
+    uploaded.push(await uploadAsset(token, repo, release.id, f));
+  }
+  console.log('[release] 完成：' + release.html_url + '（附件 ' + uploaded.length + ' 个：' + uploaded.map((a) => a.name).join('、') + '）');
 }
 
 main().catch((e) => fail(1, '发布失败：' + (e && e.message ? e.message : e)));

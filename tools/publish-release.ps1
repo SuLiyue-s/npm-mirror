@@ -122,6 +122,9 @@ if ($CheckToken) {
   }
 
   $nodeArgs += @('--version', $Version, '--file', $exe)
+  # 校验清单也作为附件一起发布（可重复 --file）
+  $sumPath = Join-Path $Root 'dist\SHA256SUMS.txt'
+  if (Test-Path -LiteralPath $sumPath) { $nodeArgs += @('--file', $sumPath) }
   if ($NotesFile) { $nodeArgs += @('--notes-file', $NotesFile) }
   if ($Draft) { $nodeArgs += '--draft' }
 }
